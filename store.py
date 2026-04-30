@@ -19,6 +19,13 @@ Tables:
                        enabling resume-on-failure, repeatability, and debugging.
                        Entries expire after DEEP_THINK_CACHE_TTL_HOURS (default 24h).
                        Analogy: DAMA pheromone evaporation — stale signals fade.
+- pass_cache         — individual pass outputs stored after each pass completes,
+                       indexed by (job_id, perspective, pass_num) + run_sig.
+                       Enables mid-job resume: if a job crashes on pass 3 of 6,
+                       the next run reloads passes 1–2 and continues from pass 3.
+                       run_sig locks in execution inputs (question, directives,
+                       model, etc.) so cached passes are only replayed when the
+                       resumed run is semantically identical.
 """
 
 import json
@@ -108,6 +115,29 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_perspective_cache_expires "
             "ON perspective_cache(expires_at)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pass_cache (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id       TEXT NOT NULL,
+                perspective  TEXT NOT NULL DEFAULT '',
+                pass_num     INTEGER NOT NULL,
+                run_sig      TEXT NOT NULL,
+                framing      TEXT,
+                tier         TEXT,
+                model_used   TEXT,
+                provider     TEXT,
+                output       TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT NOT NULL,
+                UNIQUE(job_id, perspective, pass_num)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pass_cache_expires "
+            "ON pass_cache(expires_at)"
         )
         conn.commit()
     finally:
@@ -487,3 +517,94 @@ def list_perspective_cache(job_id: str = "") -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Pass cache — per-pass intermediate caching for mid-job resume
+# ---------------------------------------------------------------------------
+
+
+def get_pass_history(job_id: str, perspective: str, run_sig: str) -> list[dict]:
+    """Return cached passes for this job/perspective with matching run_sig.
+
+    Only returns the longest contiguous prefix starting at pass 1 — if pass 3
+    is missing but 4 exists, returns [1, 2] to avoid skipping a required pass.
+    Expired rows are excluded.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT pass_num, framing, tier, model_used, provider, output "
+            "FROM pass_cache "
+            "WHERE job_id=? AND perspective=? AND run_sig=? AND expires_at > ? "
+            "ORDER BY pass_num ASC",
+            (job_id, perspective, run_sig, now),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Take the longest contiguous prefix 1, 2, 3, ... N
+    result = []
+    for i, row in enumerate(rows, start=1):
+        if row["pass_num"] != i:
+            break
+        result.append(dict(row))
+    return result
+
+
+def set_pass_cache(
+    job_id: str,
+    perspective: str,
+    pass_num: int,
+    run_sig: str,
+    framing: str,
+    tier: str,
+    model_used: str,
+    provider: str,
+    output: str,
+) -> None:
+    """Store a single pass output. Overwrites any existing row for this (job, perspective, pass_num)."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(hours=_cache_ttl_hours())).isoformat()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO pass_cache
+                (job_id, perspective, pass_num, run_sig, framing, tier,
+                 model_used, provider, output, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(job_id, perspective, pass_num) DO UPDATE SET
+                run_sig=excluded.run_sig,
+                framing=excluded.framing,
+                tier=excluded.tier,
+                model_used=excluded.model_used,
+                provider=excluded.provider,
+                output=excluded.output,
+                created_at=excluded.created_at,
+                expires_at=excluded.expires_at
+            """,
+            (job_id, perspective, pass_num, run_sig, framing, tier,
+             model_used, provider, output, now.isoformat(), expires),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def evict_expired_pass_cache() -> int:
+    """Remove expired pass cache entries. Returns count removed."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM pass_cache WHERE expires_at <= ?", (now,)
+        )
+        count = cur.rowcount
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
