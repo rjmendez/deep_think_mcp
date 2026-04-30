@@ -951,6 +951,28 @@ Return ONLY valid JSON — no other text:
 
 If no factual contradictions exist, return: {{"contradictions": []}}"""
 
+_CLAIM_EXTRACTION_PROMPT = """\
+Extract the key claims from this analysis. Be precise and concise.
+
+Analysis to extract from:
+{analysis}
+
+Return ONLY valid JSON — no other text:
+{{
+  "claims": [
+    {{
+      "claim": "<specific factual or analytical claim, one sentence>",
+      "confidence": <0.0-1.0, how confident the analysis seems in this claim>,
+      "evidence_basis": "<brief note on what supports this claim, or 'asserted' if no support given>"
+    }}
+  ],
+  "verdict": "<the analysis's overall conclusion in one sentence>",
+  "key_uncertainties": ["<thing the analysis flagged as uncertain or unknown>"]
+}}
+
+Extract 3-7 claims. Focus on claims that are specific, falsifiable, and central to the verdict.
+Do not include meta-commentary about the analysis process itself."""
+
 # Fan-out synthesis prompt — injected as the question for the final heavy synthesis pass.
 _FAN_OUT_SYNTHESIS_PROMPT = """You are the synthesis analyst integrating {n} independent perspective analyses of the following question.
 
@@ -1445,6 +1467,44 @@ def _extract_json_block(text: str) -> dict | None:
     return None
 
 
+async def _extract_claims(
+    perspective_name: str,
+    analysis_text: str,
+    cfg: ProviderConfig,
+    github_token: str,
+    anthropic_key: str,
+) -> dict:
+    """Distil a perspective's prose into a structured claim set.
+
+    Uses the light tier (fast/cheap model). Falls back to returning a
+    minimal claim set if extraction fails, so fan-out is never blocked.
+    """
+    if not analysis_text or not analysis_text.strip():
+        return {"claims": [], "verdict": "", "key_uncertainties": []}
+
+    prompt = _CLAIM_EXTRACTION_PROMPT.format(analysis=analysis_text[:4000])
+    try:
+        raw, model_id = await _call_provider(
+            prompt=prompt,
+            tier="light",
+            cfg=cfg,
+            anthropic_key=anthropic_key,
+            github_token=github_token,
+            task_class="extraction",
+        )
+        parsed = _extract_json_block(raw)
+        if parsed and isinstance(parsed.get("claims"), list):
+            log.debug(
+                "Claim extraction: perspective=%s claims=%d model=%s",
+                perspective_name, len(parsed["claims"]), model_id,
+            )
+            return parsed
+        return {"claims": [], "verdict": raw[:200], "key_uncertainties": []}
+    except Exception as exc:
+        log.warning("Claim extraction failed for %s (non-fatal): %s", perspective_name, exc)
+        return {"claims": [], "verdict": "", "key_uncertainties": []}
+
+
 async def _run_alarm_scan(
     question: str,
     successes: list[dict],
@@ -1498,6 +1558,9 @@ async def run_fan_out(
     data_policy: str = "any",
     max_parallel: int = 2,
     job_id: str = "",
+    max_width: int = 6,
+    confidence_threshold: int = 50,
+    extract_claims: bool = False,
 ) -> str:
     """Run a perspective fan-out: width parallel mandate-driven agents × height passes each.
 
@@ -1505,14 +1568,21 @@ async def run_fan_out(
     A final synthesis pass (heavy model) integrates all perspective outputs.
 
     Args:
-        question:     The question or content to analyze.
-        width:        Number of parallel perspectives (1–6). Clips to available mandates.
-        height:       Number of reasoning passes per perspective (1–5).
-        provider_cfg: Provider configuration.
-        task_class:   Determines which set of perspective mandates to use.
-        data_policy:  "any" | "local" | "cloud"
-        max_parallel: Max perspectives running concurrently (default 2 — safe for Copilot
-                      Business heavy-tier concurrency limits). Increase to 4 for Enterprise.
+        question:             The question or content to analyze.
+        width:                Number of parallel perspectives (1–6). Clips to available mandates.
+        height:               Number of reasoning passes per perspective (1–5).
+        provider_cfg:         Provider configuration.
+        task_class:           Determines which set of perspective mandates to use.
+        data_policy:          "any" | "local" | "cloud"
+        max_parallel:         Max perspectives running concurrently (default 2 — safe for Copilot
+                              Business heavy-tier concurrency limits). Increase to 4 for Enterprise.
+        max_width:            Upper bound on total perspectives after adaptive expansion (default 6).
+        confidence_threshold: If synthesis confidence_score < this value OR contested_areas > 2,
+                              dispatch remaining unused mandates and re-synthesize (DAMA
+                              sampling_factor analog). Default 50. Max 1 expansion.
+        extract_claims:       If True, distil each perspective's prose into a structured claim set
+                              (light-tier model) before synthesis. Reduces synthesis context ~10-20×
+                              and surfaces numerical confidence per claim. Default False.
 
     Returns JSON string with perspectives + synthesis, matching deep_think schema shape.
     """
@@ -1641,11 +1711,52 @@ async def run_fan_out(
         task_class=resolved_class,
     )
 
+    # Optionally extract structured claims from each perspective before synthesis
+    claim_sets: list[dict] = []
+    if extract_claims and len(successes) >= 1:
+        extract_tasks = [
+            _extract_claims(
+                perspective_name=p["name"],
+                analysis_text=p["final_answer"] or "",
+                cfg=cfg,
+                github_token=github_token,
+                anthropic_key=anthropic_key,
+            )
+            for p in successes
+        ]
+        claim_sets = list(await asyncio.gather(*extract_tasks, return_exceptions=False))
+        claim_sets = [
+            cs if isinstance(cs, dict) else {"claims": [], "verdict": "", "key_uncertainties": []}
+            for cs in claim_sets
+        ]
+        log.info("Claim extraction complete: %d perspectives, total claims=%d",
+                 len(claim_sets), sum(len(cs.get("claims", [])) for cs in claim_sets))
+
     # Build synthesis prompt — inject alarm signals as a preamble if any found
-    perspectives_text = "\n\n".join(
-        f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
-        for p in successes
-    )
+    if extract_claims and claim_sets:
+        compact_parts = []
+        for p, cs in zip(successes, claim_sets):
+            claims_fmt = "\n".join(
+                f"  - [{c.get('confidence', 0):.0%}] {c.get('claim', '')} "
+                f"(basis: {c.get('evidence_basis', 'asserted')})"
+                for c in cs.get("claims", [])
+            )
+            uncertainties_fmt = (
+                "\n".join(f"  ? {u}" for u in cs.get("key_uncertainties", []))
+                or "  (none flagged)"
+            )
+            compact_parts.append(
+                f"=== {p['name'].upper()} PERSPECTIVE ===\n"
+                f"VERDICT: {cs.get('verdict', '(none)')}\n"
+                f"CLAIMS:\n{claims_fmt or '  (no claims extracted)'}\n"
+                f"UNCERTAINTIES:\n{uncertainties_fmt}"
+            )
+        perspectives_text = "\n\n".join(compact_parts)
+    else:
+        perspectives_text = "\n\n".join(
+            f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+            for p in successes
+        )
     if alarm_signals:
         alarm_preamble = (
             "⚠️ CONTRADICTION ALERTS — the following factual conflicts were detected "
@@ -1706,6 +1817,120 @@ async def run_fan_out(
     )
     gaps = synthesis_structured.get("gaps", []) if synthesis_structured else []
 
+    # Adaptive expansion: if confidence is low or too many contested areas,
+    # dispatch remaining unused mandates and re-synthesize (DAMA sampling_factor analog).
+    # Limit to 1 expansion to cap API spend.
+    adaptive_triggered = False
+    adaptive_reason = ""
+    final_width = width
+
+    all_mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
+    unused_mandates = [m for m in all_mandates if m not in mandates]
+
+    should_expand = (
+        unused_mandates
+        and width < max_width
+        and (
+            (confidence_score is not None and confidence_score < confidence_threshold)
+            or len(contested_areas) > 2
+        )
+    )
+
+    if should_expand:
+        expansion_width = min(len(unused_mandates), max_width - width)
+        expansion_mandates = unused_mandates[:expansion_width]
+        log.info(
+            "Adaptive expansion triggered: confidence=%s contested=%d — "
+            "adding %d more perspectives",
+            confidence_score, len(contested_areas), expansion_width,
+        )
+        adaptive_triggered = True
+        adaptive_reason = (
+            f"confidence_score={confidence_score} < threshold={confidence_threshold}"
+            if confidence_score is not None and confidence_score < confidence_threshold
+            else f"contested_areas={len(contested_areas)} > 2"
+        )
+
+        extra_results = await asyncio.gather(
+            *[run_perspective(m, job_id=job_id) for m in expansion_mandates],
+            return_exceptions=True,
+        )
+        extra_outputs = []
+        for mandate, result in zip(expansion_mandates, extra_results):
+            if isinstance(result, Exception):
+                log.error("Adaptive perspective %s failed: %s", mandate["name"], result)
+                extra_outputs.append({
+                    "name": mandate["name"], "status": "failed",
+                    "error": str(result), "final_answer": None,
+                })
+            else:
+                extra_outputs.append(result)
+
+        extra_successes = [
+            p for p in extra_outputs
+            if p["status"] == "complete" and p["final_answer"]
+        ]
+        all_successes = successes + extra_successes
+        perspective_outputs = perspective_outputs + extra_outputs
+        final_width = width + len(extra_outputs)
+
+        if extra_successes:
+            # Re-run alarm scan with expanded perspective set
+            alarm_signals = await _run_alarm_scan(
+                question=question,
+                successes=all_successes,
+                cfg=cfg,
+                github_token=github_token,
+                anthropic_key=anthropic_key,
+                task_class=resolved_class,
+            )
+
+            # Re-build perspectives_text and re-synthesize
+            perspectives_text = "\n\n".join(
+                f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+                for p in all_successes
+            )
+            if alarm_signals:
+                alarm_preamble = (
+                    "⚠️ CONTRADICTION ALERTS:\n"
+                )
+                for i, sig in enumerate(alarm_signals, 1):
+                    alarm_preamble += (
+                        f"{i}. {sig.get('claim','?')}: "
+                        f"{sig.get('perspective_a','?')} says '{sig.get('says_a','?')}' vs "
+                        f"{sig.get('perspective_b','?')} says '{sig.get('says_b','?')}'\n"
+                    )
+                perspectives_text = alarm_preamble + "\n\n" + perspectives_text
+
+            synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
+                n=len(all_successes),
+                question=question,
+                perspectives=perspectives_text,
+            )
+            log.debug("Adaptive re-synthesis with %d perspectives", len(all_successes))
+            synthesis_raw = await deep_think_passes(
+                question=synthesis_question,
+                passes=1,
+                provider_cfg=cfg,
+                task_class="synthesis",
+                data_policy=data_policy,
+            )
+            try:
+                passes_result = json.loads(synthesis_raw)
+                raw_answer = passes_result.get("final_answer", synthesis_raw)
+            except Exception:
+                raw_answer = synthesis_raw
+
+            synthesis_structured = _extract_json_block(raw_answer)
+            if synthesis_structured:
+                synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+                confidence_score = synthesis_structured.get("confidence_score")
+                converged_claims = synthesis_structured.get("converged_claims", [])
+                contested_areas = synthesis_structured.get("contested_areas", [])
+                gaps = synthesis_structured.get("gaps", [])
+            else:
+                synthesis_text = raw_answer
+
     cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
 
     result: dict = {
@@ -1716,6 +1941,9 @@ async def run_fan_out(
         "perspectives_attempted": width,
         "perspectives_succeeded": len(successes),
         "cache_hits": cache_hits,
+        "adaptive_triggered": adaptive_triggered,
+        "adaptive_reason": adaptive_reason,
+        "final_width": final_width,
         "alarm_signals": alarm_signals,
         "provider": model_summary(cfg, resolved_class),
         # Structured synthesis fields (None if synthesis JSON parse failed)
@@ -1733,6 +1961,7 @@ async def run_fan_out(
             }
             for p in perspective_outputs
         ],
+        "claim_sets": claim_sets if extract_claims else [],
         "final_answer": synthesis_text,
     }
     return json.dumps(result, indent=2)
