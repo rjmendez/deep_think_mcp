@@ -3,8 +3,10 @@
 Design:
 - Single asyncio loop polls the job queue every second
 - Concurrency controlled via a counter (not semaphore, to avoid private attrs)
-- Stale 'running' jobs are requeued on startup (crash recovery)
+- Stale 'running' jobs are requeued on startup (crash recovery, time-based cutoff)
 - Task references kept in a set to prevent GC before completion
+- All store calls from async context run in a thread pool (asyncio.to_thread)
+  to avoid blocking the event loop on SQLite I/O
 """
 
 import asyncio
@@ -63,10 +65,10 @@ async def _run_job(job: dict) -> None:
             )
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 
-        store.complete_job(job_id, result)
+        await asyncio.to_thread(store.complete_job, job_id, result)
     except Exception as exc:
-        error_msg = str(exc) or f"{type(exc).__qualname__} (no message — likely {type(exc).__module__}.{type(exc).__qualname__})"
-        store.fail_job(job_id, error_msg)
+        error_msg = str(exc) or type(exc).__qualname__
+        await asyncio.to_thread(store.fail_job, job_id, error_msg)
         log.error("Job %s failed: %s", job_id, error_msg)
 
 
@@ -75,7 +77,7 @@ async def worker_loop(max_concurrency: int = 0) -> None:
     if max_concurrency <= 0:
         max_concurrency = int(os.getenv("DEEP_THINK_MAX_CONCURRENCY", "2"))
 
-    stale = store.requeue_stale()
+    stale = await asyncio.to_thread(store.requeue_stale)
     if stale:
         log.info("Requeued %d stale job(s) from prior run", stale)
 
@@ -88,7 +90,13 @@ async def worker_loop(max_concurrency: int = 0) -> None:
             await asyncio.sleep(0.5)
             continue
 
-        job = store.claim_next_job()
+        try:
+            job = await asyncio.to_thread(store.claim_next_job)
+        except Exception as exc:
+            log.error("claim_next_job failed (will retry): %s", exc)
+            await asyncio.sleep(2.0)
+            continue
+
         if job is None:
             await asyncio.sleep(1.0)
             continue
@@ -103,6 +111,14 @@ async def worker_loop(max_concurrency: int = 0) -> None:
             finally:
                 active -= 1
 
-        task = asyncio.create_task(_run_and_release(job))
+        try:
+            task = asyncio.create_task(_run_and_release(job))
+        except Exception as exc:
+            # create_task failed after DB row is already marked 'running' — fail it
+            log.error("create_task failed for job %s: %s", job["job_id"], exc)
+            active -= 1
+            await asyncio.to_thread(store.fail_job, job["job_id"], f"create_task: {exc}")
+            continue
+
         _active_tasks.add(task)
         task.add_done_callback(_active_tasks.discard)

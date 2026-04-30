@@ -1671,7 +1671,7 @@ async def run_fan_out(
 
         # Check perspective cache before running (resume-on-failure + repeatability)
         from . import store as _store
-        cached = _store.get_perspective_cache(cache_key)
+        cached = await asyncio.to_thread(_store.get_perspective_cache, cache_key)
         if cached:
             log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
             return {
@@ -1706,13 +1706,9 @@ async def run_fan_out(
 
         perspective_model_sig = model_summary(perspective_cfg, resolved_class)
         # Cache the result for repeatability and potential resume
-        _store.set_perspective_cache(
-            cache_key=cache_key,
-            perspective_name=name,
-            final_answer=final_answer,
-            model_summary=perspective_model_sig,
-            passes_run=passes_run,
-            job_id=job_id,
+        await asyncio.to_thread(
+            _store.set_perspective_cache,
+            cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
         )
         return {
             "name": name,

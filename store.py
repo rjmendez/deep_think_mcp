@@ -4,7 +4,11 @@ Design:
 - Per-operation connections (not a shared long-lived connection)
 - WAL journal mode + busy_timeout for concurrent read/write safety
 - BEGIN IMMEDIATE for atomic job claiming (prevents double-claim)
-- On startup: stale 'running' jobs are reset to 'queued' for recovery
+- threading.Lock removed — SQLite WAL + BEGIN IMMEDIATE already serializes the
+  only operation that needs it (claim_next_job). Reads are naturally concurrent.
+- On startup: stale 'running' jobs are reset to 'queued' using a time-based
+  cutoff (DEEP_THINK_STALE_JOB_MINUTES, default 120) so multiple concurrent
+  worker processes don't race to requeue each other's live jobs.
 
 Tables:
 - thinking_jobs      — reasoning job queue and results
@@ -19,13 +23,10 @@ Tables:
 
 import json
 import sqlite3
-import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
-_lock = threading.Lock()
 
 
 def _db_path() -> str:
@@ -45,73 +46,72 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS thinking_jobs (
-                    job_id               TEXT PRIMARY KEY,
-                    status               TEXT NOT NULL DEFAULT 'queued',
-                    question             TEXT NOT NULL,
-                    passes               INTEGER NOT NULL DEFAULT 3,
-                    provider             TEXT,
-                    model_summary        TEXT,
-                    provider_config_json TEXT DEFAULT '{}',
-                    created_at           TEXT NOT NULL,
-                    started_at           TEXT,
-                    completed_at         TEXT,
-                    result               TEXT,
-                    error                TEXT
-                )
-                """
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thinking_jobs (
+                job_id               TEXT PRIMARY KEY,
+                status               TEXT NOT NULL DEFAULT 'queued',
+                question             TEXT NOT NULL,
+                passes               INTEGER NOT NULL DEFAULT 3,
+                provider             TEXT,
+                model_summary        TEXT,
+                provider_config_json TEXT DEFAULT '{}',
+                created_at           TEXT NOT NULL,
+                started_at           TEXT,
+                completed_at         TEXT,
+                result               TEXT,
+                error                TEXT
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS model_cache (
-                    model_id        TEXT NOT NULL,
-                    provider        TEXT NOT NULL,
-                    size_b          REAL DEFAULT 0,
-                    suggested_tier  TEXT DEFAULT 'medium',
-                    capabilities    TEXT DEFAULT '["general"]',
-                    benchmark_ms    INTEGER DEFAULT 0,
-                    timeout_secs    INTEGER DEFAULT 300,
-                    is_available    INTEGER DEFAULT 1,
-                    last_checked    TEXT,
-                    PRIMARY KEY (model_id, provider)
-                )
-                """
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_cache (
+                model_id        TEXT NOT NULL,
+                provider        TEXT NOT NULL,
+                size_b          REAL DEFAULT 0,
+                suggested_tier  TEXT DEFAULT 'medium',
+                capabilities    TEXT DEFAULT '["general"]',
+                benchmark_ms    INTEGER DEFAULT 0,
+                timeout_secs    INTEGER DEFAULT 300,
+                is_available    INTEGER DEFAULT 1,
+                last_checked    TEXT,
+                PRIMARY KEY (model_id, provider)
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS discovery_meta (
-                    key        TEXT PRIMARY KEY,
-                    value      TEXT,
-                    updated_at TEXT
-                )
-                """
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS discovery_meta (
+                key        TEXT PRIMARY KEY,
+                value      TEXT,
+                updated_at TEXT
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS perspective_cache (
-                    cache_key       TEXT PRIMARY KEY,
-                    perspective_name TEXT NOT NULL,
-                    model_summary   TEXT,
-                    passes_run      INTEGER NOT NULL DEFAULT 1,
-                    final_answer    TEXT NOT NULL,
-                    job_id          TEXT,
-                    created_at      TEXT NOT NULL,
-                    expires_at      TEXT NOT NULL
-                )
-                """
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS perspective_cache (
+                cache_key       TEXT PRIMARY KEY,
+                perspective_name TEXT NOT NULL,
+                model_summary   TEXT,
+                passes_run      INTEGER NOT NULL DEFAULT 1,
+                final_answer    TEXT NOT NULL,
+                job_id          TEXT,
+                created_at      TEXT NOT NULL,
+                expires_at      TEXT NOT NULL
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_perspective_cache_expires "
-                "ON perspective_cache(expires_at)"
-            )
-            conn.commit()
-        finally:
-            conn.close()
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_perspective_cache_expires "
+            "ON perspective_cache(expires_at)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def create_job(
@@ -123,95 +123,104 @@ def create_job(
 ) -> str:
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO thinking_jobs
-                    (job_id, status, question, passes, provider,
-                     model_summary, provider_config_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (job_id, "queued", question, passes, provider,
-                 model_summary, provider_config_json, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO thinking_jobs
+                (job_id, status, question, passes, provider,
+                 model_summary, provider_config_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, "queued", question, passes, provider,
+             model_summary, provider_config_json, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return job_id
 
 
 def claim_next_job() -> Optional[dict]:
     """Atomically claim the oldest queued job. Returns the job dict or None."""
-    with _lock:
-        conn = _connect()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM thinking_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if not row:
+            conn.execute("ROLLBACK")
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE thinking_jobs SET status='running', started_at=? WHERE job_id=?",
+            (now, row["job_id"]),
+        )
+        conn.execute("COMMIT")
+        return dict(row)
+    except Exception:
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT * FROM thinking_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
-            if not row:
-                conn.execute("ROLLBACK")
-                return None
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "UPDATE thinking_jobs SET status='running', started_at=? WHERE job_id=?",
-                (now, row["job_id"]),
-            )
-            conn.execute("COMMIT")
-            return dict(row)
+            conn.execute("ROLLBACK")
         except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.close()
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def complete_job(job_id: str, result: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "UPDATE thinking_jobs SET status='complete', result=?, completed_at=? WHERE job_id=?",
-                (result, now, job_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE thinking_jobs SET status='complete', result=?, completed_at=? WHERE job_id=?",
+            (result, now, job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def fail_job(job_id: str, error: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "UPDATE thinking_jobs SET status='failed', error=?, completed_at=? WHERE job_id=?",
-                (error, now, job_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE thinking_jobs SET status='failed', error=?, completed_at=? WHERE job_id=?",
+            (error, now, job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def requeue_stale() -> int:
-    """Reset any 'running' jobs to 'queued'. Call on startup to recover from crashes."""
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "UPDATE thinking_jobs SET status='queued', started_at=NULL WHERE status='running'"
-            )
-            count = conn.execute("SELECT changes()").fetchone()[0]
-            conn.commit()
-            return count
-        finally:
-            conn.close()
+def requeue_stale(stale_after_minutes: int = 0) -> int:
+    """Reset timed-out 'running' jobs to 'queued'. Call on startup for crash recovery.
+
+    Uses a time-based cutoff (default DEEP_THINK_STALE_JOB_MINUTES, fallback 120 min)
+    so concurrent worker processes only requeue genuinely abandoned jobs, not each
+    other's actively-running work.
+    """
+    import os
+    from datetime import timedelta
+    if stale_after_minutes <= 0:
+        stale_after_minutes = int(os.getenv("DEEP_THINK_STALE_JOB_MINUTES", "120"))
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+    ).isoformat()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE thinking_jobs SET status='queued', started_at=NULL "
+            "WHERE status='running' AND started_at < ?",
+            (cutoff,),
+        )
+        count = cur.rowcount
+        conn.commit()
+        return count
+    finally:
+        conn.close()
 
 
 def get_job(job_id: str) -> Optional[dict]:
@@ -251,51 +260,50 @@ def list_jobs(status: str = "all", limit: int = 10) -> list[dict]:
 def save_discovery(result: "DiscoveryResult", ollama_hash: str) -> None:  # type: ignore[name-defined]
     """Persist a DiscoveryResult to model_cache and discovery_meta."""
     now = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            # Upsert each model
-            for m in result.models:
-                conn.execute(
-                    """
-                    INSERT INTO model_cache
-                        (model_id, provider, size_b, suggested_tier, capabilities,
-                         benchmark_ms, timeout_secs, is_available, last_checked)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(model_id, provider) DO UPDATE SET
-                        size_b=excluded.size_b,
-                        suggested_tier=excluded.suggested_tier,
-                        capabilities=excluded.capabilities,
-                        benchmark_ms=excluded.benchmark_ms,
-                        timeout_secs=excluded.timeout_secs,
-                        is_available=excluded.is_available,
-                        last_checked=excluded.last_checked
-                    """,
-                    (
-                        m.model_id, m.provider, m.size_b, m.suggested_tier,
-                        json.dumps(m.capabilities), m.benchmark_ms,
-                        m.timeout_secs, int(m.is_available), m.last_checked or now,
-                    ),
-                )
-            # Save tier assignments as JSON
-            tier_json = json.dumps(
-                {p: {"light": ta.light, "medium": ta.medium, "heavy": ta.heavy}
-                 for p, ta in result.tier_assignments.items()}
+    conn = _connect()
+    try:
+        # Upsert each model
+        for m in result.models:
+            conn.execute(
+                """
+                INSERT INTO model_cache
+                    (model_id, provider, size_b, suggested_tier, capabilities,
+                     benchmark_ms, timeout_secs, is_available, last_checked)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(model_id, provider) DO UPDATE SET
+                    size_b=excluded.size_b,
+                    suggested_tier=excluded.suggested_tier,
+                    capabilities=excluded.capabilities,
+                    benchmark_ms=excluded.benchmark_ms,
+                    timeout_secs=excluded.timeout_secs,
+                    is_available=excluded.is_available,
+                    last_checked=excluded.last_checked
+                """,
+                (
+                    m.model_id, m.provider, m.size_b, m.suggested_tier,
+                    json.dumps(m.capabilities), m.benchmark_ms,
+                    m.timeout_secs, int(m.is_available), m.last_checked or now,
+                ),
             )
-            for key, value in [
-                ("ollama_hash", ollama_hash),
-                ("tier_assignments", tier_json),
-                ("completed_at", result.completed_at or now),
-                ("discovery_secs", str(result.discovery_secs)),
-            ]:
-                conn.execute(
-                    "INSERT INTO discovery_meta (key,value,updated_at) VALUES (?,?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                    (key, value, now),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        # Save tier assignments as JSON
+        tier_json = json.dumps(
+            {p: {"light": ta.light, "medium": ta.medium, "heavy": ta.heavy}
+             for p, ta in result.tier_assignments.items()}
+        )
+        for key, value in [
+            ("ollama_hash", ollama_hash),
+            ("tier_assignments", tier_json),
+            ("completed_at", result.completed_at or now),
+            ("discovery_secs", str(result.discovery_secs)),
+        ]:
+            conn.execute(
+                "INSERT INTO discovery_meta (key,value,updated_at) VALUES (?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (key, value, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def load_discovery(
@@ -416,45 +424,43 @@ def set_perspective_cache(
     now = datetime.now(timezone.utc)
     expires = (now + timedelta(hours=_cache_ttl_hours())).isoformat()
     now_str = now.isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO perspective_cache
-                    (cache_key, perspective_name, model_summary, passes_run,
-                     final_answer, job_id, created_at, expires_at)
-                VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    final_answer=excluded.final_answer,
-                    model_summary=excluded.model_summary,
-                    passes_run=excluded.passes_run,
-                    job_id=excluded.job_id,
-                    created_at=excluded.created_at,
-                    expires_at=excluded.expires_at
-                """,
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO perspective_cache
                 (cache_key, perspective_name, model_summary, passes_run,
-                 final_answer, job_id, now_str, expires),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+                 final_answer, job_id, created_at, expires_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                final_answer=excluded.final_answer,
+                model_summary=excluded.model_summary,
+                passes_run=excluded.passes_run,
+                job_id=excluded.job_id,
+                created_at=excluded.created_at,
+                expires_at=excluded.expires_at
+            """,
+            (cache_key, perspective_name, model_summary, passes_run,
+             final_answer, job_id, now_str, expires),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def evict_expired_cache() -> int:
     """Remove expired perspective cache entries. Returns count removed."""
     now = datetime.now(timezone.utc).isoformat()
-    with _lock:
-        conn = _connect()
-        try:
-            conn.execute(
-                "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
-            )
-            count = conn.execute("SELECT changes()").fetchone()[0]
-            conn.commit()
-            return count
-        finally:
-            conn.close()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
+        )
+        count = cur.rowcount
+        conn.commit()
+        return count
+    finally:
+        conn.close()
 
 
 def list_perspective_cache(job_id: str = "") -> list[dict]:
@@ -477,4 +483,3 @@ def list_perspective_cache(job_id: str = "") -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
-
