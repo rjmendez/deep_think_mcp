@@ -1280,6 +1280,8 @@ async def deep_think_passes(
     data_policy: str = "any",
     mandate_prefix: str = "",
     verify: bool = False,
+    job_id: str = "",
+    perspective_name: str = "",
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
@@ -1356,8 +1358,44 @@ async def deep_think_passes(
     )
 
     # --- Main reasoning passes ---
+    # Compute a run signature that locks in all execution inputs.
+    # Cached passes are only replayed if the signature matches exactly.
+    import hashlib as _hashlib
+    from . import store as _store
+    _run_sig = _hashlib.sha256(
+        "\n".join([
+            question,
+            str(passes),
+            resolved_class,
+            repr(directives),
+            mandate_prefix,
+            model_summary(cfg, resolved_class),
+            cfg.data_policy,
+        ]).encode()
+    ).hexdigest()
+
+    # Resume: load the longest contiguous prefix of cached passes
     history: list[dict] = []
-    for i in range(passes):
+    if job_id:
+        _cached = await asyncio.to_thread(
+            _store.get_pass_history, job_id, perspective_name, _run_sig
+        )
+        for cp in _cached:
+            history.append({
+                "pass": cp["pass_num"],
+                "framing": cp["framing"],
+                "tier": cp["tier"],
+                "provider": cp["provider"],
+                "model": cp["model_used"],
+                "output": cp["output"],
+            })
+        if history:
+            log.info(
+                "Resuming job %s perspective=%r from pass %d/%d",
+                job_id, perspective_name or "main", len(history) + 1, passes,
+            )
+
+    for i in range(len(history), passes):
         is_final = i == passes - 1
         framing, directive = (
             directives[-1] if is_final else directives[min(i, len(directives) - 2)]
@@ -1394,6 +1432,12 @@ async def deep_think_passes(
             "Pass %d/%d complete (%s via %s/%s)",
             i + 1, passes, framing, _tier_provider(cfg, tier), model_used,
         )
+        if job_id:
+            await asyncio.to_thread(
+                _store.set_pass_cache,
+                job_id, perspective_name, i + 1, _run_sig,
+                framing, tier, model_used, _tier_provider(cfg, tier), text,
+            )
 
     final_answer = history[-1]["output"]
 
@@ -1706,6 +1750,8 @@ async def run_fan_out(
                 task_class=resolved_class,
                 data_policy=data_policy,
                 mandate_prefix=mandate_text,
+                job_id=job_id,
+                perspective_name=name,
             )
         try:
             parsed = json.loads(raw)

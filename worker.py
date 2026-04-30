@@ -62,6 +62,7 @@ async def _run_job(job: dict) -> None:
                 task_class=task_class,
                 data_policy=data_policy,
                 verify=verify,
+                job_id=job_id,
             )
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 
