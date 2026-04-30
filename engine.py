@@ -83,7 +83,7 @@ _ANTHROPIC_DEFAULTS = {
     "heavy":  "claude-opus-4-7",
 }
 _COPILOT_DEFAULTS = {
-    "light":  "gpt-4o-mini",
+    "light":  "claude-sonnet-4",    # gpt-4o-mini hits TPM limit under concurrent fan-out on copilot_4_cli tokens
     "medium": "claude-sonnet-4.6",
     "heavy":  "claude-opus-4.7",
 }
@@ -499,7 +499,7 @@ TASK_CLASS_PROFILES: dict = {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "code_review": {
@@ -507,14 +507,14 @@ TASK_CLASS_PROFILES: dict = {
         "directives": CODE_REVIEW_DIRECTIVES,
         # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
         "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "safety": {
@@ -522,7 +522,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
@@ -530,14 +530,14 @@ TASK_CLASS_PROFILES: dict = {
         "directives": EXTRACTION_DIRECTIVES,
         # Lighter models are fine — extraction is pattern matching, not deep reasoning
         "ollama":    {"light": "phi4-mini:latest",  "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
@@ -545,7 +545,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": REASONING_DIRECTIVES,
         # qwen3.5 for heavy local reasoning; sonnet for cloud medium (gpt-5.2 not on /chat/completions)
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
 }
@@ -1107,7 +1107,13 @@ async def _call_copilot(
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            body = resp.text[:400]
+            log.error("Copilot API error %s model=%s body=%s", resp.status_code, model_id, body)
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} {resp.reason_phrase} — {body}",
+                request=resp.request, response=resp,
+            )
         return resp.json()["choices"][0]["message"]["content"].strip(), model_id
 
 
