@@ -257,8 +257,9 @@ def list_jobs(status: str = "all", limit: int = 10) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def save_discovery(result: "DiscoveryResult", ollama_hash: str) -> None:  # type: ignore[name-defined]
+def save_discovery(result: "DiscoveryResult", ollama_hash: str) -> None:
     """Persist a DiscoveryResult to model_cache and discovery_meta."""
+    from .discover import DiscoveryResult  # noqa: F401 — satisfies type checker for the annotation
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:

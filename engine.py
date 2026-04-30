@@ -109,7 +109,7 @@ def _read_copilot_token() -> str:
 
 
 # Keep legacy name as alias for callers that may reference it
-_read_github_models_token = _read_copilot_token
+_read_github_models_token = _read_copilot_token  # legacy alias — prefer _read_copilot_token
 
 
 def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
@@ -1292,7 +1292,7 @@ async def deep_think_passes(
     # Gather credentials once
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     github_token = (
-        _read_github_models_token()
+        _read_copilot_token()
         if any(_tier_provider(cfg, t) == "copilot" for t in ("light", "medium", "heavy"))
         else ""
     )
@@ -1415,6 +1415,10 @@ async def deep_think_passes(
             )
             verification_pass_text = verify_text
             v_lower = verify_text.lower().strip()
+            # Heuristic: replace final answer only if the verification pass opens
+            # with a correction keyword. This is intentionally simple — the model
+            # is prompted to lead with these words only when it's actually correcting
+            # something, so false positives are rare in practice.
             if any(v_lower.startswith(kw) for kw in ("corrected", "updated", "revised", "amended")):
                 final_answer = verify_text
             log.debug("Verification pass complete (model=%s)", verify_model)

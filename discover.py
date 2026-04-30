@@ -342,7 +342,7 @@ def _save_to_store(result: DiscoveryResult, ollama_model_hash: str) -> None:
     store.save_discovery(result, ollama_model_hash)
 
 
-def _load_from_store(base_url: str, current_hash: str) -> DiscoveryResult | None:
+def _load_from_store(current_hash: str) -> DiscoveryResult | None:
     from . import store
     return store.load_discovery(current_hash, max_age_hours=_CACHE_MAX_AGE_HOURS)
 
@@ -389,7 +389,7 @@ async def run_discovery(
 
     # --- Step 2: Check cache ---
     if not force:
-        cached = _load_from_store(base_url, ollama_hash)
+        cached = _load_from_store(ollama_hash)
         if cached:
             cached.from_cache = True
             _current = cached
