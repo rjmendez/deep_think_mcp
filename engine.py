@@ -933,25 +933,37 @@ PERSPECTIVE ANALYSES:
 {perspectives}
 
 ---
-Produce a structured synthesis with these four sections:
+Analyze convergence and divergence across these perspectives, then produce your output as a JSON block.
 
-## CONVERGENCE (High Confidence)
-What do multiple independent perspectives independently agree on? List only findings where different mandates arrived at the same conclusion through different reasoning paths. These are your highest-confidence outputs.
+INSTRUCTIONS:
+1. CONVERGED CLAIMS: Identify claims where different perspectives independently reached the same conclusion through different reasoning paths. These are the highest-confidence findings.
+2. CONTESTED AREAS: Identify claims where perspectives explicitly contradict each other — not just different emphasis, but actually conflicting factual assertions or conclusions.
+3. CONFIDENCE SCORE: Rate overall confidence 0-100 based on: how many perspectives converged (more=higher), how many contested areas exist (more=lower), evidence quality, and internal consistency.
+   - 80-100: Strong convergence, few or no contested areas
+   - 60-79: Moderate convergence, some contested areas
+   - 40-59: Mixed — significant divergence or uncertainty
+   - 0-39: High divergence, contradictory evidence, or insufficient basis for conclusions
+4. FINAL ANSWER: Integrate all perspectives into a concrete answer. Lead with converged high-confidence findings. Clearly mark contested claims. Note gaps.
 
-## DIVERGENCE (Contested)
-Where do perspectives conflict? For each conflict: state the competing positions clearly and explain what the disagreement reveals about the underlying uncertainty or ambiguity.
-
-## GAPS
-What important angles were not addressed by any perspective, or where is evidence insufficient for any perspective to reach a conclusion?
-
-## INTEGRATED ASSESSMENT
-Synthesize all perspectives into a final answer that:
-- Leads with convergent high-confidence findings
-- Clearly marks contested areas with appropriate confidence levels
-- Notes remaining unknowns
-- Provides a concrete overall conclusion or recommendation
-
-Be direct and concrete. Do not repeat each perspective — integrate them."""
+Respond with ONLY this JSON (no other text before or after):
+```json
+{{
+  "confidence_score": <integer 0-100>,
+  "converged_claims": [
+    "<specific claim that multiple perspectives independently agreed on>",
+    "..."
+  ],
+  "contested_areas": [
+    "<description of explicit conflict between perspectives, naming which perspectives disagree>",
+    "..."
+  ],
+  "gaps": [
+    "<important angle not addressed or insufficient evidence>",
+    "..."
+  ],
+  "final_answer": "<full integrated synthesis — lead with convergence, mark contested areas, note remaining unknowns, give concrete conclusion>"
+}}
+```"""
 
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1297,56 @@ async def deep_think_passes(
 # ---------------------------------------------------------------------------
 
 
+def _extract_json_block(text: str) -> dict | None:
+    """Extract a JSON object from model output, stripping markdown fences.
+
+    Tries in order:
+    1. Parse the whole text as JSON
+    2. Extract content between ```json ... ``` fences
+    3. Extract content between ``` ... ``` fences
+    4. Find the first { ... } block spanning the whole remaining text
+
+    Returns parsed dict or None if all attempts fail.
+    """
+    text = text.strip()
+    # 1. Bare JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # 2. ```json fence
+    if "```json" in text:
+        inner = text.split("```json", 1)[1]
+        inner = inner.split("```", 1)[0].strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            pass
+    # 3. Generic ``` fence
+    if "```" in text:
+        inner = text.split("```", 1)[1]
+        inner = inner.split("```", 1)[0].strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            pass
+    # 4. First balanced { ... } block
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except Exception:
+                        break
+    return None
+
+
 async def run_fan_out(
     question: str,
     width: int = 3,
@@ -1404,11 +1466,39 @@ async def run_fan_out(
         task_class="synthesis",
         data_policy=data_policy,
     )
+
+    # Extract the deep_think_passes wrapper, then parse the synthesis JSON
+    synthesis_text = synthesis_raw
+    synthesis_structured: dict | None = None
     try:
-        synthesis_parsed = json.loads(synthesis_raw)
-        synthesis_text = synthesis_parsed.get("final_answer", synthesis_raw)
+        passes_result = json.loads(synthesis_raw)
+        raw_answer = passes_result.get("final_answer", synthesis_raw)
     except Exception:
-        synthesis_text = synthesis_raw
+        raw_answer = synthesis_raw
+
+    synthesis_structured = _extract_json_block(raw_answer)
+    if synthesis_structured:
+        synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+        log.debug(
+            "Fan-out synthesis parsed: confidence=%s contested=%d converged=%d",
+            synthesis_structured.get("confidence_score"),
+            len(synthesis_structured.get("contested_areas", [])),
+            len(synthesis_structured.get("converged_claims", [])),
+        )
+    else:
+        log.warning("Fan-out: synthesis JSON parse failed — falling back to plain text")
+        synthesis_text = raw_answer
+
+    confidence_score = (
+        synthesis_structured.get("confidence_score") if synthesis_structured else None
+    )
+    converged_claims = (
+        synthesis_structured.get("converged_claims", []) if synthesis_structured else []
+    )
+    contested_areas = (
+        synthesis_structured.get("contested_areas", []) if synthesis_structured else []
+    )
+    gaps = synthesis_structured.get("gaps", []) if synthesis_structured else []
 
     result: dict = {
         "type": "fan_out",
@@ -1418,6 +1508,11 @@ async def run_fan_out(
         "perspectives_attempted": width,
         "perspectives_succeeded": len(successes),
         "provider": model_summary(cfg, resolved_class),
+        # Structured synthesis fields (None if synthesis JSON parse failed)
+        "confidence_score": confidence_score,
+        "converged_claims": converged_claims,
+        "contested_areas": contested_areas,
+        "gaps": gaps,
         "perspectives": [
             {
                 "name": p["name"],
