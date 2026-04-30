@@ -318,9 +318,12 @@ def load_discovery(
             "SELECT key, value, updated_at FROM discovery_meta"
         ).fetchall()
         meta = {r["key"]: r["value"] for r in meta_rows}
-        updated_at_str = next(
-            (r["updated_at"] for r in meta_rows if r["key"] == "completed_at"),
-            None,
+        # Use the most recent updated_at across all meta rows — this is the actual
+        # DB write time from save_discovery, regardless of which key row we land on.
+        # Filtering for key=="completed_at" silently skips expiry if that row is absent.
+        updated_at_str = max(
+            (r["updated_at"] for r in meta_rows if r["updated_at"]),
+            default=None,
         )
         if not meta or "ollama_hash" not in meta:
             return None
