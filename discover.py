@@ -48,7 +48,8 @@ _TIMEOUT_MAX_SECS = 300
 # Conservative timeouts for cloud models — not benchmarked (costs money / rate limits).
 # Keyed on model ID substring (longest match wins).
 _CLOUD_TIMEOUTS: list[tuple[str, int]] = [
-    # Haiku / fast models
+    # Fast / mini models
+    ("gpt-4o-mini",    45),
     ("haiku",          45),
     ("gpt-5-mini",     45),
     ("gpt-4.1",        60),
@@ -57,6 +58,7 @@ _CLOUD_TIMEOUTS: list[tuple[str, int]] = [
     ("sonnet-4.6",     90),
     ("sonnet-4",       90),
     ("gpt-5.2-codex",  90),
+    ("gpt-5.3-codex",  90),
     ("gpt-5.2",        90),
     ("gpt-5.3",        90),
     # Opus / large

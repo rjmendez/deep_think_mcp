@@ -86,9 +86,9 @@ _ANTHROPIC_DEFAULTS = {
     "heavy":  "claude-opus-4-7",
 }
 _COPILOT_DEFAULTS = {
-    "light":  "openai/gpt-4.1-mini",
-    "medium": "openai/gpt-4.1",
-    "heavy":  "openai/gpt-5",
+    "light":  "gpt-4o-mini",
+    "medium": "claude-sonnet-4.6",
+    "heavy":  "claude-opus-4.7",
 }
 _OLLAMA_DEFAULTS = {
     "light":  "phi4-mini:latest",
@@ -97,19 +97,22 @@ _OLLAMA_DEFAULTS = {
 }
 
 
-def _read_github_models_token() -> str:
-    """Read GitHub Models fine-grained PAT.
+def _read_copilot_token() -> str:
+    """Read GitHub Copilot OAuth token.
 
     Checks (in order):
-      1. GITHUB_MODELS_TOKEN env var (preferred — fine-grained PAT with models:read)
-      2. GITHUB_TOKEN env var (fallback — may work if token has models:read)
-      3. GITHUB_COPILOT_OAUTH_TOKEN env var (legacy name — will likely fail without models:read)
+      1. GITHUB_COPILOT_OAUTH_TOKEN env var (set by run.sh via `gh auth token`)
+      2. GITHUB_TOKEN env var (fallback)
     """
-    for var in ("GITHUB_MODELS_TOKEN", "GITHUB_TOKEN", "GITHUB_COPILOT_OAUTH_TOKEN"):
+    for var in ("GITHUB_COPILOT_OAUTH_TOKEN", "GITHUB_TOKEN"):
         val = os.getenv(var, "").strip()
         if val and val not in ("not-set", ""):
             return val
     return ""
+
+
+# Keep legacy name as alias for callers that may reference it
+_read_github_models_token = _read_copilot_token
 
 
 def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
@@ -131,7 +134,7 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
         anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         if anthropic_key and anthropic_key not in ("not-set", ""):
             cfg.provider = "anthropic"
-        elif _read_github_models_token():
+        elif _read_copilot_token():
             cfg.provider = "copilot"
         else:
             cfg.provider = "ollama"
@@ -498,55 +501,55 @@ TASK_CLASS_PROFILES: dict = {
     "general": {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1",    "heavy": "openai/gpt-5"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "code_review": {
         "description": "Code analysis, bug detection, security review, code quality.",
         "directives": CODE_REVIEW_DIRECTIVES,
-        # qwen2.5-coder is code-specialized; codestral on copilot side
-        "ollama":    {"light": "qwen2.5-coder:7b",         "medium": "qwen2.5-coder:7b",          "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini",      "medium": "mistral-ai/codestral-2501", "heavy": "openai/gpt-5"},
-        "anthropic": {"light": "claude-haiku-4-5",         "medium": "claude-sonnet-4-6",         "heavy": "claude-opus-4-7"},
+        # qwen2.5-coder is code-specialized; codex models on copilot side
+        "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-5.2-codex",     "heavy": "gpt-5.3-codex"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "safety": {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
         "description": "Structured data extraction, entity recognition, schema-constrained JSON output.",
         "directives": EXTRACTION_DIRECTIVES,
         # Lighter models are fine — extraction is pattern matching, not deep reasoning
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "mistral:7b",       "heavy": "llama3.1:8b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1",  "heavy": "openai/gpt-4.1"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-haiku-4-5", "heavy": "claude-sonnet-4-6"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-4.1",           "heavy": "claude-sonnet-4.6"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
         "directives": REASONING_DIRECTIVES,
-        # o-series and deepseek-r1 excel at structured reasoning
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "qwen3.5:27b",              "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/o4-mini",           "heavy": "openai/o3"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6",        "heavy": "claude-opus-4-7"},
+        # gpt-5.2 for structured reasoning on copilot side; opus for deep thinking
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-5.2",           "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
 }
 
@@ -622,21 +625,21 @@ async def _call_copilot(
     prompt: str, tier: str, cfg: ProviderConfig,
     github_token: str, task_class: str = "general",
 ) -> tuple[str, str]:
-    """Call the GitHub Models API (models.github.ai).
+    """Call the GitHub Copilot API (api.githubcopilot.com).
 
-    Requires a fine-grained PAT with models:read permission (GITHUB_MODELS_TOKEN).
-    Model IDs use publisher/model format: "openai/gpt-4.1", "openai/gpt-5", etc.
+    Requires a GitHub OAuth token (gho_) with copilot scope.
+    Injected by run.sh via `gh auth token` → GITHUB_COPILOT_OAUTH_TOKEN.
     """
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
     timeout = _timeout_for(model_id, "copilot")
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
-            "https://models.github.ai/inference/chat/completions",
+            "https://api.githubcopilot.com/chat/completions",
             headers={
                 "Authorization": f"Bearer {github_token}",
                 "Content-Type": "application/json",
-                "Accept": "application/vnd.github+json",
+                "Copilot-Integration-Id": "vscode-chat",
             },
             json={
                 "model": model_id,
