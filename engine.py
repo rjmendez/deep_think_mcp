@@ -83,7 +83,7 @@ _ANTHROPIC_DEFAULTS = {
     "heavy":  "claude-opus-4-7",
 }
 _COPILOT_DEFAULTS = {
-    "light":  "claude-sonnet-4",    # gpt-4o-mini hits TPM limit under concurrent fan-out on copilot_4_cli tokens
+    "light":  "claude-sonnet-4.6",  # sonnet-4 and gpt-4o-mini both hit tpm limits under concurrent fan-out on copilot_4_cli
     "medium": "claude-sonnet-4.6",
     "heavy":  "claude-opus-4.7",
 }
@@ -499,7 +499,7 @@ TASK_CLASS_PROFILES: dict = {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "code_review": {
@@ -507,14 +507,14 @@ TASK_CLASS_PROFILES: dict = {
         "directives": CODE_REVIEW_DIRECTIVES,
         # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
         "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "safety": {
@@ -522,7 +522,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
@@ -530,14 +530,14 @@ TASK_CLASS_PROFILES: dict = {
         "directives": EXTRACTION_DIRECTIVES,
         # Lighter models are fine — extraction is pattern matching, not deep reasoning
         "ollama":    {"light": "phi4-mini:latest",  "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
@@ -545,7 +545,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": REASONING_DIRECTIVES,
         # qwen3.5 for heavy local reasoning; sonnet for cloud medium (gpt-5.2 not on /chat/completions)
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
 }
@@ -1089,32 +1089,50 @@ async def _call_copilot(
 
     Requires a GitHub OAuth token (gho_) with copilot scope.
     Injected by run.sh via `gh auth token` → GITHUB_COPILOT_OAUTH_TOKEN.
+
+    Automatically retries on TPM (tokens-per-minute) rate limit 403s with
+    exponential backoff + jitter (up to 3 attempts). The copilot_4_cli token
+    type has per-model TPM limits that fire under concurrent fan-out.
     """
     import httpx  # type: ignore
+    import random
     model_id = _model_for_tier(cfg, tier, task_class)
     timeout = _timeout_for(model_id, "copilot")
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            "https://api.githubcopilot.com/chat/completions",
-            headers={
-                "Authorization": f"Bearer {github_token}",
-                "Content-Type": "application/json",
-                "Copilot-Integration-Id": "vscode-chat",
-            },
-            json={
-                "model": model_id,
-                "max_tokens": 2048,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        if not resp.is_success:
-            body = resp.text[:400]
-            log.error("Copilot API error %s model=%s body=%s", resp.status_code, model_id, body)
-            raise httpx.HTTPStatusError(
-                f"{resp.status_code} {resp.reason_phrase} — {body}",
-                request=resp.request, response=resp,
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                "https://api.githubcopilot.com/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Content-Type": "application/json",
+                    "Copilot-Integration-Id": "vscode-chat",
+                },
+                json={
+                    "model": model_id,
+                    "max_tokens": 2048,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
             )
-        return resp.json()["choices"][0]["message"]["content"].strip(), model_id
+        if resp.is_success:
+            return resp.json()["choices"][0]["message"]["content"].strip(), model_id
+
+        body = resp.text[:400]
+        is_tpm = "tpm:" in resp.headers.get("x-endpoint-client-forbidden", "")
+        if resp.status_code == 403 and is_tpm and attempt < max_attempts:
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            log.warning(
+                "Copilot TPM limit hit model=%s attempt=%d/%d — retrying in %.1fs",
+                model_id, attempt, max_attempts, wait,
+            )
+            await asyncio.sleep(wait)
+            continue
+
+        log.error("Copilot API error %s model=%s body=%s", resp.status_code, model_id, body)
+        raise httpx.HTTPStatusError(
+            f"{resp.status_code} {resp.reason_phrase} — {body}",
+            request=resp.request, response=resp,
+        )
 
 
 async def _call_ollama(
@@ -1562,6 +1580,7 @@ async def run_fan_out(
     width: int = 3,
     height: int = 2,
     provider_cfg: ProviderConfig | None = None,
+    provider_cfgs: list[ProviderConfig] | None = None,
     task_class: str = "general",
     data_policy: str = "any",
     max_parallel: int = 2,
@@ -1579,7 +1598,12 @@ async def run_fan_out(
         question:             The question or content to analyze.
         width:                Number of parallel perspectives (1–6). Clips to available mandates.
         height:               Number of reasoning passes per perspective (1–5).
-        provider_cfg:         Provider configuration.
+        provider_cfg:         Single provider configuration used for all perspectives and synthesis.
+                              Ignored when provider_cfgs is supplied.
+        provider_cfgs:        Optional list of ProviderConfig objects to round-robin across
+                              perspectives. perspective[i] uses provider_cfgs[i % len(...)].
+                              Useful for mixing Copilot and Ollama to spread TPM load.
+                              Synthesis always uses the first entry in the list (or provider_cfg).
         task_class:           Determines which set of perspective mandates to use.
         data_policy:          "any" | "local" | "cloud"
         max_parallel:         Max perspectives running concurrently (default 2 — safe for Copilot
@@ -1596,7 +1620,16 @@ async def run_fan_out(
     """
     import asyncio
 
-    cfg = provider_cfg or build_provider_config()
+    # Resolve provider pool. provider_cfgs takes precedence; fall back to single cfg.
+    _cfg_pool: list[ProviderConfig]
+    if provider_cfgs and len(provider_cfgs) > 0:
+        _cfg_pool = provider_cfgs
+    else:
+        _cfg_pool = [provider_cfg or build_provider_config()]
+
+    # Synthesis always uses the first (or only) config — typically cloud heavy.
+    cfg = _cfg_pool[0]
+
     width = max(1, min(width, 6))
     height = max(1, min(height, 5))
 
@@ -1604,31 +1637,37 @@ async def run_fan_out(
     mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
     mandates = mandates[:width]
 
+    pool_desc = (
+        "+".join(c.provider for c in _cfg_pool) if len(_cfg_pool) > 1 else _cfg_pool[0].provider
+    )
     log.info(
-        "Fan-out: width=%d height=%d task_class=%s provider=%s",
-        width, height, resolved_class, cfg.provider,
+        "Fan-out: width=%d height=%d task_class=%s providers=%s",
+        width, height, resolved_class, pool_desc,
     )
 
     # Semaphore limits concurrent perspective coroutines (each runs height passes serially).
     # This is the primary rate-limit guard for cloud providers within a single job.
     sem = asyncio.Semaphore(max(1, min(max_parallel, width)))
 
-    # Build a stable provider identity string for cache keying
+    # Build a stable provider identity string for cache keying (uses first cfg)
     _model_sig = model_summary(cfg, resolved_class)
 
-    def _perspective_cache_key(mandate_text: str) -> str:
+    def _perspective_cache_key(mandate_text: str, perspective_cfg: ProviderConfig) -> str:
         """SHA-256 of (question + mandate + height + model) — content-addressed cache key."""
         import hashlib
-        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{_model_sig}"
+        sig = model_summary(perspective_cfg, resolved_class)
+        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}"
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    async def run_perspective(mandate: dict, job_id: str = "") -> dict:
+    async def run_perspective(mandate: dict, slot: int, job_id: str = "") -> dict:
+        # Round-robin provider assignment across the pool
+        perspective_cfg = _cfg_pool[slot % len(_cfg_pool)]
         name = mandate["name"]
         mandate_text = (
             f"[Perspective: {name.upper()}]\n"
             f"{mandate['mandate']}"
         )
-        cache_key = _perspective_cache_key(mandate_text)
+        cache_key = _perspective_cache_key(mandate_text, perspective_cfg)
 
         # Check perspective cache before running (resume-on-failure + repeatability)
         from . import store as _store
@@ -1644,11 +1683,14 @@ async def run_fan_out(
             }
 
         async with sem:
-            log.debug("Fan-out perspective starting: %s", name)
+            log.debug(
+                "Fan-out perspective starting: %s (slot=%d provider=%s)",
+                name, slot, perspective_cfg.provider,
+            )
             raw = await deep_think_passes(
                 question=question,
                 passes=height,
-                provider_cfg=cfg,
+                provider_cfg=perspective_cfg,
                 task_class=resolved_class,
                 data_policy=data_policy,
                 mandate_prefix=mandate_text,
@@ -1662,12 +1704,13 @@ async def run_fan_out(
             final_answer = raw
             passes_run = height
 
+        perspective_model_sig = model_summary(perspective_cfg, resolved_class)
         # Cache the result for repeatability and potential resume
         _store.set_perspective_cache(
             cache_key=cache_key,
             perspective_name=name,
             final_answer=final_answer,
-            model_summary=_model_sig,
+            model_summary=perspective_model_sig,
             passes_run=passes_run,
             job_id=job_id,
         )
@@ -1681,7 +1724,7 @@ async def run_fan_out(
 
     # Run all perspectives, capturing exceptions as structured failures
     raw_results = await asyncio.gather(
-        *[run_perspective(m, job_id=job_id) for m in mandates],
+        *[run_perspective(m, slot=i, job_id=job_id) for i, m in enumerate(mandates)],
         return_exceptions=True,
     )
 
@@ -1859,8 +1902,14 @@ async def run_fan_out(
             else f"contested_areas={len(contested_areas)} > 2"
         )
 
+        # Slot indices continue from where the initial mandates left off so the
+        # round-robin provider assignment stays consistent across expansion.
+        expansion_start_slot = len(mandates)
         extra_results = await asyncio.gather(
-            *[run_perspective(m, job_id=job_id) for m in expansion_mandates],
+            *[
+                run_perspective(m, slot=expansion_start_slot + i, job_id=job_id)
+                for i, m in enumerate(expansion_mandates)
+            ],
             return_exceptions=True,
         )
         extra_outputs = []
@@ -1953,7 +2002,7 @@ async def run_fan_out(
         "adaptive_reason": adaptive_reason,
         "final_width": final_width,
         "alarm_signals": alarm_signals,
-        "provider": model_summary(cfg, resolved_class),
+        "provider": pool_desc,
         # Structured synthesis fields (None if synthesis JSON parse failed)
         "confidence_score": confidence_score,
         "converged_claims": converged_claims,
