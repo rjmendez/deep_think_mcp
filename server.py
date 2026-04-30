@@ -184,6 +184,10 @@ async def get_thinking_result(job_id: str) -> dict:
                     response["converged_claims"] = result["converged_claims"]
                 if result.get("contested_areas"):
                     response["contested_areas"] = result["contested_areas"]
+                response["adaptive_triggered"] = result.get("adaptive_triggered", False)
+                if result.get("adaptive_triggered"):
+                    response["adaptive_reason"] = result.get("adaptive_reason", "")
+                    response["final_width"] = result.get("final_width")
             # Surface verification_pass at the top level for deep_think jobs
             if isinstance(result, dict) and result.get("verification_pass") is not None:
                 response["verification_pass"] = result["verification_pass"]
@@ -251,6 +255,8 @@ async def deep_think_fan_out(
     task_class: str = "general",
     data_policy: str = "any",
     max_parallel: int = 2,
+    max_width: int = 6,
+    confidence_threshold: int = 50,
     provider_config: Optional[dict] = None,
 ) -> dict:
     """Queue a perspective fan-out reasoning job and return a job_id immediately.
@@ -260,15 +266,20 @@ async def deep_think_fan_out(
     synthesis pass integrates all perspectives, identifying convergence (high confidence)
     and divergence (contested areas).
 
+    If synthesis confidence_score < confidence_threshold (default 50) OR contested_areas > 2,
+    automatically dispatches remaining unused perspective mandates and re-synthesizes with all
+    outputs (adaptive width expansion — DAMA sampling_factor analog). Limited to 1 expansion
+    to cap API spend.
+
     Poll with get_thinking_result(job_id) until status is "complete".
 
     Args:
-        question:     The question or content to analyze.
-        width:        Parallel perspectives (1–6). Task class determines which mandates are used.
-                      width=3 → first 3 mandates; width=6 → all 6.
-        height:       Sequential passes per perspective (1–5). Each perspective runs this many
-                      reasoning passes with its mandate injected into every prompt.
-        task_class:   Selects the mandate set and specialist models.
+        question:             The question or content to analyze.
+        width:                Parallel perspectives (1–6). Task class determines which mandates are used.
+                              width=3 → first 3 mandates; width=6 → all 6.
+        height:               Sequential passes per perspective (1–5). Each perspective runs this many
+                              reasoning passes with its mandate injected into every prompt.
+        task_class:           Selects the mandate set and specialist models.
             "investigation" → defense / prosecution / forensics / compliance / red_team / timeline
             "general"       → primary / adversarial / alternative / technical / risk / devils_advocate
             "code_review"   → correctness / security / performance / maintainability / api_contract / edge_cases
@@ -276,12 +287,14 @@ async def deep_think_fan_out(
             "reasoning"     → formal / adversarial / constraints / alternative / verification / simplification
             "synthesis"     → structure / accuracy / clarity / completeness / audience / attribution
             "extraction"    → schema / completeness / disambiguation / confidence / validation / context
-        data_policy:  "any" | "local" | "cloud"
-        max_parallel: Max concurrent perspectives (default 2 — safe for Copilot Business
-                      heavy-tier limits). Increase to 4 for Enterprise accounts.
+        data_policy:          "any" | "local" | "cloud"
+        max_parallel:         Max concurrent perspectives (default 2 — safe for Copilot Business
+                              heavy-tier limits). Increase to 4 for Enterprise accounts.
+        max_width:            Upper bound on total perspectives after adaptive expansion (default 6).
+        confidence_threshold: Trigger adaptive expansion when confidence_score < this value (default 50).
         provider_config: Optional per-call model/provider overrides (no secrets).
 
-    Total LLM calls = (width × height) + 1 synthesis pass.
+    Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
     Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
     """
     pc: dict = dict(provider_config or {})
@@ -310,6 +323,8 @@ async def deep_think_fan_out(
             "width": width,
             "height": height,
             "max_parallel": max_parallel,
+            "max_width": max_width,
+            "confidence_threshold": confidence_threshold,
         }),
     )
 
