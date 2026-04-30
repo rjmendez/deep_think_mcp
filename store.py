@@ -7,9 +7,14 @@ Design:
 - On startup: stale 'running' jobs are reset to 'queued' for recovery
 
 Tables:
-- thinking_jobs   — reasoning job queue and results
-- model_cache     — discovered model info + benchmarks (from discover.py)
-- discovery_meta  — tracks last discovery run and ollama model set hash
+- thinking_jobs      — reasoning job queue and results
+- model_cache        — discovered model info + benchmarks (from discover.py)
+- discovery_meta     — tracks last discovery run and ollama model set hash
+- perspective_cache  — cached per-perspective outputs for fan-out jobs
+                       keyed by content hash (question + mandate + height + model),
+                       enabling resume-on-failure, repeatability, and debugging.
+                       Entries expire after DEEP_THINK_CACHE_TTL_HOURS (default 24h).
+                       Analogy: DAMA pheromone evaporation — stale signals fade.
 """
 
 import json
@@ -85,6 +90,24 @@ def init_db() -> None:
                     updated_at TEXT
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS perspective_cache (
+                    cache_key       TEXT PRIMARY KEY,
+                    perspective_name TEXT NOT NULL,
+                    model_summary   TEXT,
+                    passes_run      INTEGER NOT NULL DEFAULT 1,
+                    final_answer    TEXT NOT NULL,
+                    job_id          TEXT,
+                    created_at      TEXT NOT NULL,
+                    expires_at      TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_perspective_cache_expires "
+                "ON perspective_cache(expires_at)"
             )
             conn.commit()
         finally:
@@ -352,6 +375,106 @@ def load_discovery(
         return result
     except Exception:
         return None
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Perspective cache — resume-on-failure + repeatability for fan-out jobs
+# ---------------------------------------------------------------------------
+
+
+def _cache_ttl_hours() -> int:
+    import os
+    return int(os.getenv("DEEP_THINK_CACHE_TTL_HOURS", "24"))
+
+
+def get_perspective_cache(cache_key: str) -> Optional[dict]:
+    """Return a cached perspective result if it exists and hasn't expired."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM perspective_cache WHERE cache_key=? AND expires_at > ?",
+            (cache_key, now),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def set_perspective_cache(
+    cache_key: str,
+    perspective_name: str,
+    final_answer: str,
+    model_summary: str = "",
+    passes_run: int = 1,
+    job_id: str = "",
+) -> None:
+    """Store a perspective result. Overwrites any existing entry for this key."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(hours=_cache_ttl_hours())).isoformat()
+    now_str = now.isoformat()
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO perspective_cache
+                    (cache_key, perspective_name, model_summary, passes_run,
+                     final_answer, job_id, created_at, expires_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    final_answer=excluded.final_answer,
+                    model_summary=excluded.model_summary,
+                    passes_run=excluded.passes_run,
+                    job_id=excluded.job_id,
+                    created_at=excluded.created_at,
+                    expires_at=excluded.expires_at
+                """,
+                (cache_key, perspective_name, model_summary, passes_run,
+                 final_answer, job_id, now_str, expires),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def evict_expired_cache() -> int:
+    """Remove expired perspective cache entries. Returns count removed."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
+            )
+            count = conn.execute("SELECT changes()").fetchone()[0]
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+
+def list_perspective_cache(job_id: str = "") -> list[dict]:
+    """List cached perspectives, optionally filtered by job_id."""
+    conn = _connect()
+    try:
+        if job_id:
+            rows = conn.execute(
+                "SELECT cache_key, perspective_name, model_summary, passes_run, "
+                "job_id, created_at, expires_at FROM perspective_cache WHERE job_id=? "
+                "ORDER BY created_at",
+                (job_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT cache_key, perspective_name, model_summary, passes_run, "
+                "job_id, created_at, expires_at FROM perspective_cache "
+                "ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 

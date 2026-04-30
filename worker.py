@@ -39,6 +39,7 @@ async def _run_job(job: dict) -> None:
                 task_class=task_class,
                 data_policy=data_policy,
                 max_parallel=max_parallel,
+                job_id=job_id,
             )
             log.info(
                 "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
@@ -56,8 +57,9 @@ async def _run_job(job: dict) -> None:
 
         store.complete_job(job_id, result)
     except Exception as exc:
-        store.fail_job(job_id, str(exc))
-        log.error("Job %s failed: %s", job_id, exc)
+        error_msg = str(exc) or f"{type(exc).__qualname__} (no message — likely {type(exc).__module__}.{type(exc).__qualname__})"
+        store.fail_job(job_id, error_msg)
+        log.error("Job %s failed: %s", job_id, error_msg)
 
 
 async def worker_loop(max_concurrency: int = 0) -> None:
