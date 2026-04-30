@@ -19,13 +19,13 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app):
     store.init_db()
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    # Run discovery non-blocking — server is usable immediately.
-    # Jobs submitted before discovery completes use conservative fallback timeouts.
-    asyncio.create_task(
-        _discover.run_discovery(base_url, benchmark=True),
-        # name available in Python 3.11+; ignored on 3.10
-    )
+    # Only run Ollama discovery if at least one tier is configured to use it.
+    # Avoids unnecessary network calls in cloud-only deployments.
+    if _ollama_in_use():
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
+    else:
+        log.info("No Ollama provider in use — skipping model discovery")
     task = asyncio.create_task(worker.worker_loop())
     try:
         yield
@@ -35,6 +35,15 @@ async def _lifespan(app):
             await task
         except asyncio.CancelledError:
             pass
+
+
+def _ollama_in_use() -> bool:
+    """Return True if any provider tier resolves to Ollama."""
+    cfg = engine.build_provider_config()
+    return any(
+        engine._tier_provider(cfg, tier) == "ollama"
+        for tier in ("light", "medium", "heavy")
+    )
 
 
 mcp = FastMCP(
