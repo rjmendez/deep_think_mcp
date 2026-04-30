@@ -11,15 +11,21 @@ from fastmcp import FastMCP
 
 from . import engine, store, worker
 
+from . import discover as _discover
+
 log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def _lifespan(app):
     store.init_db()
-    # Discover available Ollama models at startup so profile routing knows what's available
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    await engine.refresh_ollama_models(base_url)
+    # Run discovery non-blocking — server is usable immediately.
+    # Jobs submitted before discovery completes use conservative fallback timeouts.
+    asyncio.create_task(
+        _discover.run_discovery(base_url, benchmark=True),
+        # name available in Python 3.11+; ignored on 3.10
+    )
     task = asyncio.create_task(worker.worker_loop())
     try:
         yield
@@ -160,6 +166,54 @@ async def get_thinking_result(job_id: str) -> dict:
         response["error"] = job.get("error")
 
     return response
+
+
+@mcp.tool()
+async def discover_models(force: bool = False, benchmark: bool = True) -> dict:
+    """Discover available models, benchmark their latency, and assign tiers.
+
+    Runs automatically at server startup (non-blocking). Call this tool to:
+      - See what models are available and how they were assigned to tiers
+      - Force a re-benchmark after adding/removing Ollama models
+      - Check benchmarked timeouts (conservative: benchmark × 8, min 45s, max 300s)
+
+    Args:
+        force:     Re-run even if the cache is fresh (< 24h old). Default False.
+        benchmark: Actually measure latency per model. Set False for a fast inventory
+                   without benchmarking (uses size-based heuristics only). Default True.
+
+    Returns a summary of discovered models grouped by provider and tier.
+    """
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    result = await _discover.run_discovery(base_url, force=force, benchmark=benchmark)
+
+    # Build a clean summary for display
+    by_provider: dict[str, list[dict]] = {}
+    for m in result.models:
+        entry = {
+            "model_id":       m.model_id,
+            "tier":           m.suggested_tier,
+            "capabilities":   m.capabilities,
+            "benchmark_ms":   m.benchmark_ms if m.benchmark_ms else "not measured",
+            "timeout_secs":   m.timeout_secs,
+        }
+        if m.benchmark_ms:
+            entry["size_b"] = m.size_b
+        by_provider.setdefault(m.provider, []).append(entry)
+
+    tier_summary = {
+        provider: {"light": ta.light, "medium": ta.medium, "heavy": ta.heavy}
+        for provider, ta in result.tier_assignments.items()
+    }
+
+    return {
+        "from_cache":       result.from_cache,
+        "completed_at":     result.completed_at,
+        "discovery_secs":   round(result.discovery_secs, 1),
+        "errors":           result.errors,
+        "tier_assignments": tier_summary,
+        "models":           by_provider,
+    }
 
 
 @mcp.tool()

@@ -160,8 +160,17 @@ def _default_for_provider(provider: str, tier: str) -> str:
 
 
 def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general") -> str:
-    """Resolve model ID with full precedence chain."""
-    # 1. Single override for all tiers
+    """Resolve model ID with full precedence chain.
+
+    Priority:
+      1. cfg.model — single override for all tiers
+      2. cfg.light / .medium / .heavy — explicit per-tier call override
+      3. DEEP_THINK_{PROVIDER}_{TIER} env var
+      4. Task class profile recommendation (validated against discovery)
+      5. Dynamically-discovered tier assignment from run_discovery()
+      6. Built-in provider default (static fallback)
+    """
+    # 1. Single override
     if cfg.model:
         return cfg.model
     # 2. Explicit per-tier call override
@@ -186,22 +195,48 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     profile_model = _profile_model(task_class, provider, tier)
     if profile_model:
         return profile_model
-    # 5. Built-in provider default
+    # 5. Dynamically-discovered assignment
+    discovered = _discovered_tier_model(provider, tier)
+    if discovered:
+        return discovered
+    # 6. Built-in provider default
     return _default_for_provider(provider, tier)
 
 
 def _profile_model(task_class: str, provider: str, tier: str) -> str:
-    """Return task-class profile recommended model, or '' if not applicable."""
+    """Return task-class profile recommended model, checking discovery availability."""
+    from . import discover as _discover  # late import — avoids circular at module load
+    disc = _discover.get_current()
+
     profile = TASK_CLASS_PROFILES.get(task_class, {})
     models = profile.get(provider, {})
     preferred = models.get(tier, "")
     if not preferred:
         return ""
-    # For ollama: only use preferred if it was discovered as available (or no discovery done yet)
-    if provider == "ollama" and _ollama_discovered and preferred not in _ollama_discovered:
-        log.debug("Profile model %s not available in ollama, using default", preferred)
-        return ""
+
+    # For ollama: validate against discovery cache, or legacy _ollama_discovered set
+    if provider == "ollama":
+        if disc:
+            available = {m.model_id for m in disc.models if m.provider == "ollama" and m.is_available}
+            if available and preferred not in available:
+                log.debug("Profile model %s not in discovered ollama models, skipping", preferred)
+                return ""
+        elif _ollama_discovered and preferred not in _ollama_discovered:
+            log.debug("Profile model %s not available in ollama, skipping", preferred)
+            return ""
     return preferred
+
+
+def _discovered_tier_model(provider: str, tier: str) -> str:
+    """Return the dynamically-discovered model for a provider+tier, or ''."""
+    from . import discover as _discover
+    disc = _discover.get_current()
+    if not disc:
+        return ""
+    assignment = disc.tier_assignments.get(provider)
+    if not assignment:
+        return ""
+    return getattr(assignment, tier, "") or ""
 
 
 def model_summary(cfg: ProviderConfig, task_class: str = "general") -> str:
@@ -582,13 +617,26 @@ async def _get_copilot_session_token(oauth_token: str) -> str:
     return session_token
 
 
+def _timeout_for(model_id: str, provider: str) -> int:
+    """Return the per-call timeout for this model, consulting discovery cache."""
+    from . import discover as _discover
+    disc = _discover.get_current()
+    if disc:
+        return disc.timeout_for(model_id, provider)
+    # Pre-discovery fallback
+    if provider in ("anthropic", "copilot"):
+        return _discover.cloud_timeout(model_id)
+    return _discover._TIMEOUT_MAX_SECS  # conservative 300s for unknown local models
+
+
 async def _call_anthropic(
     prompt: str, tier: str, cfg: ProviderConfig,
     anthropic_key: str, task_class: str = "general",
 ) -> tuple[str, str]:
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
-    async with httpx.AsyncClient(timeout=120) as client:
+    timeout = _timeout_for(model_id, "anthropic")
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -612,8 +660,9 @@ async def _call_copilot(
 ) -> tuple[str, str]:
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
+    timeout = _timeout_for(model_id, "copilot")
     session_token = await _get_copilot_session_token(copilot_oauth)
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             "https://api.githubcopilot.com/chat/completions",
             headers={
@@ -638,11 +687,13 @@ async def _call_ollama(
 ) -> tuple[str, str]:
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
+    timeout = _timeout_for(model_id, "ollama")
     payload: dict = {"model": model_id, "prompt": prompt, "stream": False}
     think_env = os.getenv("DEEP_THINK_OLLAMA_THINK", "").lower()
     if think_env == "false" or (think_env != "true" and "qwen" in model_id.lower()):
         payload["think"] = False
-    async with httpx.AsyncClient(timeout=120) as client:
+    log.debug("Ollama call: model=%s timeout=%ds", model_id, timeout)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{cfg.base_url}/api/generate", json=payload)
         resp.raise_for_status()
         return resp.json().get("response", "").strip(), model_id
