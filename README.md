@@ -38,16 +38,17 @@ With a mixed Ollama (light/medium) + Copilot (heavy) setup:
 
 | Task class | Light | Medium | Heavy |
 |---|---|---|---|
-| general | phi4-mini | llama3.1:8b | claude-opus-4.7 |
+| general | phi4-mini | qwen3:8b | claude-opus-4.7 |
 | code_review | **qwen2.5-coder:7b** | **qwen2.5-coder:7b** | claude-opus-4.7 |
-| investigation | phi4-mini | llama3.1:8b | claude-opus-4.7 |
-| safety | phi4-mini | llama3.1:8b | claude-opus-4.7 |
-| extraction | phi4-mini | **mistral:7b** | **claude-sonnet-4.6** |
-| synthesis | phi4-mini | llama3.1:8b | claude-opus-4.7 |
-| reasoning | phi4-mini | **qwen3.5:27b** | claude-opus-4.7 |
+| investigation | phi4-mini | **deepseek-r1:8b** | claude-opus-4.7 |
+| safety | **granite3-guardian:2b** | qwen3:8b | claude-opus-4.7 |
+| extraction | phi4-mini | **qwen2.5-coder:7b** | **claude-sonnet-4.6** |
+| synthesis | phi4-mini | qwen3:8b | claude-opus-4.7 |
+| reasoning | phi4-mini | **deepseek-r1:8b** | claude-opus-4.7 |
 
 > Models marked **bold** differ from the `general` defaults.
 > Profile recommendations fall back to tier defaults if a model isn't available on your Ollama server (discovered at startup via `/api/tags`).
+> See [`docs/ollama-lineup.md`](docs/ollama-lineup.md) for the full recommended local model set.
 
 ## Quick start
 
@@ -135,8 +136,8 @@ Each reasoning pass uses a tier: `light` (cheap/fast), `medium` (analysis), `hea
 | `DEEP_THINK_COPILOT_MEDIUM` | `claude-sonnet-4.6` |
 | `DEEP_THINK_COPILOT_HEAVY` | `claude-opus-4.7` |
 | `DEEP_THINK_MODEL_LIGHT` | `phi4-mini` |
-| `DEEP_THINK_MODEL_MEDIUM` | `llama3.1:8b` |
-| `DEEP_THINK_MODEL_HEAVY` | `llama3.1:8b` |
+| `DEEP_THINK_MODEL_MEDIUM` | `qwen3:8b` |
+| `DEEP_THINK_MODEL_HEAVY` | `deepseek-r1:8b` |
 
 ### Server
 
