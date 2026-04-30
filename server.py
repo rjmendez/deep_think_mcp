@@ -19,22 +19,24 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app):
     store.init_db()
-    # Only run Ollama discovery if at least one tier is configured to use it.
-    # Avoids unnecessary network calls in cloud-only deployments.
+    discovery_task = None
     if _ollama_in_use():
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
+        discovery_task = asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
     else:
         log.info("No Ollama provider in use — skipping model discovery")
-    task = asyncio.create_task(worker.worker_loop())
+    worker_task = asyncio.create_task(worker.worker_loop())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for t in (discovery_task, worker_task):
+            if t is None:
+                continue
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 def _ollama_in_use() -> bool:
