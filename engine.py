@@ -923,6 +923,34 @@ PERSPECTIVE_MANDATES: dict[str, list[dict]] = {
     ],
 }
 
+# Fan-out alarm scan prompt — detects explicit factual contradictions across perspectives.
+_FAN_OUT_ALARM_PROMPT = """\
+You are a contradiction detector. Below are {n} independent analyses of the same question.
+Your ONLY task: identify explicit factual contradictions — cases where two perspectives make
+directly incompatible claims about the same specific fact.
+
+IGNORE: differences in emphasis, framing, confidence level, or opinion.
+ONLY flag: direct factual contradictions (A says X is true, B says X is false).
+
+Question analyzed: {question}
+
+{perspectives}
+
+Return ONLY valid JSON — no other text:
+{{
+  "contradictions": [
+    {{
+      "claim": "<the specific fact in dispute>",
+      "perspective_a": "<name>",
+      "says_a": "<what A claims>",
+      "perspective_b": "<name>",
+      "says_b": "<what B claims>"
+    }}
+  ]
+}}
+
+If no factual contradictions exist, return: {{"contradictions": []}}"""
+
 # Fan-out synthesis prompt — injected as the question for the final heavy synthesis pass.
 _FAN_OUT_SYNTHESIS_PROMPT = """You are the synthesis analyst integrating {n} independent perspective analyses of the following question.
 
@@ -1381,6 +1409,50 @@ def _extract_json_block(text: str) -> dict | None:
     return None
 
 
+async def _run_alarm_scan(
+    question: str,
+    successes: list[dict],
+    cfg: ProviderConfig,
+    github_token: str,
+    anthropic_key: str,
+    task_class: str,
+) -> list[dict]:
+    """Run a medium-tier contradiction scan across perspective outputs.
+
+    Returns a list of contradiction dicts. Gracefully returns [] on any error.
+    """
+    if len(successes) < 2:
+        return []
+
+    perspectives_text = "\n\n".join(
+        f"=== {p['name'].upper()} ===\n{p['final_answer']}"
+        for p in successes
+    )
+    prompt = _FAN_OUT_ALARM_PROMPT.format(
+        n=len(successes),
+        question=question,
+        perspectives=perspectives_text,
+    )
+    try:
+        raw, _model = await _call_provider(
+            prompt=prompt,
+            tier="medium",
+            cfg=cfg,
+            anthropic_key=anthropic_key,
+            github_token=github_token,
+            task_class=task_class,
+        )
+        parsed = _extract_json_block(raw)
+        if parsed and isinstance(parsed.get("contradictions"), list):
+            contradictions = parsed["contradictions"]
+            log.debug("Alarm scan: %d contradiction(s) found", len(contradictions))
+            return contradictions
+        return []
+    except Exception as exc:
+        log.warning("Alarm scan failed (non-fatal): %s", exc)
+        return []
+
+
 async def run_fan_out(
     question: str,
     width: int = 3,
@@ -1520,11 +1592,36 @@ async def run_fan_out(
             "too many failures to synthesize reliably."
         )
 
-    # Build synthesis prompt
+    # Run alarm scan to detect factual contradictions across perspectives
+    # (medium tier, non-blocking — gracefully degrades to [] on failure)
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    github_token = _read_copilot_token()
+    alarm_signals = await _run_alarm_scan(
+        question=question,
+        successes=successes,
+        cfg=cfg,
+        github_token=github_token,
+        anthropic_key=anthropic_key,
+        task_class=resolved_class,
+    )
+
+    # Build synthesis prompt — inject alarm signals as a preamble if any found
     perspectives_text = "\n\n".join(
         f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
         for p in successes
     )
+    if alarm_signals:
+        alarm_preamble = (
+            "⚠️ CONTRADICTION ALERTS — the following factual conflicts were detected "
+            "between perspectives. Address each explicitly in your synthesis:\n"
+        )
+        for i, sig in enumerate(alarm_signals, 1):
+            alarm_preamble += (
+                f"\n{i}. CLAIM: {sig.get('claim', '?')}\n"
+                f"   {sig.get('perspective_a', '?')} says: {sig.get('says_a', '?')}\n"
+                f"   {sig.get('perspective_b', '?')} says: {sig.get('says_b', '?')}\n"
+            )
+        perspectives_text = alarm_preamble + "\n\n" + perspectives_text
     synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
         n=len(successes),
         question=question,
@@ -1583,6 +1680,7 @@ async def run_fan_out(
         "perspectives_attempted": width,
         "perspectives_succeeded": len(successes),
         "cache_hits": cache_hits,
+        "alarm_signals": alarm_signals,
         "provider": model_summary(cfg, resolved_class),
         # Structured synthesis fields (None if synthesis JSON parse failed)
         "confidence_score": confidence_score,
