@@ -1073,10 +1073,17 @@ async def _call_ollama(
     if think_env == "false" or (think_env != "true" and "qwen" in model_id.lower()):
         payload["think"] = False
     log.debug("Ollama call: model=%s timeout=%ds", model_id, timeout)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{cfg.base_url}/api/generate", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("response", "").strip(), model_id
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(f"{cfg.base_url}/api/generate", json=payload)
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip(), model_id
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"Ollama model '{model_id}' timed out after {timeout}s "
+            f"(tier={tier}). Consider increasing DEEP_THINK_CACHE_TTL_HOURS "
+            f"or setting DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true to retry on cloud."
+        ) from exc
 
 
 async def _call_provider(
@@ -1084,13 +1091,40 @@ async def _call_provider(
     anthropic_key: str = "", github_token: str = "",
     task_class: str = "general",
 ) -> tuple[str, str]:
-    """Dispatch to the correct provider for this tier."""
+    """Dispatch to the correct provider for this tier.
+
+    If the primary provider is Ollama and it times out, and
+    DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true is set, automatically retries
+    on the first available cloud provider (Copilot → Anthropic).
+    """
+    import httpx  # type: ignore
     provider = _tier_provider(cfg, tier)
     if provider == "anthropic":
         return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class)
     if provider == "copilot":
         return await _call_copilot(prompt, tier, cfg, github_token, task_class)
-    return await _call_ollama(prompt, tier, cfg, task_class)
+
+    # Ollama — attempt first, then optionally fall back to cloud on timeout
+    try:
+        return await _call_ollama(prompt, tier, cfg, task_class)
+    except RuntimeError as exc:
+        # Re-raise unless it's a timeout and fallback is enabled
+        if "timed out" not in str(exc):
+            raise
+        if os.getenv("DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK", "").lower() != "true":
+            raise
+        log.warning(
+            "Ollama timeout on tier=%s — falling back to cloud (%s)",
+            tier, exc,
+        )
+        if github_token:
+            return await _call_copilot(prompt, tier, cfg, github_token, task_class)
+        if anthropic_key:
+            return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class)
+        raise RuntimeError(
+            f"Ollama timed out and no cloud provider credentials available for fallback. "
+            f"Set GITHUB_COPILOT_OAUTH_TOKEN or ANTHROPIC_API_KEY."
+        ) from exc
 
 
 async def classify_task(
@@ -1355,6 +1389,7 @@ async def run_fan_out(
     task_class: str = "general",
     data_policy: str = "any",
     max_parallel: int = 2,
+    job_id: str = "",
 ) -> str:
     """Run a perspective fan-out: width parallel mandate-driven agents × height passes each.
 
@@ -1392,12 +1427,36 @@ async def run_fan_out(
     # This is the primary rate-limit guard for cloud providers within a single job.
     sem = asyncio.Semaphore(max(1, min(max_parallel, width)))
 
-    async def run_perspective(mandate: dict) -> dict:
+    # Build a stable provider identity string for cache keying
+    _model_sig = model_summary(cfg, resolved_class)
+
+    def _perspective_cache_key(mandate_text: str) -> str:
+        """SHA-256 of (question + mandate + height + model) — content-addressed cache key."""
+        import hashlib
+        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{_model_sig}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def run_perspective(mandate: dict, job_id: str = "") -> dict:
         name = mandate["name"]
         mandate_text = (
             f"[Perspective: {name.upper()}]\n"
             f"{mandate['mandate']}"
         )
+        cache_key = _perspective_cache_key(mandate_text)
+
+        # Check perspective cache before running (resume-on-failure + repeatability)
+        from . import store as _store
+        cached = _store.get_perspective_cache(cache_key)
+        if cached:
+            log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
+            return {
+                "name": name,
+                "status": "complete",
+                "final_answer": cached["final_answer"],
+                "passes_run": cached["passes_run"],
+                "cache_hit": True,
+            }
+
         async with sem:
             log.debug("Fan-out perspective starting: %s", name)
             raw = await deep_think_passes(
@@ -1410,19 +1469,33 @@ async def run_fan_out(
             )
         try:
             parsed = json.loads(raw)
-            return {
-                "name": name,
-                "status": "complete",
-                "final_answer": parsed.get("final_answer", ""),
-                "passes_run": parsed.get("passes", height),
-            }
+            final_answer = parsed.get("final_answer", "")
+            passes_run = parsed.get("passes", height)
         except Exception as e:
             log.warning("Fan-out perspective %s: JSON parse failed: %s", name, e)
-            return {"name": name, "status": "complete", "final_answer": raw, "passes_run": height}
+            final_answer = raw
+            passes_run = height
+
+        # Cache the result for repeatability and potential resume
+        _store.set_perspective_cache(
+            cache_key=cache_key,
+            perspective_name=name,
+            final_answer=final_answer,
+            model_summary=_model_sig,
+            passes_run=passes_run,
+            job_id=job_id,
+        )
+        return {
+            "name": name,
+            "status": "complete",
+            "final_answer": final_answer,
+            "passes_run": passes_run,
+            "cache_hit": False,
+        }
 
     # Run all perspectives, capturing exceptions as structured failures
     raw_results = await asyncio.gather(
-        *[run_perspective(m) for m in mandates],
+        *[run_perspective(m, job_id=job_id) for m in mandates],
         return_exceptions=True,
     )
 
@@ -1500,6 +1573,8 @@ async def run_fan_out(
     )
     gaps = synthesis_structured.get("gaps", []) if synthesis_structured else []
 
+    cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
+
     result: dict = {
         "type": "fan_out",
         "task_class": resolved_class,
@@ -1507,6 +1582,7 @@ async def run_fan_out(
         "height": height,
         "perspectives_attempted": width,
         "perspectives_succeeded": len(successes),
+        "cache_hits": cache_hits,
         "provider": model_summary(cfg, resolved_class),
         # Structured synthesis fields (None if synthesis JSON parse failed)
         "confidence_score": confidence_score,
@@ -1519,6 +1595,7 @@ async def run_fan_out(
                 "status": p["status"],
                 "final_answer": p.get("final_answer"),
                 "error": p.get("error"),
+                "cache_hit": p.get("cache_hit", False),
             }
             for p in perspective_outputs
         ],
