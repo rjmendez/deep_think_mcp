@@ -226,6 +226,95 @@ async def discover_models(force: bool = False, benchmark: bool = True) -> dict:
 
 
 @mcp.tool()
+async def deep_think_fan_out(
+    question: str,
+    width: int = 3,
+    height: int = 2,
+    task_class: str = "general",
+    data_policy: str = "any",
+    max_parallel: int = 2,
+    provider_config: Optional[dict] = None,
+) -> dict:
+    """Queue a perspective fan-out reasoning job and return a job_id immediately.
+
+    Runs `width` parallel agents each with a structurally different mandate (e.g. defense /
+    prosecution / forensics), each doing `height` sequential reasoning passes. A final
+    synthesis pass integrates all perspectives, identifying convergence (high confidence)
+    and divergence (contested areas).
+
+    Poll with get_thinking_result(job_id) until status is "complete".
+
+    Args:
+        question:     The question or content to analyze.
+        width:        Parallel perspectives (1–6). Task class determines which mandates are used.
+                      width=3 → first 3 mandates; width=6 → all 6.
+        height:       Sequential passes per perspective (1–5). Each perspective runs this many
+                      reasoning passes with its mandate injected into every prompt.
+        task_class:   Selects the mandate set and specialist models.
+            "investigation" → defense / prosecution / forensics / compliance / red_team / timeline
+            "general"       → primary / adversarial / alternative / technical / risk / devils_advocate
+            "code_review"   → correctness / security / performance / maintainability / api_contract / edge_cases
+            "safety"        → harm_assessment / policy_compliance / mitigations / false_positives / context / legal
+            "reasoning"     → formal / adversarial / constraints / alternative / verification / simplification
+            "synthesis"     → structure / accuracy / clarity / completeness / audience / attribution
+            "extraction"    → schema / completeness / disambiguation / confidence / validation / context
+        data_policy:  "any" | "local" | "cloud"
+        max_parallel: Max concurrent perspectives (default 2 — safe for Copilot Business
+                      heavy-tier limits). Increase to 4 for Enterprise accounts.
+        provider_config: Optional per-call model/provider overrides (no secrets).
+
+    Total LLM calls = (width × height) + 1 synthesis pass.
+    Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
+    """
+    pc: dict = dict(provider_config or {})
+    if data_policy and data_policy != "any":
+        pc["data_policy"] = data_policy
+
+    cfg = engine.build_provider_config(pc)
+    resolved_class = task_class if task_class in engine.TASK_CLASS_PROFILES else "general"
+    summary = engine.model_summary(cfg, resolved_class)
+
+    # Clip to valid ranges
+    width = max(1, min(width, 6))
+    height = max(1, min(height, 5))
+    total_calls = width * height + 1  # stored as passes for display
+
+    job_id = store.create_job(
+        question=question,
+        passes=total_calls,
+        provider=cfg.provider,
+        model_summary=summary,
+        provider_config_json=json.dumps({
+            **pc,
+            "task_class": task_class,
+            "data_policy": data_policy,
+            "fan_out": True,
+            "width": width,
+            "height": height,
+            "max_parallel": max_parallel,
+        }),
+    )
+
+    # List which perspectives will run
+    mandates = engine.PERSPECTIVE_MANDATES.get(resolved_class, engine.PERSPECTIVE_MANDATES["general"])
+    perspective_names = [m["name"] for m in mandates[:width]]
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "task_class": resolved_class,
+        "width": width,
+        "height": height,
+        "total_llm_calls": total_calls,
+        "perspectives": perspective_names,
+        "data_policy": data_policy,
+        "provider": cfg.provider,
+        "model_summary": summary,
+        "message": f"Call get_thinking_result('{job_id}') to poll for results.",
+    }
+
+
+@mcp.tool()
 async def list_thinking_jobs(status: str = "all", limit: int = 10) -> dict:
     """List recent thinking jobs.
 
