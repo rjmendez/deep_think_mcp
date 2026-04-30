@@ -558,6 +558,66 @@
     <span style="color:#64748b">→ { status: "complete", final_answer: "…", reasoning_chain: [{pass: 1, …}, …] }</span>
   </div>
 
+  <div class="diagram">
+    <svg width="680" height="172" viewBox="0 0 680 172" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr-j"  markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#475569"/></marker>
+        <marker id="arr-jg" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#10b981"/></marker>
+        <marker id="arr-jr" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#ef4444"/></marker>
+      </defs>
+      <!-- Submit -->
+      <rect x="8" y="44" width="82" height="44" rx="8" fill="rgba(59,130,246,0.15)" stroke="rgba(59,130,246,0.5)" stroke-width="1.5"/>
+      <text x="49" y="64" text-anchor="middle" font-size="12" font-weight="700" fill="#60a5fa">Submit</text>
+      <text x="49" y="79" text-anchor="middle" font-size="9" fill="#64748b">→ job_id</text>
+      <line x1="90" y1="66" x2="110" y2="66" stroke="#475569" stroke-width="1.5" marker-end="url(#arr-j)"/>
+      <!-- Queued -->
+      <rect x="110" y="44" width="82" height="44" rx="8" fill="rgba(245,158,11,0.1)" stroke="rgba(245,158,11,0.4)" stroke-width="1.5"/>
+      <text x="151" y="64" text-anchor="middle" font-size="12" font-weight="700" fill="#fbbf24">Queued</text>
+      <text x="151" y="79" text-anchor="middle" font-size="9" fill="#64748b">pending</text>
+      <line x1="192" y1="66" x2="212" y2="66" stroke="#475569" stroke-width="1.5" marker-end="url(#arr-j)"/>
+      <!-- Running dashed container -->
+      <rect x="210" y="12" width="300" height="115" rx="10" fill="rgba(59,130,246,0.05)" stroke="rgba(59,130,246,0.28)" stroke-width="1.5" stroke-dasharray="5,3"/>
+      <text x="360" y="30" text-anchor="middle" font-size="11" font-weight="700" fill="#60a5fa">Running</text>
+      <!-- Pass 1 -->
+      <rect x="220" y="39" width="58" height="36" rx="6" fill="rgba(255,255,255,0.04)" stroke="#334155" stroke-width="1"/>
+      <text x="249" y="57" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8">Pass 1</text>
+      <text x="249" y="69" text-anchor="middle" font-size="8" fill="#475569">light</text>
+      <line x1="278" y1="57" x2="290" y2="57" stroke="#334155" stroke-width="1" marker-end="url(#arr-j)"/>
+      <!-- Pass 2 -->
+      <rect x="290" y="39" width="58" height="36" rx="6" fill="rgba(255,255,255,0.04)" stroke="#334155" stroke-width="1"/>
+      <text x="319" y="57" text-anchor="middle" font-size="10" font-weight="600" fill="#94a3b8">Pass 2</text>
+      <text x="319" y="69" text-anchor="middle" font-size="8" fill="#475569">medium</text>
+      <line x1="348" y1="57" x2="360" y2="57" stroke="#334155" stroke-width="1" marker-end="url(#arr-j)"/>
+      <!-- Pass 3 adversarial -->
+      <rect x="360" y="34" width="60" height="46" rx="6" fill="rgba(239,68,68,0.1)" stroke="rgba(239,68,68,0.5)" stroke-width="1.5"/>
+      <text x="390" y="52" text-anchor="middle" font-size="10" font-weight="700" fill="#f87171">Pass 3 ⚡</text>
+      <text x="390" y="65" text-anchor="middle" font-size="8" fill="#fca5a5">counter-brief</text>
+      <text x="390" y="75" text-anchor="middle" font-size="8" fill="#475569">medium</text>
+      <line x1="420" y1="57" x2="432" y2="57" stroke="#334155" stroke-width="1" marker-end="url(#arr-j)"/>
+      <!-- Pass 4 synthesis -->
+      <rect x="432" y="39" width="68" height="36" rx="6" fill="#1d4ed8" stroke="#3b82f6" stroke-width="1.5"/>
+      <text x="466" y="57" text-anchor="middle" font-size="10" font-weight="700" fill="white">Pass 4</text>
+      <text x="466" y="69" text-anchor="middle" font-size="8" fill="#93c5fd">heavy</text>
+      <!-- Timing -->
+      <text x="360" y="112" text-anchor="middle" font-size="8.5" fill="#475569" font-style="italic">2–5 min local Ollama · 30–90 s cloud</text>
+      <!-- Branch out of Running (right edge x=510) -->
+      <line x1="510" y1="50" x2="536" y2="36" stroke="#10b981" stroke-width="1.5" marker-end="url(#arr-jg)"/>
+      <line x1="510" y1="82" x2="536" y2="108" stroke="#ef4444" stroke-width="1.5" marker-end="url(#arr-jr)"/>
+      <!-- Complete -->
+      <rect x="536" y="16" width="134" height="46" rx="8" fill="rgba(16,185,129,0.15)" stroke="rgba(16,185,129,0.6)" stroke-width="2"/>
+      <text x="603" y="36" text-anchor="middle" font-size="12" font-weight="700" fill="#34d399">✅ complete</text>
+      <text x="603" y="52" text-anchor="middle" font-size="8.5" fill="#6ee7b7">final_answer · reasoning_chain</text>
+      <!-- Failed -->
+      <rect x="536" y="88" width="134" height="44" rx="8" fill="rgba(239,68,68,0.1)" stroke="rgba(239,68,68,0.4)" stroke-width="1.5"/>
+      <text x="603" y="107" text-anchor="middle" font-size="12" font-weight="700" fill="#f87171">✗ failed</text>
+      <text x="603" y="122" text-anchor="middle" font-size="8.5" fill="#fca5a5">error + partial chain</text>
+      <!-- Poll bar -->
+      <rect x="8" y="142" width="662" height="26" rx="6" fill="rgba(59,130,246,0.06)" stroke="rgba(59,130,246,0.2)" stroke-width="1"/>
+      <text x="339" y="159" text-anchor="middle" font-size="9.5" fill="#64748b">Poll:  get_thinking_result(job_id)  ·  list_thinking_jobs()  — or wait for MCP completion notification</text>
+    </svg>
+  </div>
+  <p class="caption">Figure 8 — Async job lifecycle. Passes run sequentially with escalating model tiers. Poll <code>get_thinking_result(job_id)</code> or wait for the server completion event.</p>
+
   <div class="cards" style="margin-top:1rem;">
     <div class="card blue"><div class="label">task_class routing</div><div class="desc">7 built-in classes: <code>general</code>, <code>code_review</code>, <code>investigation</code>, <code>safety</code>, <code>extraction</code>, <code>synthesis</code>, <code>reasoning</code>. Each selects specialist pass directives and local models. Use <code>auto</code> to let a Pass 0 classifier decide.</div></div>
     <div class="card green"><div class="label">data_policy</div><div class="desc"><code>any</code> (default) — auto-detect from credentials. <code>local</code> — Ollama only, no data leaves the machine. <code>cloud</code> — cloud preferred; light tier stays local.</div></div>
@@ -626,6 +686,54 @@
   <h2><span class="num">10</span> deep-think-mcp — Task Class &amp; API Reference</h2>
   <p class="lead">Task classes select specialized pass directives and model recommendations. Specify <code>task_class</code> when calling <code>deep_think_async</code>. Default is <code>general</code>. All classes run 4 passes unless overridden with the <code>passes</code> parameter (2–6).</p>
 
+  <div class="diagram">
+    <svg width="700" height="190" viewBox="0 0 700 190" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr-tc" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#3b82f6"/></marker>
+      </defs>
+      <!-- Input -->
+      <rect x="240" y="6" width="220" height="36" rx="8" fill="rgba(59,130,246,0.14)" stroke="rgba(59,130,246,0.5)" stroke-width="1.5"/>
+      <text x="350" y="22" text-anchor="middle" font-size="9.5" fill="#64748b">parameter</text>
+      <text x="350" y="36" text-anchor="middle" font-size="12" font-weight="700" fill="#60a5fa">task_class = ?</text>
+      <line x1="350" y1="42" x2="350" y2="57" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr-tc)"/>
+      <!-- Row 1: general · code_review · investigation · safety -->
+      <rect x="10"  y="58" width="162" height="56" rx="8" fill="rgba(59,130,246,0.12)"  stroke="rgba(59,130,246,0.45)"  stroke-width="1.5"/>
+      <text x="91"  y="79" text-anchor="middle" font-size="11" font-weight="700" fill="#60a5fa">general</text>
+      <text x="91"  y="94" text-anchor="middle" font-size="8.5" fill="#64748b">reasoning · analysis</text>
+      <text x="91"  y="106" text-anchor="middle" font-size="8.5" fill="#64748b">architecture decisions</text>
+      <rect x="182" y="58" width="162" height="56" rx="8" fill="rgba(245,158,11,0.12)" stroke="rgba(245,158,11,0.45)" stroke-width="1.5"/>
+      <text x="263" y="79" text-anchor="middle" font-size="11" font-weight="700" fill="#fbbf24">code_review</text>
+      <text x="263" y="94" text-anchor="middle" font-size="8.5" fill="#64748b">bugs · security</text>
+      <text x="263" y="106" text-anchor="middle" font-size="8.5" fill="#64748b">code quality</text>
+      <rect x="354" y="58" width="162" height="56" rx="8" fill="rgba(239,68,68,0.12)"  stroke="rgba(239,68,68,0.45)"  stroke-width="1.5"/>
+      <text x="435" y="79" text-anchor="middle" font-size="11" font-weight="700" fill="#f87171">investigation</text>
+      <text x="435" y="94" text-anchor="middle" font-size="8.5" fill="#64748b">threat hunting</text>
+      <text x="435" y="106" text-anchor="middle" font-size="8.5" fill="#64748b">IOC triage</text>
+      <rect x="526" y="58" width="162" height="56" rx="8" fill="rgba(249,115,22,0.12)" stroke="rgba(249,115,22,0.45)" stroke-width="1.5"/>
+      <text x="607" y="79" text-anchor="middle" font-size="11" font-weight="700" fill="#fb923c">safety</text>
+      <text x="607" y="94" text-anchor="middle" font-size="8.5" fill="#64748b">content policy</text>
+      <text x="607" y="106" text-anchor="middle" font-size="8.5" fill="#64748b">risk detection</text>
+      <!-- Row 2: extraction · synthesis · reasoning · auto -->
+      <rect x="10"  y="122" width="162" height="56" rx="8" fill="rgba(16,185,129,0.12)" stroke="rgba(16,185,129,0.45)" stroke-width="1.5"/>
+      <text x="91"  y="143" text-anchor="middle" font-size="11" font-weight="700" fill="#34d399">extraction</text>
+      <text x="91"  y="158" text-anchor="middle" font-size="8.5" fill="#64748b">JSON output</text>
+      <text x="91"  y="170" text-anchor="middle" font-size="8.5" fill="#64748b">entity recognition</text>
+      <rect x="182" y="122" width="162" height="56" rx="8" fill="rgba(59,130,246,0.07)" stroke="rgba(59,130,246,0.3)"  stroke-width="1.5"/>
+      <text x="263" y="143" text-anchor="middle" font-size="11" font-weight="700" fill="#93c5fd">synthesis</text>
+      <text x="263" y="158" text-anchor="middle" font-size="8.5" fill="#64748b">writing · reports</text>
+      <text x="263" y="170" text-anchor="middle" font-size="8.5" fill="#64748b">summarization</text>
+      <rect x="354" y="122" width="162" height="56" rx="8" fill="rgba(139,92,246,0.12)" stroke="rgba(139,92,246,0.45)" stroke-width="1.5"/>
+      <text x="435" y="143" text-anchor="middle" font-size="11" font-weight="700" fill="#a78bfa">reasoning</text>
+      <text x="435" y="158" text-anchor="middle" font-size="8.5" fill="#64748b">logic · math</text>
+      <text x="435" y="170" text-anchor="middle" font-size="8.5" fill="#64748b">formal analysis</text>
+      <rect x="526" y="122" width="162" height="56" rx="8" fill="rgba(100,116,139,0.1)" stroke="#334155" stroke-width="1.5" stroke-dasharray="4,3"/>
+      <text x="607" y="143" text-anchor="middle" font-size="11" font-weight="700" fill="#94a3b8">auto</text>
+      <text x="607" y="158" text-anchor="middle" font-size="8.5" fill="#64748b">Pass 0 classifier</text>
+      <text x="607" y="170" text-anchor="middle" font-size="8.5" fill="#64748b">≥ 0.75 confidence</text>
+    </svg>
+  </div>
+  <p class="caption">Figure 9 — Task class routing. Each class activates a specialist set of pass directives and model recommendations. <code>auto</code> runs a lightweight Pass 0 classifier to choose the class dynamically.</p>
+
   <table class="htable">
     <tr>
       <th style="width:13%">task_class</th>
@@ -683,6 +791,44 @@
     </tr>
   </table>
 
+  <div class="diagram">
+    <svg width="660" height="248" viewBox="0 0 660 248" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr-prov" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#475569"/></marker>
+        <marker id="arr-provg" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#10b981"/></marker>
+      </defs>
+      <!-- Header -->
+      <rect x="0" y="0" width="660" height="34" rx="6" fill="rgba(59,130,246,0.12)" stroke="rgba(59,130,246,0.35)" stroke-width="1"/>
+      <text x="330" y="21" text-anchor="middle" font-size="11.5" font-weight="700" fill="#60a5fa">Provider Resolution — Priority Order</text>
+      <!-- Row 1: data_policy=local -->
+      <rect x="6" y="42" width="648" height="44" rx="6" fill="rgba(16,185,129,0.08)" stroke="rgba(16,185,129,0.35)" stroke-width="1.5"/>
+      <text x="30" y="58" font-size="10" font-weight="700" fill="#34d399">① data_policy = "local"</text>
+      <text x="30" y="74" font-size="9.5" fill="#64748b">Overrides everything — Ollama only, no cloud calls regardless of keys present</text>
+      <text x="610" y="65" text-anchor="end" font-size="10" font-weight="600" fill="#34d399">→ Ollama</text>
+      <!-- Arrow 1→2 -->
+      <text x="330" y="96" text-anchor="middle" font-size="9" fill="#475569">else ↓</text>
+      <!-- Row 2: Anthropic key -->
+      <rect x="6" y="102" width="648" height="44" rx="6" fill="rgba(139,92,246,0.08)" stroke="rgba(139,92,246,0.35)" stroke-width="1.5"/>
+      <text x="30" y="118" font-size="10" font-weight="700" fill="#a78bfa">② ANTHROPIC_API_KEY present</text>
+      <text x="30" y="134" font-size="9.5" fill="#64748b">claude-haiku-4-5 (light) · claude-sonnet-4-5 (medium) · claude-opus-4-5 (heavy)</text>
+      <text x="610" y="125" text-anchor="end" font-size="10" font-weight="600" fill="#a78bfa">→ Anthropic</text>
+      <!-- Arrow 2→3 -->
+      <text x="330" y="156" text-anchor="middle" font-size="9" fill="#475569">else ↓</text>
+      <!-- Row 3: Copilot token -->
+      <rect x="6" y="162" width="648" height="44" rx="6" fill="rgba(245,158,11,0.08)" stroke="rgba(245,158,11,0.35)" stroke-width="1.5"/>
+      <text x="30" y="178" font-size="10" font-weight="700" fill="#fbbf24">③ GITHUB_COPILOT_OAUTH_TOKEN present</text>
+      <text x="30" y="194" font-size="9.5" fill="#64748b">claude-haiku-4-5 (light) · claude-sonnet-4-6 (medium) · claude-opus-4-7 (heavy)</text>
+      <text x="610" y="185" text-anchor="end" font-size="10" font-weight="600" fill="#fbbf24">→ Copilot</text>
+      <!-- Arrow 3→4 -->
+      <text x="330" y="216" text-anchor="middle" font-size="9" fill="#475569">else ↓</text>
+      <!-- Row 4: fallback Ollama -->
+      <rect x="6" y="222" width="648" height="22" rx="6" fill="rgba(100,116,139,0.08)" stroke="#334155" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="30" y="237" font-size="10" font-weight="600" fill="#94a3b8">④ Fallback — Ollama at OLLAMA_BASE_URL  (phi4-mini · qwen3:8b · deepseek-r1:8b)</text>
+      <text x="610" y="237" text-anchor="end" font-size="10" font-weight="600" fill="#94a3b8">→ Ollama</text>
+    </svg>
+  </div>
+  <p class="caption">Figure 10 — Provider resolution cascade. <code>data_policy</code> is checked first; then credentials are tested in priority order. Per-tier overrides (<code>provider_config.light_provider</code> etc.) can bypass any row.</p>
+
   <h3>Key Environment Variables</h3>
   <table class="htable" style="margin-top:0.75rem;">
     <tr>
@@ -731,6 +877,53 @@
       <td>GitHub Copilot OAuth token. Run <code>gh auth token</code> to obtain. <code>run.sh</code> injects this automatically.</td>
     </tr>
   </table>
+
+  <div class="diagram">
+    <svg width="600" height="200" viewBox="0 0 600 200" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr-dp"  markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#475569"/></marker>
+        <marker id="arr-dpg" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#10b981"/></marker>
+        <marker id="arr-dpb" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#3b82f6"/></marker>
+        <marker id="arr-dpv" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0,7 2.5,0 5" fill="#8b5cf6"/></marker>
+      </defs>
+      <!-- Input box -->
+      <rect x="175" y="8" width="250" height="40" rx="8" fill="rgba(59,130,246,0.12)" stroke="rgba(59,130,246,0.45)" stroke-width="1.5"/>
+      <text x="300" y="24" text-anchor="middle" font-size="9.5" fill="#64748b">parameter</text>
+      <text x="300" y="39" text-anchor="middle" font-size="13" font-weight="700" fill="#60a5fa">data_policy = ?</text>
+      <!-- Main stem down -->
+      <line x1="300" y1="48" x2="300" y2="62" stroke="#475569" stroke-width="1.5" marker-end="url(#arr-dp)"/>
+      <!-- Horizontal bar -->
+      <line x1="80" y1="68" x2="520" y2="68" stroke="#334155" stroke-width="1.5"/>
+      <!-- Left stem → local -->
+      <line x1="80"  y1="68" x2="80"  y2="90" stroke="#10b981" stroke-width="1.5" marker-end="url(#arr-dpg)"/>
+      <!-- Center stem → any -->
+      <line x1="300" y1="68" x2="300" y2="90" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#arr-dpb)"/>
+      <!-- Right stem → cloud -->
+      <line x1="520" y1="68" x2="520" y2="90" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#arr-dpv)"/>
+      <!-- local box -->
+      <rect x="10" y="90" width="140" height="100" rx="8" fill="rgba(16,185,129,0.1)" stroke="rgba(16,185,129,0.5)" stroke-width="2"/>
+      <text x="80" y="110" text-anchor="middle" font-size="12" font-weight="700" fill="#34d399">"local"</text>
+      <text x="80" y="130" text-anchor="middle" font-size="9" fill="#6ee7b7">Ollama only</text>
+      <text x="80" y="145" text-anchor="middle" font-size="8.5" fill="#475569">no cloud calls</text>
+      <text x="80" y="160" text-anchor="middle" font-size="8.5" fill="#475569">even if keys</text>
+      <text x="80" y="174" text-anchor="middle" font-size="8.5" fill="#475569">are present</text>
+      <!-- any box (default) -->
+      <rect x="230" y="90" width="140" height="100" rx="8" fill="rgba(59,130,246,0.12)" stroke="rgba(59,130,246,0.5)" stroke-width="2"/>
+      <text x="300" y="108" text-anchor="middle" font-size="12" font-weight="700" fill="#60a5fa">"any" ★</text>
+      <text x="300" y="124" text-anchor="middle" font-size="9" fill="#93c5fd">default</text>
+      <text x="300" y="142" text-anchor="middle" font-size="8.5" fill="#475569">auto-detects provider</text>
+      <text x="300" y="157" text-anchor="middle" font-size="8.5" fill="#475569">from env credentials</text>
+      <text x="300" y="172" text-anchor="middle" font-size="8.5" fill="#475569">per priority cascade</text>
+      <!-- cloud box -->
+      <rect x="450" y="90" width="140" height="100" rx="8" fill="rgba(139,92,246,0.1)" stroke="rgba(139,92,246,0.5)" stroke-width="2"/>
+      <text x="520" y="110" text-anchor="middle" font-size="12" font-weight="700" fill="#a78bfa">"cloud"</text>
+      <text x="520" y="130" text-anchor="middle" font-size="9" fill="#c4b5fd">cloud preferred</text>
+      <text x="520" y="145" text-anchor="middle" font-size="8.5" fill="#475569">Ollama allowed</text>
+      <text x="520" y="160" text-anchor="middle" font-size="8.5" fill="#475569">only for light</text>
+      <text x="520" y="175" text-anchor="middle" font-size="8.5" fill="#475569">tier tasks</text>
+    </svg>
+  </div>
+  <p class="caption">Figure 11 — <code>data_policy</code> fork. <code>"local"</code> is the privacy-safe setting for sensitive data. <code>"any"</code> (default) auto-detects the best available provider. <code>"cloud"</code> prefers remote APIs and reserves Ollama for cheap light-tier passes only.</p>
 
   <div class="callout-green" style="margin-top:1.5rem;">
     <p><strong>Local model lineup:</strong> The Ollama defaults above assume the specialist roster in <a href="ollama-lineup.md" style="color:#34d399"><code>docs/ollama-lineup.md</code></a>. Quick install: <code>ollama pull phi4-mini &amp;&amp; ollama pull qwen3:8b &amp;&amp; ollama pull deepseek-r1:8b &amp;&amp; ollama pull qwen2.5-coder:7b &amp;&amp; ollama pull granite3-guardian:2b</code></p>
