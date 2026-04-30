@@ -40,20 +40,47 @@ With a mixed Ollama (light/medium) + Copilot (heavy) setup:
 |---|---|---|---|
 | general | phi4-mini | qwen3:8b | claude-opus-4.7 |
 | code_review | **qwen2.5-coder:7b** | **qwen2.5-coder:7b** | claude-opus-4.7 |
-| investigation | phi4-mini | **deepseek-r1:8b** | claude-opus-4.7 |
-| safety | **granite3-guardian:2b** | qwen3:8b | claude-opus-4.7 |
-| extraction | phi4-mini | **qwen2.5-coder:7b** | **claude-sonnet-4.6** |
-| synthesis | phi4-mini | qwen3:8b | claude-opus-4.7 |
-| reasoning | phi4-mini | **deepseek-r1:8b** | claude-opus-4.7 |
+| investigation | phi4-mini | claude-sonnet-4.6 | claude-opus-4.7 |
+| safety | **granite3-guardian:2b** | claude-sonnet-4.6 | claude-opus-4.7 |
+| extraction | phi4-mini | **claude-sonnet-4** | **claude-sonnet-4.6** |
+| synthesis | phi4-mini | claude-sonnet-4.6 | claude-opus-4.7 |
+| reasoning | phi4-mini | claude-sonnet-4.6 | claude-opus-4.7 |
 
 > Models marked **bold** differ from the `general` defaults.
 > Profile recommendations fall back to tier defaults if a model isn't available on your Ollama server (discovered at startup via `/api/tags`).
 > See [`docs/ollama-lineup.md`](docs/ollama-lineup.md) for the full recommended local model set.
 
+### Confirmed-working Copilot model IDs (as of 2026-04-30)
+
+These model IDs work with the `/chat/completions` endpoint and `Copilot-Integration-Id: vscode-chat`:
+
+| Model ID | Tier | Notes |
+|---|---|---|
+| `gpt-4o-mini` | light | Fastest, lowest cost |
+| `claude-sonnet-4` | medium | Lighter Sonnet — good for extraction/classification |
+| `claude-sonnet-4.6` | medium/heavy | Best balance for most tasks |
+| `claude-opus-4.5` | heavy | Available but superseded |
+| `claude-opus-4.6` | heavy | Available but superseded |
+| `claude-opus-4.7` | heavy | Default heavy — best quality |
+
+**Not accessible** via `/chat/completions`: `gpt-5.x-codex` (different endpoint), `o1/o3/o4-mini` (reasoning endpoint), `gpt-4o`, `gpt-5.x`, `claude-sonnet-4.5`.
+If your org enables additional models, override with `DEEP_THINK_COPILOT_LIGHT/MEDIUM/HEAVY` env vars.
+
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
+```
+
+> **Note on Python import path:** The repo is named `deep-think-mcp` (hyphens) but the Python
+> package is `deep_think_mcp` (underscores). Create a symlink so Python can find it:
+> ```bash
+> ln -sf ~/Dev/deep-think-mcp ~/Dev/deep_think_mcp
+> ```
+> This is a one-time setup step. `run.sh` and `run_http.sh` set `PYTHONPATH` to the parent
+> directory automatically. A future `pyproject.toml` will make this unnecessary.
+
+```bash
 python -m deep_think_mcp          # starts on http://0.0.0.0:8002
 ```
 

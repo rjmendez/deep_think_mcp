@@ -49,7 +49,7 @@ Qwen thinking mode:
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclasses_replace
 
 log = logging.getLogger(__name__)
 
@@ -505,9 +505,9 @@ TASK_CLASS_PROFILES: dict = {
     "code_review": {
         "description": "Code analysis, bug detection, security review, code quality.",
         "directives": CODE_REVIEW_DIRECTIVES,
-        # qwen2.5-coder is code-specialized; codex models on copilot side
+        # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
         "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-5.2-codex",     "heavy": "gpt-5.3-codex"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
@@ -530,7 +530,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": EXTRACTION_DIRECTIVES,
         # Lighter models are fine — extraction is pattern matching, not deep reasoning
         "ollama":    {"light": "phi4-mini:latest",  "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-4.1",           "heavy": "claude-sonnet-4.6"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
@@ -543,9 +543,9 @@ TASK_CLASS_PROFILES: dict = {
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
         "directives": REASONING_DIRECTIVES,
-        # gpt-5.2 for structured reasoning on copilot side; opus for deep thinking
+        # qwen3.5 for heavy local reasoning; sonnet for cloud medium (gpt-5.2 not on /chat/completions)
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4o-mini",       "medium": "gpt-5.2",           "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "gpt-4o-mini",       "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
 }
@@ -1168,9 +1168,11 @@ async def _call_provider(
             tier, exc,
         )
         if github_token:
-            return await _call_copilot(prompt, tier, cfg, github_token, task_class)
+            fallback_cfg = dataclasses_replace(cfg, provider="copilot")
+            return await _call_copilot(prompt, tier, fallback_cfg, github_token, task_class)
         if anthropic_key:
-            return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class)
+            fallback_cfg = dataclasses_replace(cfg, provider="anthropic")
+            return await _call_anthropic(prompt, tier, fallback_cfg, anthropic_key, task_class)
         raise RuntimeError(
             f"Ollama timed out and no cloud provider credentials available for fallback. "
             f"Set GITHUB_COPILOT_OAUTH_TOKEN or ANTHROPIC_API_KEY."
