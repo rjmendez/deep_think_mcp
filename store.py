@@ -5,8 +5,14 @@ Design:
 - WAL journal mode + busy_timeout for concurrent read/write safety
 - BEGIN IMMEDIATE for atomic job claiming (prevents double-claim)
 - On startup: stale 'running' jobs are reset to 'queued' for recovery
+
+Tables:
+- thinking_jobs   — reasoning job queue and results
+- model_cache     — discovered model info + benchmarks (from discover.py)
+- discovery_meta  — tracks last discovery run and ollama model set hash
 """
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -52,6 +58,31 @@ def init_db() -> None:
                     completed_at         TEXT,
                     result               TEXT,
                     error                TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS model_cache (
+                    model_id        TEXT NOT NULL,
+                    provider        TEXT NOT NULL,
+                    size_b          REAL DEFAULT 0,
+                    suggested_tier  TEXT DEFAULT 'medium',
+                    capabilities    TEXT DEFAULT '["general"]',
+                    benchmark_ms    INTEGER DEFAULT 0,
+                    timeout_secs    INTEGER DEFAULT 300,
+                    is_available    INTEGER DEFAULT 1,
+                    last_checked    TEXT,
+                    PRIMARY KEY (model_id, provider)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_meta (
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT,
+                    updated_at TEXT
                 )
                 """
             )
@@ -187,3 +218,140 @@ def list_jobs(status: str = "all", limit: int = 10) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Discovery persistence
+# ---------------------------------------------------------------------------
+
+
+def save_discovery(result: "DiscoveryResult", ollama_hash: str) -> None:  # type: ignore[name-defined]
+    """Persist a DiscoveryResult to model_cache and discovery_meta."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _connect()
+        try:
+            # Upsert each model
+            for m in result.models:
+                conn.execute(
+                    """
+                    INSERT INTO model_cache
+                        (model_id, provider, size_b, suggested_tier, capabilities,
+                         benchmark_ms, timeout_secs, is_available, last_checked)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(model_id, provider) DO UPDATE SET
+                        size_b=excluded.size_b,
+                        suggested_tier=excluded.suggested_tier,
+                        capabilities=excluded.capabilities,
+                        benchmark_ms=excluded.benchmark_ms,
+                        timeout_secs=excluded.timeout_secs,
+                        is_available=excluded.is_available,
+                        last_checked=excluded.last_checked
+                    """,
+                    (
+                        m.model_id, m.provider, m.size_b, m.suggested_tier,
+                        json.dumps(m.capabilities), m.benchmark_ms,
+                        m.timeout_secs, int(m.is_available), m.last_checked or now,
+                    ),
+                )
+            # Save tier assignments as JSON
+            tier_json = json.dumps(
+                {p: {"light": ta.light, "medium": ta.medium, "heavy": ta.heavy}
+                 for p, ta in result.tier_assignments.items()}
+            )
+            for key, value in [
+                ("ollama_hash", ollama_hash),
+                ("tier_assignments", tier_json),
+                ("completed_at", result.completed_at or now),
+                ("discovery_secs", str(result.discovery_secs)),
+            ]:
+                conn.execute(
+                    "INSERT INTO discovery_meta (key,value,updated_at) VALUES (?,?,?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (key, value, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_discovery(
+    current_ollama_hash: str,
+    max_age_hours: int = 24,
+) -> "DiscoveryResult | None":  # type: ignore[name-defined]
+    """Load cached DiscoveryResult if fresh and hash matches. Returns None on miss."""
+    from .discover import DiscoveryResult, ModelInfo, TierAssignment  # local import
+    conn = _connect()
+    try:
+        meta_rows = conn.execute(
+            "SELECT key, value, updated_at FROM discovery_meta"
+        ).fetchall()
+        meta = {r["key"]: r["value"] for r in meta_rows}
+        updated_at_str = next(
+            (r["updated_at"] for r in meta_rows if r["key"] == "completed_at"),
+            None,
+        )
+        if not meta or "ollama_hash" not in meta:
+            return None
+
+        # Check hash match (model set unchanged)
+        if meta["ollama_hash"] != current_ollama_hash:
+            return None
+
+        # Check age
+        if updated_at_str:
+            try:
+                from datetime import timedelta
+                updated = datetime.fromisoformat(updated_at_str)
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - updated
+                if age.total_seconds() > max_age_hours * 3600:
+                    return None
+            except Exception:
+                return None
+
+        # Load models
+        rows = conn.execute(
+            "SELECT * FROM model_cache WHERE is_available=1"
+        ).fetchall()
+        models = []
+        for r in rows:
+            models.append(ModelInfo(
+                model_id=r["model_id"],
+                provider=r["provider"],
+                size_b=r["size_b"] or 0.0,
+                suggested_tier=r["suggested_tier"] or "medium",
+                capabilities=json.loads(r["capabilities"] or '["general"]'),
+                benchmark_ms=r["benchmark_ms"] or 0,
+                timeout_secs=r["timeout_secs"] or 300,
+                is_available=bool(r["is_available"]),
+                last_checked=r["last_checked"] or "",
+            ))
+
+        # Load tier assignments
+        tier_assignments: dict[str, TierAssignment] = {}
+        if "tier_assignments" in meta:
+            try:
+                raw = json.loads(meta["tier_assignments"])
+                for provider, tiers in raw.items():
+                    tier_assignments[provider] = TierAssignment(
+                        light=tiers.get("light", ""),
+                        medium=tiers.get("medium", ""),
+                        heavy=tiers.get("heavy", ""),
+                    )
+            except Exception:
+                pass
+
+        result = DiscoveryResult(
+            models=models,
+            tier_assignments=tier_assignments,
+            from_cache=True,
+            completed_at=meta.get("completed_at", ""),
+        )
+        return result
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
