@@ -141,6 +141,9 @@ async def get_thinking_result(job_id: str) -> dict:
 
     Returns status (queued → running → complete | failed),
     duration_secs once complete, and the full reasoning chain + final_answer.
+
+    For fan_out jobs, also surfaces confidence_score, converged_claims, and
+    contested_areas at the top level for easy inspection.
     """
     job = store.get_job(job_id)
     if not job:
@@ -168,7 +171,16 @@ async def get_thinking_result(job_id: str) -> dict:
 
     if job["status"] == "complete" and job.get("result"):
         try:
-            response["result"] = json.loads(job["result"])
+            result = json.loads(job["result"])
+            response["result"] = result
+            # Surface fan-out convergence fields at the top level for convenience
+            if isinstance(result, dict) and result.get("type") == "fan_out":
+                if result.get("confidence_score") is not None:
+                    response["confidence_score"] = result["confidence_score"]
+                if result.get("converged_claims"):
+                    response["converged_claims"] = result["converged_claims"]
+                if result.get("contested_areas"):
+                    response["contested_areas"] = result["contested_areas"]
         except (json.JSONDecodeError, TypeError):
             response["result"] = job["result"]
     elif job["status"] == "failed":
