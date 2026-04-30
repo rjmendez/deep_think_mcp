@@ -46,12 +46,14 @@ async def _run_job(job: dict) -> None:
                 job_id, width, height, task_class, cfg.provider,
             )
         else:
+            verify = bool(provider_config.pop("verify", False))
             result = await engine.deep_think_passes(
                 question=job["question"],
                 passes=int(job["passes"]),
                 provider_cfg=cfg,
                 task_class=task_class,
                 data_policy=data_policy,
+                verify=verify,
             )
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 

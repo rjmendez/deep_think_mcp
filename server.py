@@ -68,6 +68,7 @@ async def deep_think_async(
     data_policy: str = "any",
     model: str = "",
     provider_config: Optional[dict] = None,
+    verify: bool = False,
 ) -> dict:
     """Queue a multi-pass reasoning job and return a job_id immediately.
 
@@ -100,6 +101,8 @@ async def deep_think_async(
             light_provider  Per-tier provider (e.g. "ollama" for cheap local)
             medium_provider Per-tier provider
             heavy_provider  Per-tier provider (e.g. "copilot" for synthesis)
+        verify:      If True, runs an extra heavy-tier re-traversal pass after the main passes
+                     to check for gaps, contradictions, and unsupported claims (RYS verification).
 
     Provider secrets via environment variables only:
         ANTHROPIC_API_KEY              Anthropic API key
@@ -121,7 +124,7 @@ async def deep_think_async(
         passes=max(2, min(passes, 6)),
         provider=cfg.provider,
         model_summary=summary,
-        provider_config_json=json.dumps({**pc, "task_class": task_class, "data_policy": data_policy}),
+        provider_config_json=json.dumps({**pc, "task_class": task_class, "data_policy": data_policy, "verify": verify}),
     )
 
     return {
@@ -181,6 +184,9 @@ async def get_thinking_result(job_id: str) -> dict:
                     response["converged_claims"] = result["converged_claims"]
                 if result.get("contested_areas"):
                     response["contested_areas"] = result["contested_areas"]
+            # Surface verification_pass at the top level for deep_think jobs
+            if isinstance(result, dict) and result.get("verification_pass") is not None:
+                response["verification_pass"] = result["verification_pass"]
         except (json.JSONDecodeError, TypeError):
             response["result"] = job["result"]
     elif job["status"] == "failed":
@@ -336,3 +342,18 @@ async def list_thinking_jobs(status: str = "all", limit: int = 10) -> dict:
     """
     jobs = store.list_jobs(status=status, limit=min(limit, 100))
     return {"count": len(jobs), "jobs": jobs}
+
+
+def main():
+    transport = os.getenv("DEEP_THINK_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        host = os.getenv("DEEP_THINK_HOST", "0.0.0.0")
+        port = int(os.getenv("DEEP_THINK_PORT", "8080"))
+        log.info("Starting HTTP/SSE server on %s:%d", host, port)
+        mcp.run(transport="streamable-http", host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
