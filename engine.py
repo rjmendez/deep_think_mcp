@@ -10,7 +10,16 @@ Provider selection priority (per tier):
   3. DEEP_THINK_<TIER>_PROVIDER env var — per-tier env override
   4. provider_config["provider"] — default provider for all tiers
   5. Auto-detected from credentials: ANTHROPIC_API_KEY → "anthropic",
-     Copilot token → "copilot", fallback → "ollama"
+     GITHUB_MODELS_TOKEN → "copilot", fallback → "ollama"
+
+GitHub Copilot provider ("copilot"):
+  Uses the official GitHub Models API (models.github.ai/inference/chat/completions).
+  Requires a fine-grained personal access token with the "models:read" permission.
+  Classic OAuth tokens from `gh auth token` do NOT work — they lack the models:read scope.
+  Set env var GITHUB_MODELS_TOKEN to your fine-grained PAT.
+  Model IDs use publisher/model format: "openai/gpt-4.1", "openai/gpt-5", etc.
+  Available families: OpenAI (gpt-5, o3, gpt-4.1), Meta Llama, Mistral, DeepSeek, xAI Grok.
+  Claude models are NOT available via GitHub Models — use the "anthropic" provider instead.
 
 Model selection priority (per tier: light / medium / heavy):
   1. provider_config["model"] — single override for all tiers
@@ -47,9 +56,6 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
-# Cached GitHub Copilot session token (expires ~25 min, re-fetched lazily).
-_copilot_session: dict = {"token": "", "expires_at": 0.0}
-
 # Ollama model availability cache — populated by refresh_ollama_models() at startup.
 _ollama_discovered: set[str] = set()
 
@@ -80,9 +86,9 @@ _ANTHROPIC_DEFAULTS = {
     "heavy":  "claude-opus-4-7",
 }
 _COPILOT_DEFAULTS = {
-    "light":  "claude-sonnet-4.5",
-    "medium": "claude-sonnet-4.6",
-    "heavy":  "claude-opus-4.7",
+    "light":  "openai/gpt-4.1-mini",
+    "medium": "openai/gpt-4.1",
+    "heavy":  "openai/gpt-5",
 }
 _OLLAMA_DEFAULTS = {
     "light":  "phi4-mini:latest",
@@ -91,25 +97,19 @@ _OLLAMA_DEFAULTS = {
 }
 
 
-def _read_copilot_oauth_token() -> str:
-    env_token = os.getenv("GITHUB_COPILOT_OAUTH_TOKEN", "").strip()
-    if env_token:
-        return env_token
-    hosts_path = os.getenv("GH_HOSTS_YML_PATH", "").strip()
-    if not hosts_path:
-        xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
-        hosts_path = (
-            os.path.join(xdg, "gh", "hosts.yml")
-            if xdg
-            else os.path.expanduser("~/.config/gh/hosts.yml")
-        )
-    try:
-        import yaml  # type: ignore
-        with open(hosts_path) as f:
-            hosts = yaml.safe_load(f) or {}
-        return hosts.get("github.com", {}).get("oauth_token", "")
-    except Exception:
-        return ""
+def _read_github_models_token() -> str:
+    """Read GitHub Models fine-grained PAT.
+
+    Checks (in order):
+      1. GITHUB_MODELS_TOKEN env var (preferred — fine-grained PAT with models:read)
+      2. GITHUB_TOKEN env var (fallback — may work if token has models:read)
+      3. GITHUB_COPILOT_OAUTH_TOKEN env var (legacy name — will likely fail without models:read)
+    """
+    for var in ("GITHUB_MODELS_TOKEN", "GITHUB_TOKEN", "GITHUB_COPILOT_OAUTH_TOKEN"):
+        val = os.getenv(var, "").strip()
+        if val and val not in ("not-set", ""):
+            return val
+    return ""
 
 
 def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
@@ -131,7 +131,7 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
         anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
         if anthropic_key and anthropic_key not in ("not-set", ""):
             cfg.provider = "anthropic"
-        elif _read_copilot_oauth_token():
+        elif _read_github_models_token():
             cfg.provider = "copilot"
         else:
             cfg.provider = "ollama"
@@ -499,55 +499,54 @@ TASK_CLASS_PROFILES: dict = {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4.5",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1",    "heavy": "openai/gpt-5"},
         "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "code_review": {
         "description": "Code analysis, bug detection, security review, code quality.",
         "directives": CODE_REVIEW_DIRECTIVES,
-        # qwen2.5-coder is code-specialized; gpt-5.2-codex on copilot side
-        "ollama":    {"light": "qwen2.5-coder:7b",    "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4.1",             "medium": "gpt-5.2-codex",     "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        # qwen2.5-coder is code-specialized; codestral on copilot side
+        "ollama":    {"light": "qwen2.5-coder:7b",         "medium": "qwen2.5-coder:7b",          "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini",      "medium": "mistral-ai/codestral-2501", "heavy": "openai/gpt-5"},
+        "anthropic": {"light": "claude-haiku-4-5",         "medium": "claude-sonnet-4-6",         "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4.5",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
         "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "safety": {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
-        # granite3-guardian not used as reasoning tier (binary output) — pre-pass only
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "gpt-4.1",             "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
         "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
         "description": "Structured data extraction, entity recognition, schema-constrained JSON output.",
         "directives": EXTRACTION_DIRECTIVES,
         # Lighter models are fine — extraction is pattern matching, not deep reasoning
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
-        "copilot":   {"light": "gpt-4.1",             "medium": "gpt-4.1",           "heavy": "claude-sonnet-4.6"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
+        "ollama":    {"light": "phi4-mini:latest",    "medium": "mistral:7b",       "heavy": "llama3.1:8b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1",  "heavy": "openai/gpt-4.1"},
+        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-haiku-4-5", "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4.5",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "ollama":    {"light": "phi4-mini:latest",    "medium": "llama3.1:8b",    "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/gpt-4.1", "heavy": "openai/gpt-5"},
         "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
         "directives": REASONING_DIRECTIVES,
-        # Bias toward larger/stronger models — reasoning benefits most from scale
-        "ollama":    {"light": "phi4-mini:latest",    "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
-        "copilot":   {"light": "claude-sonnet-4.5",   "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        # o-series and deepseek-r1 excel at structured reasoning
+        "ollama":    {"light": "phi4-mini:latest",    "medium": "qwen3.5:27b",              "heavy": "qwen3.5:27b"},
+        "copilot":   {"light": "openai/gpt-4.1-mini", "medium": "openai/o4-mini",           "heavy": "openai/o3"},
+        "anthropic": {"light": "claude-haiku-4-5",    "medium": "claude-sonnet-4-6",        "heavy": "claude-opus-4-7"},
     },
 }
 
@@ -583,47 +582,12 @@ _AUTO_CONFIDENCE_THRESHOLD = 0.75  # minimum confidence to accept auto-classifie
 # ---------------------------------------------------------------------------
 
 
-async def _get_copilot_session_token(oauth_token: str) -> str:
-    import time as _time
-    import httpx  # type: ignore
-
-    global _copilot_session
-    if _copilot_session["token"] and _time.time() < _copilot_session["expires_at"] - 60:
-        return _copilot_session["token"]
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            "https://api.github.com/copilot_internal/v2/token",
-            headers={
-                "Authorization": f"token {oauth_token}",
-                "editor-version": "vscode/1.85.0",
-                "Copilot-Integration-Id": "vscode-chat",
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    session_token = data.get("token", "")
-    try:
-        from datetime import datetime, timezone as _tz
-        expires_at = datetime.fromisoformat(
-            data["expires_at"].replace("Z", "+00:00")
-        ).timestamp()
-    except Exception:
-        import time as _t2
-        expires_at = _t2.time() + 1500
-
-    _copilot_session = {"token": session_token, "expires_at": expires_at}
-    return session_token
-
-
 def _timeout_for(model_id: str, provider: str) -> int:
     """Return the per-call timeout for this model, consulting discovery cache."""
     from . import discover as _discover
     disc = _discover.get_current()
     if disc:
         return disc.timeout_for(model_id, provider)
-    # Pre-discovery fallback
     if provider in ("anthropic", "copilot"):
         return _discover.cloud_timeout(model_id)
     return _discover._TIMEOUT_MAX_SECS  # conservative 300s for unknown local models
@@ -656,20 +620,23 @@ async def _call_anthropic(
 
 async def _call_copilot(
     prompt: str, tier: str, cfg: ProviderConfig,
-    copilot_oauth: str, task_class: str = "general",
+    github_token: str, task_class: str = "general",
 ) -> tuple[str, str]:
+    """Call the GitHub Models API (models.github.ai).
+
+    Requires a fine-grained PAT with models:read permission (GITHUB_MODELS_TOKEN).
+    Model IDs use publisher/model format: "openai/gpt-4.1", "openai/gpt-5", etc.
+    """
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
     timeout = _timeout_for(model_id, "copilot")
-    session_token = await _get_copilot_session_token(copilot_oauth)
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
-            "https://api.githubcopilot.com/chat/completions",
+            "https://models.github.ai/inference/chat/completions",
             headers={
-                "Authorization": f"Bearer {session_token}",
-                "Copilot-Integration-Id": "vscode-chat",
-                "editor-version": "vscode/1.85.0",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {github_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/vnd.github+json",
             },
             json={
                 "model": model_id,
@@ -701,7 +668,7 @@ async def _call_ollama(
 
 async def _call_provider(
     prompt: str, tier: str, cfg: ProviderConfig,
-    anthropic_key: str = "", copilot_oauth: str = "",
+    anthropic_key: str = "", github_token: str = "",
     task_class: str = "general",
 ) -> tuple[str, str]:
     """Dispatch to the correct provider for this tier."""
@@ -709,13 +676,13 @@ async def _call_provider(
     if provider == "anthropic":
         return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class)
     if provider == "copilot":
-        return await _call_copilot(prompt, tier, cfg, copilot_oauth, task_class)
+        return await _call_copilot(prompt, tier, cfg, github_token, task_class)
     return await _call_ollama(prompt, tier, cfg, task_class)
 
 
 async def classify_task(
     question: str, cfg: ProviderConfig,
-    anthropic_key: str = "", copilot_oauth: str = "",
+    anthropic_key: str = "", github_token: str = "",
 ) -> tuple[str, float, str]:
     """Pass-0 task classifier. Returns (task_class, confidence, rationale).
     Falls back to ("general", 0.0, reason) on any error.
@@ -724,7 +691,7 @@ async def classify_task(
     prompt = _TASK_CLASSIFIER_PROMPT.format(question=question[:600])
     try:
         text, _ = await asyncio.wait_for(
-            _call_provider(prompt, "light", cfg, anthropic_key, copilot_oauth, "general"),
+            _call_provider(prompt, "light", cfg, anthropic_key, github_token, "general"),
             timeout=20.0,
         )
         # Extract JSON from response (model may wrap it in backticks)
@@ -796,8 +763,8 @@ async def deep_think_passes(
 
     # Gather credentials once
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    copilot_oauth = (
-        _read_copilot_oauth_token()
+    github_token = (
+        _read_github_models_token()
         if any(_tier_provider(cfg, t) == "copilot" for t in ("light", "medium", "heavy"))
         else ""
     )
@@ -808,7 +775,7 @@ async def deep_think_passes(
 
     if task_class == "auto":
         detected, confidence, rationale = await classify_task(
-            question, cfg, anthropic_key, copilot_oauth
+            question, cfg, anthropic_key, github_token
         )
         classifier_meta = {
             "detected": detected,
@@ -871,7 +838,7 @@ async def deep_think_passes(
             )
 
         text, model_used = await _call_provider(
-            prompt, tier, cfg, anthropic_key, copilot_oauth, resolved_class
+            prompt, tier, cfg, anthropic_key, github_token, resolved_class
         )
         history.append({
             "pass": i + 1,
