@@ -1,0 +1,24 @@
+# Environment — never commit secrets
+.env
+*.env
+
+# Runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Database (jobs + discovery cache — machine-local)
+*.db
+*.db-wal
+*.db-shm
+~/.deep_think/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
