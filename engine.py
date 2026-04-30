@@ -89,8 +89,8 @@ _COPILOT_DEFAULTS = {
 }
 _OLLAMA_DEFAULTS = {
     "light":  "phi4-mini:latest",
-    "medium": "llama3.1:8b",
-    "heavy":  "qwen3.5:27b",
+    "medium": "qwen3:8b",
+    "heavy":  "deepseek-r1:8b",
 }
 
 
@@ -498,7 +498,7 @@ TASK_CLASS_PROFILES: dict = {
     "general": {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -506,14 +506,14 @@ TASK_CLASS_PROFILES: dict = {
         "description": "Code analysis, bug detection, security review, code quality.",
         "directives": CODE_REVIEW_DIRECTIVES,
         # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
-        "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen3.5:27b"},
+        "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -521,30 +521,30 @@ TASK_CLASS_PROFILES: dict = {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
         "description": "Structured data extraction, entity recognition, schema-constrained JSON output.",
         "directives": EXTRACTION_DIRECTIVES,
-        # Lighter models are fine — extraction is pattern matching, not deep reasoning
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "mistral:7b",        "heavy": "llama3.1:8b"},
+        # Code-tuned models excel at structured JSON; extraction is pattern-matching over deep reasoning
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "qwen3.5:27b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
         "directives": REASONING_DIRECTIVES,
-        # qwen3.5 for heavy local reasoning; sonnet for cloud medium (gpt-5.2 not on /chat/completions)
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "qwen3.5:27b"},
+        # deepseek-r1:8b is the pure reasoning specialist; ideal for all challenge and synthesis passes
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "deepseek-r1:8b",    "heavy": "deepseek-r1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
