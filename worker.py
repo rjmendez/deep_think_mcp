@@ -33,6 +33,7 @@ async def _run_job(job: dict) -> None:
             max_parallel = int(provider_config.pop("max_parallel", 2))
             max_width = int(provider_config.pop("max_width", 6))
             confidence_threshold = int(provider_config.pop("confidence_threshold", 50))
+            extract_claims = bool(provider_config.pop("extract_claims", False))
             result = await engine.run_fan_out(
                 question=job["question"],
                 width=width,
@@ -44,6 +45,7 @@ async def _run_job(job: dict) -> None:
                 job_id=job_id,
                 max_width=max_width,
                 confidence_threshold=confidence_threshold,
+                extract_claims=extract_claims,
             )
             log.info(
                 "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",

@@ -145,8 +145,8 @@ async def get_thinking_result(job_id: str) -> dict:
     Returns status (queued → running → complete | failed),
     duration_secs once complete, and the full reasoning chain + final_answer.
 
-    For fan_out jobs, also surfaces confidence_score, converged_claims, and
-    contested_areas at the top level for easy inspection.
+    For fan_out jobs, also surfaces confidence_score, converged_claims,
+    contested_areas, and claim_sets at the top level for easy inspection.
     """
     job = store.get_job(job_id)
     if not job:
@@ -184,6 +184,8 @@ async def get_thinking_result(job_id: str) -> dict:
                     response["converged_claims"] = result["converged_claims"]
                 if result.get("contested_areas"):
                     response["contested_areas"] = result["contested_areas"]
+                if result.get("claim_sets"):
+                    response["claim_sets"] = result["claim_sets"]
                 response["adaptive_triggered"] = result.get("adaptive_triggered", False)
                 if result.get("adaptive_triggered"):
                     response["adaptive_reason"] = result.get("adaptive_reason", "")
@@ -257,6 +259,7 @@ async def deep_think_fan_out(
     max_parallel: int = 2,
     max_width: int = 6,
     confidence_threshold: int = 50,
+    extract_claims: bool = False,
     provider_config: Optional[dict] = None,
 ) -> dict:
     """Queue a perspective fan-out reasoning job and return a job_id immediately.
@@ -292,6 +295,9 @@ async def deep_think_fan_out(
                               heavy-tier limits). Increase to 4 for Enterprise accounts.
         max_width:            Upper bound on total perspectives after adaptive expansion (default 6).
         confidence_threshold: Trigger adaptive expansion when confidence_score < this value (default 50).
+        extract_claims:       If True, distil each perspective's prose into a structured claim set
+                              (light-tier model) before synthesis. Reduces synthesis context ~10-20×.
+                              Default False.
         provider_config: Optional per-call model/provider overrides (no secrets).
 
     Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
@@ -325,6 +331,7 @@ async def deep_think_fan_out(
             "max_parallel": max_parallel,
             "max_width": max_width,
             "confidence_threshold": confidence_threshold,
+            "extract_claims": extract_claims,
         }),
     )
 
