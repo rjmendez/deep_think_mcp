@@ -1223,6 +1223,7 @@ async def deep_think_passes(
     task_class: str = "general",
     data_policy: str = "any",
     mandate_prefix: str = "",
+    verify: bool = False,
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
@@ -1338,13 +1339,48 @@ async def deep_think_passes(
             i + 1, passes, framing, _tier_provider(cfg, tier), model_used,
         )
 
+    final_answer = history[-1]["output"]
+
+    # --- Optional verification re-traversal pass (RYS principle) ---
+    verification_pass_text: str | None = None
+    if verify:
+        verify_prompt = (
+            f"You have just completed a {passes}-pass reasoning process on this question:\n\n"
+            f"{question}\n\n"
+            f"Your current best answer is:\n{final_answer}\n\n"
+            "Now re-examine your answer with fresh eyes. Identify:\n"
+            "1. Any gaps — important aspects of the question you didn't address\n"
+            "2. Any contradictions — claims in your answer that conflict with each other\n"
+            "3. Any unsupported claims — assertions not backed by the evidence/reasoning provided\n"
+            "4. Any missed implications — logical consequences of your answer you didn't follow through\n\n"
+            "If your answer is solid and complete, say so explicitly. "
+            "If you find issues, provide a corrected or supplemented final answer."
+        )
+        try:
+            verify_text, verify_model = await _call_provider(
+                prompt=verify_prompt,
+                tier="heavy",
+                cfg=cfg,
+                anthropic_key=anthropic_key,
+                github_token=github_token,
+                task_class=resolved_class,
+            )
+            verification_pass_text = verify_text
+            v_lower = verify_text.lower().strip()
+            if any(v_lower.startswith(kw) for kw in ("corrected", "updated", "revised", "amended")):
+                final_answer = verify_text
+            log.debug("Verification pass complete (model=%s)", verify_model)
+        except Exception as exc:
+            log.warning("Verification pass failed (non-fatal): %s", exc)
+
     result: dict = {
         "task_class": resolved_class,
         "provider": model_summary(cfg, resolved_class),
         "passes": passes,
         "question": question,
         "reasoning_chain": history,
-        "final_answer": history[-1]["output"],
+        "final_answer": final_answer,
+        "verification_pass": verification_pass_text,
     }
     if classifier_meta:
         result["classifier"] = classifier_meta
