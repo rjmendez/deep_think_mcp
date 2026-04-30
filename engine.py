@@ -1169,6 +1169,9 @@ async def _call_provider(
 ) -> tuple[str, str]:
     """Dispatch to the correct provider for this tier.
 
+    Future: agentic tool-calling loop (issue #1) — passes will be able to
+    execute MCP tools mid-reasoning and fold results back into history.
+
     If the primary provider is Ollama and it times out, and
     DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true is set, automatically retries
     on the first available cloud provider (Copilot → Anthropic).
