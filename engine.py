@@ -46,6 +46,8 @@ Qwen thinking mode:
   for all Ollama models.
 """
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1218,7 +1220,6 @@ async def classify_task(
     """Pass-0 task classifier. Returns (task_class, confidence, rationale).
     Falls back to ("general", 0.0, reason) on any error.
     """
-    import asyncio
     prompt = _TASK_CLASSIFIER_PROMPT.format(question=question[:600])
     try:
         text, _ = await asyncio.wait_for(
@@ -1360,9 +1361,8 @@ async def deep_think_passes(
     # --- Main reasoning passes ---
     # Compute a run signature that locks in all execution inputs.
     # Cached passes are only replayed if the signature matches exactly.
-    import hashlib as _hashlib
     from . import store as _store
-    _run_sig = _hashlib.sha256(
+    _run_sig = hashlib.sha256(
         "\n".join([
             question,
             str(passes),
