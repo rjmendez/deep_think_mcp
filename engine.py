@@ -1192,10 +1192,18 @@ async def _call_provider(
             tier, exc,
         )
         if github_token:
-            fallback_cfg = dataclasses_replace(cfg, provider="copilot")
+            # Clear per-tier provider overrides so _model_for_tier resolves against
+            # the copilot profile instead of falling back to Ollama model IDs.
+            fallback_cfg = dataclasses_replace(
+                cfg, provider="copilot",
+                light_provider="", medium_provider="", heavy_provider="",
+            )
             return await _call_copilot(prompt, tier, fallback_cfg, github_token, task_class)
         if anthropic_key:
-            fallback_cfg = dataclasses_replace(cfg, provider="anthropic")
+            fallback_cfg = dataclasses_replace(
+                cfg, provider="anthropic",
+                light_provider="", medium_provider="", heavy_provider="",
+            )
             return await _call_anthropic(prompt, tier, fallback_cfg, anthropic_key, task_class)
         raise RuntimeError(
             f"Ollama timed out and no cloud provider credentials available for fallback. "
