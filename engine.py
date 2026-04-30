@@ -10,16 +10,13 @@ Provider selection priority (per tier):
   3. DEEP_THINK_<TIER>_PROVIDER env var — per-tier env override
   4. provider_config["provider"] — default provider for all tiers
   5. Auto-detected from credentials: ANTHROPIC_API_KEY → "anthropic",
-     GITHUB_MODELS_TOKEN → "copilot", fallback → "ollama"
+     GITHUB_COPILOT_OAUTH_TOKEN → "copilot", fallback → "ollama"
 
 GitHub Copilot provider ("copilot"):
-  Uses the official GitHub Models API (models.github.ai/inference/chat/completions).
-  Requires a fine-grained personal access token with the "models:read" permission.
-  Classic OAuth tokens from `gh auth token` do NOT work — they lack the models:read scope.
-  Set env var GITHUB_MODELS_TOKEN to your fine-grained PAT.
-  Model IDs use publisher/model format: "openai/gpt-4.1", "openai/gpt-5", etc.
-  Available families: OpenAI (gpt-5, o3, gpt-4.1), Meta Llama, Mistral, DeepSeek, xAI Grok.
-  Claude models are NOT available via GitHub Models — use the "anthropic" provider instead.
+  Uses the GitHub Copilot API (api.githubcopilot.com/chat/completions).
+  Requires a GitHub OAuth token with copilot scope (gho_ from `gh auth token`).
+  run.sh injects this automatically via GITHUB_COPILOT_OAUTH_TOKEN.
+  Available models: claude-opus-4.7, claude-sonnet-4.6, gpt-5.4, gpt-5.2-codex, gpt-4o-mini, etc.
 
 Model selection priority (per tier: light / medium / heavy):
   1. provider_config["model"] — single override for all tiers
@@ -557,6 +554,407 @@ TASK_CLASS_NAMES = list(TASK_CLASS_PROFILES.keys())
 
 
 # ---------------------------------------------------------------------------
+# Perspective mandates for fan-out mode
+# ---------------------------------------------------------------------------
+# Each task class has exactly 6 mandates (max width). Width clips from the front.
+# Mandates are adversarial/complementary — each forces a structurally different lens.
+
+PERSPECTIVE_MANDATES: dict[str, list[dict]] = {
+    "investigation": [
+        {
+            "name": "defense",
+            "mandate": (
+                "You are defense counsel for the subject under investigation. "
+                "Your ONLY job is to find innocent, benign, or alternative explanations "
+                "for every data point. Challenge every threat inference. Identify gaps, "
+                "ambiguities, and alternative explanations. Argue against any conclusion "
+                "of malicious intent. Find the weakest links in the threat case."
+            ),
+        },
+        {
+            "name": "prosecution",
+            "mandate": (
+                "You are the threat analyst building the strongest possible case. "
+                "Your ONLY job is to identify indicators of compromise, insider threat, "
+                "or malicious activity. Assume worst-case interpretations of ambiguous signals. "
+                "Do not give benefit of the doubt. Build the most compelling threat narrative "
+                "the evidence supports."
+            ),
+        },
+        {
+            "name": "forensics",
+            "mandate": (
+                "You are the forensic evidence analyst. You care ONLY about evidence quality, "
+                "not guilt or innocence. What can actually be proven vs. inferred? "
+                "What is the chain of custody and evidentiary integrity? "
+                "What claims are overstated relative to the actual data? "
+                "What evidence gaps exist that prevent firm conclusions?"
+            ),
+        },
+        {
+            "name": "compliance",
+            "mandate": (
+                "You are the compliance and legal analyst. You do not care about the individual. "
+                "You care ONLY about the organization's regulatory exposure, policy violations, "
+                "notification obligations, and liability — regardless of intent or outcome. "
+                "What policies were violated? What mandatory actions does the organization face?"
+            ),
+        },
+        {
+            "name": "red_team",
+            "mandate": (
+                "You are the red team analyst. Assume the subject IS a threat actor with "
+                "full intent. Map out: what access and data they have already obtained, "
+                "what they would logically do next, what damage could already be done, "
+                "and what the highest-risk follow-on actions are. "
+                "Think like an attacker, not an investigator."
+            ),
+        },
+        {
+            "name": "timeline",
+            "mandate": (
+                "You are the timeline analyst. Construct a strict chronological narrative "
+                "from the available evidence. Flag every gap in the timeline where activity "
+                "is unaccounted for. Identify overlaps, inconsistencies, and sequences that "
+                "require specific explanations. What had to happen for this sequence to occur?"
+            ),
+        },
+    ],
+    "general": [
+        {
+            "name": "primary",
+            "mandate": (
+                "You are the primary analyst. Provide a thorough, balanced analysis "
+                "of the question from first principles. Cover all major angles."
+            ),
+        },
+        {
+            "name": "adversarial",
+            "mandate": (
+                "You are the adversarial reviewer. Your ONLY job is to challenge the "
+                "primary framing. Find every assumption, logical gap, and place where "
+                "the conclusion is overstated. What does standard analysis get wrong or miss?"
+            ),
+        },
+        {
+            "name": "alternative",
+            "mandate": (
+                "You are the alternative framing analyst. Your ONLY job is to propose "
+                "different interpretations, underexplored angles, and alternative conclusions "
+                "that a standard analysis would not surface."
+            ),
+        },
+        {
+            "name": "technical",
+            "mandate": (
+                "You are the technical accuracy reviewer. Check domain-specific precision. "
+                "Are technical claims correct? Are the underlying mechanisms described "
+                "accurately? Flag every technically imprecise or incorrect statement."
+            ),
+        },
+        {
+            "name": "risk",
+            "mandate": (
+                "You are the risk analyst. Identify what could go wrong with the proposed "
+                "analysis or conclusions. What are the failure modes? What happens if the "
+                "key assumptions are wrong? What are the second-order consequences?"
+            ),
+        },
+        {
+            "name": "devils_advocate",
+            "mandate": (
+                "You are devil's advocate. Steelman the strongest case AGAINST the "
+                "primary conclusion. Make the best possible argument for the opposite "
+                "position. What evidence most strongly supports the alternative view?"
+            ),
+        },
+    ],
+    "code_review": [
+        {
+            "name": "correctness",
+            "mandate": (
+                "You are the correctness reviewer. Find every bug, logic error, and "
+                "incorrect behavior. Focus on what the code ACTUALLY does versus what "
+                "it SHOULD do. Include off-by-one errors, incorrect conditionals, "
+                "and mishandled return values."
+            ),
+        },
+        {
+            "name": "security",
+            "mandate": (
+                "You are the security auditor. Find every vulnerability and unsafe pattern. "
+                "Focus on injection (SQL, command, path), authentication bypass, "
+                "privilege escalation, insecure deserialization, and data exposure. "
+                "Assume an adversarial input environment."
+            ),
+        },
+        {
+            "name": "performance",
+            "mandate": (
+                "You are the performance reviewer. Find every inefficiency, unnecessary "
+                "allocation, O(n²) loop, blocking call, and scalability bottleneck. "
+                "Focus on what breaks under load or with large data."
+            ),
+        },
+        {
+            "name": "maintainability",
+            "mandate": (
+                "You are the maintainability reviewer. Find every readability issue, "
+                "missing abstraction, god object, and violation of SOLID principles. "
+                "Focus on what makes this code hard to change six months from now."
+            ),
+        },
+        {
+            "name": "api_contract",
+            "mandate": (
+                "You are the API contract reviewer. Check every interface for unclear "
+                "contracts, undocumented invariants, surprising behaviors, and breaking "
+                "change risks. What would callers reasonably assume that is actually wrong?"
+            ),
+        },
+        {
+            "name": "edge_cases",
+            "mandate": (
+                "You are the edge case hunter. Find every boundary condition, "
+                "null/empty/zero/overflow scenario, and error handling gap. "
+                "What inputs break the code in unexpected ways?"
+            ),
+        },
+    ],
+    "safety": [
+        {
+            "name": "harm_assessment",
+            "mandate": (
+                "You are the harm assessor. Identify every potential harm vector: "
+                "who could be affected, how, and with what severity. "
+                "Consider direct, indirect, and downstream harms. Be comprehensive."
+            ),
+        },
+        {
+            "name": "policy_compliance",
+            "mandate": (
+                "You are the policy compliance reviewer. Check against relevant laws, "
+                "regulations, and organizational policies. What specific rules are implicated? "
+                "What mandatory obligations apply?"
+            ),
+        },
+        {
+            "name": "mitigations",
+            "mandate": (
+                "You are the mitigations analyst. For each identified harm or risk, "
+                "propose concrete, implementable mitigations. Focus on controls that "
+                "actually reduce risk, not theoretical safeguards."
+            ),
+        },
+        {
+            "name": "false_positives",
+            "mandate": (
+                "You are the false positive auditor. Your ONLY job is to find where "
+                "the harm assessment over-reaches. What benign use cases are being "
+                "incorrectly flagged? What context makes the concern less serious?"
+            ),
+        },
+        {
+            "name": "context",
+            "mandate": (
+                "You are the context analyst. What additional context would change "
+                "the safety assessment? What is unknown? What assumptions are being "
+                "made about intent, capability, and environment?"
+            ),
+        },
+        {
+            "name": "legal",
+            "mandate": (
+                "You are the legal analyst. What regulatory, liability, and notification "
+                "obligations apply? What is the organization's legal exposure? "
+                "What must be reported or remediated under applicable law?"
+            ),
+        },
+    ],
+    "reasoning": [
+        {
+            "name": "formal",
+            "mandate": (
+                "You are the formal reasoner. Translate the problem into formal logical "
+                "or mathematical terms. Apply rigorous deductive reasoning. Flag every "
+                "place where informal or intuitive arguments are used without proof."
+            ),
+        },
+        {
+            "name": "adversarial",
+            "mandate": (
+                "You are the adversarial logician. Find every flaw in the reasoning chain. "
+                "What premises are false or unproven? What inferences are invalid? "
+                "What conclusions don't follow from the premises?"
+            ),
+        },
+        {
+            "name": "constraints",
+            "mandate": (
+                "You are the constraints analyst. Identify every hard limit, impossibility, "
+                "and boundary condition. What cannot be true given the constraints? "
+                "What solutions are ruled out? What is the feasible solution space?"
+            ),
+        },
+        {
+            "name": "alternative",
+            "mandate": (
+                "You are the alternative approach finder. Find different ways to solve "
+                "or frame the problem. What other methods or perspectives lead to "
+                "the same or different conclusions?"
+            ),
+        },
+        {
+            "name": "verification",
+            "mandate": (
+                "You are the step verifier. Check each reasoning step independently. "
+                "Can you verify each claim from first principles without relying on "
+                "the correctness of previous steps?"
+            ),
+        },
+        {
+            "name": "simplification",
+            "mandate": (
+                "You are the Occam's Razor analyst. Find the simplest correct explanation "
+                "or solution. Where is the analysis over-complicated? "
+                "What can be reduced without loss of correctness?"
+            ),
+        },
+    ],
+    "synthesis": [
+        {
+            "name": "structure",
+            "mandate": (
+                "You are the structure reviewer. Evaluate logical flow, organization, "
+                "and coherence. Is the document well-structured? Does each section "
+                "follow from the last? Where does the flow break?"
+            ),
+        },
+        {
+            "name": "accuracy",
+            "mandate": (
+                "You are the fact-checker. Verify every specific claim (numbers, dates, "
+                "names, citations) against the source material provided. "
+                "Flag every contradiction or unsupported claim."
+            ),
+        },
+        {
+            "name": "clarity",
+            "mandate": (
+                "You are the clarity reviewer. Identify every sentence or section that "
+                "is ambiguous, jargon-heavy, or unclear to the intended audience. "
+                "What would a reader misunderstand?"
+            ),
+        },
+        {
+            "name": "completeness",
+            "mandate": (
+                "You are the completeness reviewer. What important topics, caveats, "
+                "or perspectives are missing? What would a thorough treatment include "
+                "that this document does not?"
+            ),
+        },
+        {
+            "name": "audience",
+            "mandate": (
+                "You are the audience analyst. Is the content appropriate for the "
+                "intended reader? What would the target audience find unconvincing, "
+                "confusing, or insufficiently supported?"
+            ),
+        },
+        {
+            "name": "attribution",
+            "mandate": (
+                "You are the attribution reviewer. Check every claim for confidence "
+                "calibration. What is stated as fact that is actually inference? "
+                "What sources are overrepresented or missing?"
+            ),
+        },
+    ],
+    "extraction": [
+        {
+            "name": "schema",
+            "mandate": (
+                "You are the schema adherence reviewer. Does the extraction conform to "
+                "the required schema? What fields are missing, wrong type, "
+                "or incorrectly formatted?"
+            ),
+        },
+        {
+            "name": "completeness",
+            "mandate": (
+                "You are the completeness reviewer. What entities were missed in the "
+                "extraction? Perform an independent extraction pass and compare against "
+                "the original."
+            ),
+        },
+        {
+            "name": "disambiguation",
+            "mandate": (
+                "You are the disambiguation reviewer. Where are similar entities conflated? "
+                "Where is the same entity referenced by different names? "
+                "Where are important distinctions being collapsed?"
+            ),
+        },
+        {
+            "name": "confidence",
+            "mandate": (
+                "You are the confidence calibrator. Assign confidence levels to every "
+                "extracted entity. What extractions are uncertain? "
+                "What requires human verification?"
+            ),
+        },
+        {
+            "name": "validation",
+            "mandate": (
+                "You are the cross-validator. Check extracted values for internal "
+                "consistency. Do dates make sense? Do quantities add up? "
+                "Are stated relationships logically consistent?"
+            ),
+        },
+        {
+            "name": "context",
+            "mandate": (
+                "You are the context analyst. What important context was lost in "
+                "extraction? What nuances cannot be captured in the schema? "
+                "Flag what the structured output fails to represent."
+            ),
+        },
+    ],
+}
+
+# Fan-out synthesis prompt — injected as the question for the final heavy synthesis pass.
+_FAN_OUT_SYNTHESIS_PROMPT = """You are the synthesis analyst integrating {n} independent perspective analyses of the following question.
+
+ORIGINAL QUESTION:
+{question}
+
+PERSPECTIVE ANALYSES:
+{perspectives}
+
+---
+Produce a structured synthesis with these four sections:
+
+## CONVERGENCE (High Confidence)
+What do multiple independent perspectives independently agree on? List only findings where different mandates arrived at the same conclusion through different reasoning paths. These are your highest-confidence outputs.
+
+## DIVERGENCE (Contested)
+Where do perspectives conflict? For each conflict: state the competing positions clearly and explain what the disagreement reveals about the underlying uncertainty or ambiguity.
+
+## GAPS
+What important angles were not addressed by any perspective, or where is evidence insufficient for any perspective to reach a conclusion?
+
+## INTEGRATED ASSESSMENT
+Synthesize all perspectives into a final answer that:
+- Leads with convergent high-confidence findings
+- Clearly marks contested areas with appropriate confidence levels
+- Notes remaining unknowns
+- Provides a concrete overall conclusion or recommendation
+
+Be direct and concrete. Do not repeat each perspective — integrate them."""
+
+
+# ---------------------------------------------------------------------------
 # Task classifier (Pass 0)
 # ---------------------------------------------------------------------------
 
@@ -750,6 +1148,7 @@ async def deep_think_passes(
     pass_overrides: list[tuple[str, str]] | None = None,
     task_class: str = "general",
     data_policy: str = "any",
+    mandate_prefix: str = "",
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
@@ -757,6 +1156,9 @@ async def deep_think_passes(
                 or an explicit class from TASK_CLASS_NAMES.
     data_policy: "any" (default), "local" (ollama-only), "cloud" (cloud-preferred).
                  Overrides cfg.data_policy if non-empty.
+    mandate_prefix: When set, injected into EVERY pass prompt before the question.
+                    Used by run_fan_out() to enforce a specific analytical perspective
+                    throughout the full reasoning chain.
     """
     cfg = provider_cfg or build_provider_config()
     if data_policy and data_policy != "any":
@@ -816,6 +1218,12 @@ async def deep_think_passes(
             f"[Safety pre-screen (granite3-guardian): {guardian_result}]\n\n"
         )
 
+    # Build mandate section — injected into every pass prompt when set
+    mandate_section = (
+        f"[ACTIVE MANDATE — FOLLOW STRICTLY]\n{mandate_prefix}\n[END MANDATE]\n\n"
+        if mandate_prefix else ""
+    )
+
     # --- Main reasoning passes ---
     history: list[dict] = []
     for i in range(passes):
@@ -830,13 +1238,13 @@ async def deep_think_passes(
                 f"[Pass {h['pass']} — {h['framing']}]\n{h['output']}" for h in history
             )
             prompt = (
-                f"{context_prefix}Question: {question}\n\n"
+                f"{context_prefix}{mandate_section}Question: {question}\n\n"
                 f"Prior reasoning:\n{prior}\n\n"
                 f"Pass {i + 1}/{passes}: {directive}"
             )
         else:
             prompt = (
-                f"{context_prefix}Question: {question}\n\n"
+                f"{context_prefix}{mandate_section}Question: {question}\n\n"
                 f"Pass 1/{passes}: {directive}"
             )
 
@@ -869,4 +1277,156 @@ async def deep_think_passes(
     if guardian_result:
         result["safety_precheck"] = guardian_result
 
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Fan-out reasoning: parallel perspectives + synthesis
+# ---------------------------------------------------------------------------
+
+
+async def run_fan_out(
+    question: str,
+    width: int = 3,
+    height: int = 2,
+    provider_cfg: ProviderConfig | None = None,
+    task_class: str = "general",
+    data_policy: str = "any",
+    max_parallel: int = 2,
+) -> str:
+    """Run a perspective fan-out: width parallel mandate-driven agents × height passes each.
+
+    Each perspective runs deep_think_passes() with its mandate injected into every prompt.
+    A final synthesis pass (heavy model) integrates all perspective outputs.
+
+    Args:
+        question:     The question or content to analyze.
+        width:        Number of parallel perspectives (1–6). Clips to available mandates.
+        height:       Number of reasoning passes per perspective (1–5).
+        provider_cfg: Provider configuration.
+        task_class:   Determines which set of perspective mandates to use.
+        data_policy:  "any" | "local" | "cloud"
+        max_parallel: Max perspectives running concurrently (default 2 — safe for Copilot
+                      Business heavy-tier concurrency limits). Increase to 4 for Enterprise.
+
+    Returns JSON string with perspectives + synthesis, matching deep_think schema shape.
+    """
+    import asyncio
+
+    cfg = provider_cfg or build_provider_config()
+    width = max(1, min(width, 6))
+    height = max(1, min(height, 5))
+
+    resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
+    mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
+    mandates = mandates[:width]
+
+    log.info(
+        "Fan-out: width=%d height=%d task_class=%s provider=%s",
+        width, height, resolved_class, cfg.provider,
+    )
+
+    # Semaphore limits concurrent perspective coroutines (each runs height passes serially).
+    # This is the primary rate-limit guard for cloud providers within a single job.
+    sem = asyncio.Semaphore(max(1, min(max_parallel, width)))
+
+    async def run_perspective(mandate: dict) -> dict:
+        name = mandate["name"]
+        mandate_text = (
+            f"[Perspective: {name.upper()}]\n"
+            f"{mandate['mandate']}"
+        )
+        async with sem:
+            log.debug("Fan-out perspective starting: %s", name)
+            raw = await deep_think_passes(
+                question=question,
+                passes=height,
+                provider_cfg=cfg,
+                task_class=resolved_class,
+                data_policy=data_policy,
+                mandate_prefix=mandate_text,
+            )
+        try:
+            parsed = json.loads(raw)
+            return {
+                "name": name,
+                "status": "complete",
+                "final_answer": parsed.get("final_answer", ""),
+                "passes_run": parsed.get("passes", height),
+            }
+        except Exception as e:
+            log.warning("Fan-out perspective %s: JSON parse failed: %s", name, e)
+            return {"name": name, "status": "complete", "final_answer": raw, "passes_run": height}
+
+    # Run all perspectives, capturing exceptions as structured failures
+    raw_results = await asyncio.gather(
+        *[run_perspective(m) for m in mandates],
+        return_exceptions=True,
+    )
+
+    # Normalize results — convert exceptions to failure records
+    perspective_outputs: list[dict] = []
+    for mandate, result in zip(mandates, raw_results):
+        if isinstance(result, Exception):
+            log.error("Fan-out perspective %s failed: %s", mandate["name"], result)
+            perspective_outputs.append({
+                "name": mandate["name"],
+                "status": "failed",
+                "error": str(result),
+                "final_answer": None,
+            })
+        else:
+            perspective_outputs.append(result)
+
+    successes = [p for p in perspective_outputs if p["status"] == "complete" and p["final_answer"]]
+    if len(successes) < max(1, width // 2):
+        raise RuntimeError(
+            f"Fan-out failed: only {len(successes)}/{width} perspectives succeeded — "
+            "too many failures to synthesize reliably."
+        )
+
+    # Build synthesis prompt
+    perspectives_text = "\n\n".join(
+        f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+        for p in successes
+    )
+    synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
+        n=len(successes),
+        question=question,
+        perspectives=perspectives_text,
+    )
+
+    log.debug("Fan-out: running synthesis pass (heavy tier)")
+    synthesis_raw = await deep_think_passes(
+        question=synthesis_question,
+        passes=1,
+        provider_cfg=cfg,
+        task_class="synthesis",
+        data_policy=data_policy,
+    )
+    try:
+        synthesis_parsed = json.loads(synthesis_raw)
+        synthesis_text = synthesis_parsed.get("final_answer", synthesis_raw)
+    except Exception:
+        synthesis_text = synthesis_raw
+
+    result: dict = {
+        "type": "fan_out",
+        "task_class": resolved_class,
+        "width": width,
+        "height": height,
+        "perspectives_attempted": width,
+        "perspectives_succeeded": len(successes),
+        "provider": model_summary(cfg, resolved_class),
+        "perspectives": [
+            {
+                "name": p["name"],
+                "status": p["status"],
+                "final_answer": p.get("final_answer"),
+                "error": p.get("error"),
+            }
+            for p in perspective_outputs
+        ],
+        "final_answer": synthesis_text,
+    }
     return json.dumps(result, indent=2)

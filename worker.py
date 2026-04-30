@@ -26,15 +26,35 @@ async def _run_job(job: dict) -> None:
         task_class = provider_config.pop("task_class", "general")
         data_policy = provider_config.pop("data_policy", "any")
         cfg = engine.build_provider_config(provider_config)
-        result = await engine.deep_think_passes(
-            question=job["question"],
-            passes=int(job["passes"]),
-            provider_cfg=cfg,
-            task_class=task_class,
-            data_policy=data_policy,
-        )
+
+        if provider_config.pop("fan_out", False):
+            width = int(provider_config.pop("width", 3))
+            height = int(provider_config.pop("height", 2))
+            max_parallel = int(provider_config.pop("max_parallel", 2))
+            result = await engine.run_fan_out(
+                question=job["question"],
+                width=width,
+                height=height,
+                provider_cfg=cfg,
+                task_class=task_class,
+                data_policy=data_policy,
+                max_parallel=max_parallel,
+            )
+            log.info(
+                "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
+                job_id, width, height, task_class, cfg.provider,
+            )
+        else:
+            result = await engine.deep_think_passes(
+                question=job["question"],
+                passes=int(job["passes"]),
+                provider_cfg=cfg,
+                task_class=task_class,
+                data_policy=data_policy,
+            )
+            log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
+
         store.complete_job(job_id, result)
-        log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
     except Exception as exc:
         store.fail_job(job_id, str(exc))
         log.error("Job %s failed: %s", job_id, exc)
