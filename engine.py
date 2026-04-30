@@ -1739,8 +1739,8 @@ async def run_fan_out(
         compact_parts = []
         for p, cs in zip(successes, claim_sets):
             claims_fmt = "\n".join(
-                f"  - [{c.get('confidence', 0):.0%}] {c.get('claim', '')} "
-                f"(basis: {c.get('evidence_basis', 'asserted')})"
+                f"  - [{(c.get('confidence') or 0):.0%}] {c.get('claim', '')} "
+                f"(basis: {c.get('evidence_basis', 'asserted') or 'asserted'})"
                 for c in cs.get("claims", [])
             )
             uncertainties_fmt = (
