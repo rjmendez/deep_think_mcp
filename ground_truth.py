@@ -2148,11 +2148,6 @@ class DAMAColonySubscriber:
         """
         claims = []
         request_id = str(uuid.uuid4())[:8]
-        base_metadata = {
-            "source": "mqtt_colony",
-            "device_id": device_id,
-            "request_id": request_id,
-        }
         
         # GPS claims
         if "gps" in payload:
@@ -2167,9 +2162,9 @@ class DAMAColonySubscriber:
                         "valid_fix": True,
                         "latitude": gps.get("latitude"),
                         "longitude": gps.get("longitude"),
+                        "age_ms": gps.get("age_ms", 999999),
                     },
                     confidence_model=0.8,
-                    metadata={**base_metadata, "sensor": "gps"},
                 ))
         
         # WiFi claims
@@ -2185,7 +2180,6 @@ class DAMAColonySubscriber:
                         subject="WIFI.NEARBY_NETWORKS",
                         expected_value=len(networks),
                         confidence_model=0.75,
-                        metadata={**base_metadata, "sensor": "wifi", "count": len(networks)},
                     ))
         
         # Battery claims
@@ -2201,7 +2195,6 @@ class DAMAColonySubscriber:
                         subject="BATTERY.LEVEL",
                         expected_value=pct,
                         confidence_model=0.9,
-                        metadata={**base_metadata, "sensor": "battery"},
                     ))
                 
                 temp = battery.get("temperature_c")
@@ -2213,7 +2206,6 @@ class DAMAColonySubscriber:
                         subject="BATTERY.TEMPERATURE",
                         expected_value=temp,
                         confidence_model=0.8,
-                        metadata={**base_metadata, "sensor": "battery_temp"},
                     ))
         
         # System claims
@@ -2229,7 +2221,6 @@ class DAMAColonySubscriber:
                         subject="SYSTEM.CPU",
                         expected_value=cpu,
                         confidence_model=0.7,
-                        metadata={**base_metadata, "sensor": "cpu"},
                     ))
                 
                 mem = system.get("memory_usage")
@@ -2241,7 +2232,6 @@ class DAMAColonySubscriber:
                         subject="SYSTEM.MEMORY",
                         expected_value=mem,
                         confidence_model=0.7,
-                        metadata={**base_metadata, "sensor": "memory"},
                     ))
         
         # Bluetooth claims
@@ -2257,7 +2247,6 @@ class DAMAColonySubscriber:
                         subject="BLUETOOTH.NEARBY_DEVICES",
                         expected_value=len(devices),
                         confidence_model=0.7,
-                        metadata={**base_metadata, "sensor": "bluetooth", "count": len(devices)},
                     ))
         
         log.debug(f"[DAMA] Deserialized {len(claims)} claims from {device_id}")
