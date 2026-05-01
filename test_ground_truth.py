@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Test ground truth provider integration.
+
+Run this to verify MQTT connection and sensor data flow.
+"""
+
+import asyncio
+import logging
+from ground_truth import MQTTGroundTruthProvider, Claim, PassValidationResult
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(levelname)s] %(name)s: %(message)s",
+)
+
+log = logging.getLogger(__name__)
+
+
+async def test_mqtt_connection():
+    """Test basic MQTT connection and sensor caching."""
+    log.info("Creating MQTT provider...")
+    provider = MQTTGroundTruthProvider()
+
+    log.info("Connecting to broker...")
+    connected = await provider.connect()
+    if not connected:
+        log.error("Failed to connect to MQTT broker")
+        return False
+
+    # Wait for telemetry
+    log.info("Waiting 5 seconds for telemetry...")
+    await asyncio.sleep(5)
+
+    # Check what sensors we have
+    context = await provider.get_context("GPS module failures")
+    log.info(f"Available sensors: {context['available_sensors']}")
+    log.info(f"Fresh sensors: {context['fresh_sensors']}")
+
+    # Try fetching GPS data
+    log.info("Fetching GPS.POSITION data...")
+    gps_data = await provider.get_sensor_data("GPS.POSITION")
+    log.info(f"GPS data: {gps_data}")
+
+    await provider.close()
+    return True
+
+
+async def test_claim_validation():
+    """Test validating a claim against sensor data."""
+    log.info("Creating MQTT provider...")
+    provider = MQTTGroundTruthProvider()
+
+    log.info("Connecting to broker...")
+    if not await provider.connect():
+        log.error("Failed to connect")
+        return False
+
+    # Wait for telemetry
+    log.info("Waiting 5 seconds for telemetry...")
+    await asyncio.sleep(5)
+
+    # Create a claim about GPS staleness
+    claim = Claim(
+        id="gps_staleness_001",
+        statement="GPS.POSITION is stale (age > 1000ms)",
+        claim_type="telemetry_staleness",
+        subject="GPS.POSITION",
+        expected_value={"fresh": False},
+        confidence_model=0.8,
+    )
+
+    log.info(f"Validating claim: {claim.statement}")
+    result = await provider.validate(claim)
+
+    log.info(f"Validation result:")
+    log.info(f"  is_valid: {result.is_valid}")
+    log.info(f"  confidence: {result.confidence}")
+    log.info(f"  ground_truth_value: {result.ground_truth_value}")
+
+    await provider.close()
+    return True
+
+
+async def test_batch_validation():
+    """Test validating multiple claims."""
+    log.info("Creating MQTT provider...")
+    provider = MQTTGroundTruthProvider()
+
+    if not await provider.connect():
+        log.error("Failed to connect")
+        return False
+
+    await asyncio.sleep(5)
+
+    # Create multiple claims
+    claims = [
+        Claim(
+            id="gps_001",
+            statement="GPS position is available",
+            claim_type="gps_availability",
+            subject="GPS.POSITION",
+            expected_value={"available": True},
+            confidence_model=0.7,
+        ),
+        Claim(
+            id="wifi_001",
+            statement="Wi-Fi networks are detected",
+            claim_type="wifi_availability",
+            subject="WIFI.NEARBY_NETWORKS",
+            expected_value={"count": ">=1"},
+            confidence_model=0.6,
+        ),
+        Claim(
+            id="bt_001",
+            statement="Bluetooth devices are detected",
+            claim_type="bt_availability",
+            subject="BT.NEARBY_DEVICES",
+            expected_value={"count": ">=0"},
+            confidence_model=0.5,
+        ),
+    ]
+
+    log.info(f"Validating {len(claims)} claims...")
+    results = await provider.validate_batch(claims)
+
+    for result in results:
+        log.info(f"  {result.claim_id}: valid={result.is_valid}, confidence={result.confidence}")
+
+    await provider.close()
+    return True
+
+
+async def main():
+    """Run all tests."""
+    print("\n" + "=" * 80)
+    print("TEST 1: MQTT Connection and Sensor Caching")
+    print("=" * 80)
+    if not await test_mqtt_connection():
+        return
+
+    print("\n" + "=" * 80)
+    print("TEST 2: Claim Validation")
+    print("=" * 80)
+    if not await test_claim_validation():
+        return
+
+    print("\n" + "=" * 80)
+    print("TEST 3: Batch Claim Validation")
+    print("=" * 80)
+    if not await test_batch_validation():
+        return
+
+    print("\n" + "=" * 80)
+    print("All tests passed!")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
