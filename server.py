@@ -37,6 +37,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -48,8 +49,11 @@ from .engine import (
     TASK_CLASS_PROFILES,
     model_summary,
     PERSPECTIVE_MANDATES,
+    deep_think_passes,
 )
 from . import store, worker, discover as _discover
+from . import mqtt_integration
+from .engine_mqtt_tasks import MQTTEngineAdapter
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +61,20 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app):
     store.init_db()
+    
+    # [MQTT] Startup — initialize subscriber and processor
+    await mqtt_integration.mqtt_startup()
+    mqtt_integration.setup_signal_handlers()
+    
+    # Initialize advanced MQTT engine adapter
+    mqtt_adapter = MQTTEngineAdapter(deep_think_fn=deep_think_passes)
+    mqtt_initialized = await mqtt_adapter.start_mqtt()
+    app.mqtt_adapter = mqtt_adapter
+    mcp.mqtt_adapter = mqtt_adapter  # Expose to tools
+    
+    if mqtt_initialized:
+        log.info("[MQTT] MQTTEngineAdapter initialized and running")
+    
     discovery_task = None
     if _ollama_in_use():
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -67,6 +85,13 @@ async def _lifespan(app):
     try:
         yield
     finally:
+        # [MQTT] Shutdown — gracefully stop subscriber and processor
+        if mqtt_initialized:
+            log.info("[MQTT] Shutting down MQTTEngineAdapter...")
+            await mqtt_adapter.stop_mqtt()
+        
+        await mqtt_integration.mqtt_shutdown()
+        
         for t in (discovery_task, worker_task):
             if t is None:
                 continue
@@ -416,6 +441,46 @@ async def list_thinking_jobs(status: str = "all", limit: int = 10) -> dict:
     """
     jobs = store.list_jobs(status=status, limit=min(limit, 100))
     return {"count": len(jobs), "jobs": jobs}
+
+
+@mcp.tool()
+async def mqtt_health() -> dict:
+    """Get MQTT engine health status and metrics.
+    
+    Returns:
+        Health status, circuit breaker state, message counts, error logs, and connection status.
+    """
+    if not hasattr(mcp, "mqtt_adapter"):
+        return {
+            "status": "not_initialized",
+            "message": "MQTT adapter not initialized (MQTT_ENABLE=false?)"
+        }
+    
+    adapter = mcp.mqtt_adapter
+    return adapter.get_health()
+
+
+@mcp.tool()
+async def mqtt_metrics() -> dict:
+    """Get detailed MQTT metrics for monitoring and observability.
+    
+    Returns:
+        Messages received/published, deep_think runs, failures, circuit breaker trips, etc.
+    """
+    if not hasattr(mcp, "mqtt_adapter"):
+        return {
+            "status": "not_initialized",
+            "metrics": {}
+        }
+    
+    adapter = mcp.mqtt_adapter
+    health = adapter.get_health()
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "circuit_breaker_state": health["circuit_breaker"],
+        "metrics": health["metrics"],
+        "connections": health["connections"],
+    }
 
 
 def main():
