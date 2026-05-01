@@ -27,7 +27,14 @@ async def _run_job(job: dict) -> None:
         provider_config = json.loads(job.get("provider_config_json") or "{}")
         task_class = provider_config.pop("task_class", "general")
         data_policy = provider_config.pop("data_policy", "any")
+        device_id = provider_config.pop("device_id", "")
+        force_local_models = provider_config.pop("force_local_models", False)
         cfg = engine.build_provider_config(provider_config)
+
+        # Auto-enable local-only for MQTT operations
+        if device_id or force_local_models:
+            force_local_models = True
+            log.info(f"[MQTT] Detected MQTT job (device_id={device_id}), enabling local-only models")
 
         if provider_config.pop("fan_out", False):
             width = int(provider_config.pop("width", 3))
@@ -48,6 +55,8 @@ async def _run_job(job: dict) -> None:
                 max_width=max_width,
                 confidence_threshold=confidence_threshold,
                 extract_claims=extract_claims,
+                force_local_models=force_local_models,
+                device_id=device_id,
             )
             log.info(
                 "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
@@ -63,6 +72,8 @@ async def _run_job(job: dict) -> None:
                 data_policy=data_policy,
                 verify=verify,
                 job_id=job_id,
+                force_local_models=force_local_models,
+                device_id=device_id,
             )
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 

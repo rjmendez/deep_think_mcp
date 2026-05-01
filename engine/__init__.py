@@ -17,6 +17,12 @@ Public API:
 - classify_task: Auto-classify task to task class
 - TASK_CLASS_PROFILES: Task class routing profiles
 - PERSPECTIVE_MANDATES: Mandates per task class for fan-out
+
+Security and enforcement:
+- SecurityError: Raised when security policy is violated
+- _validate_provider_is_local: Validate provider is Ollama when local-only mode
+- _check_ollama_available: Check Ollama availability at startup
+- _validate_and_enforce_local_models: Enforce local-only MQTT models
 """
 
 from .types import ProviderConfig, PassResult, ValidationData
@@ -26,6 +32,10 @@ from .provider import (
     refresh_ollama_models,
     model_summary,
     classify_task,
+    SecurityError,
+    _validate_provider_is_local,
+    _check_ollama_available,
+    _validate_and_enforce_local_models,
 )
 from .directives import TASK_CLASS_PROFILES, PERSPECTIVE_MANDATES
 
@@ -42,6 +52,11 @@ __all__ = [
     "refresh_ollama_models",
     "model_summary",
     "classify_task",
+    # Security
+    "SecurityError",
+    "_validate_provider_is_local",
+    "_check_ollama_available",
+    "_validate_and_enforce_local_models",
     # Constants
     "TASK_CLASS_PROFILES",
     "PERSPECTIVE_MANDATES",

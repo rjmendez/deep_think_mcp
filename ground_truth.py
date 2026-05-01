@@ -1939,3 +1939,335 @@ async def create_ground_truth_provider(
     else:
         log.warning(f"Unknown provider type: {provider_type}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAMA Colony Node: MQTT Subscriber for DefCon Project
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DAMAColonySubscriber:
+    """Subscribe to DAMA phone telemetry on [REDACTED_MQTT_HOST] and deserialize claims.
+    
+    This is the subscriber half of the DAMA DefCon project colony node.
+    Subscribes to dama/+/telemetry, deserializes sensor data into Claim objects,
+    and queues them for deep_think analysis with local Ollama models only.
+    
+    Architecture:
+    - Subscribe: dama/{device_id}/telemetry (MQTT)
+    - Deserialize: JSON sensor data → Claim objects (GPS, WiFi, Battery, Temperature, etc)
+    - Queue: asyncio.Queue for deep_think_engine integration
+    - Metadata: Add source="mqtt_colony", device_id, timestamp
+    """
+    
+    def __init__(
+        self,
+        broker_host: str = "[REDACTED_MQTT_HOST]",
+        broker_port: int = 1883,
+        broker_user: Optional[str] = None,
+        broker_password: Optional[str] = None,
+    ):
+        """Initialize DAMA colony subscriber.
+        
+        Args:
+            broker_host: MQTT broker hostname (default: [REDACTED_MQTT_HOST])
+            broker_port: MQTT broker port (default: 1883)
+            broker_user: MQTT username (from env: MQTT_USERNAME)
+            broker_password: MQTT password (from env: MQTT_PASSWORD)
+        """
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.broker_user = broker_user or os.getenv("MQTT_USERNAME", "dama")
+        self.broker_password = broker_password or os.getenv("MQTT_PASSWORD", "")
+        
+        self._mqtt_client = None
+        self._subscriber_task = None
+        self._claims_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._connected = False
+        self._retry_backoff = 1  # Start at 1s, exponential up to 60s
+        
+        log.info(f"[DAMA] Initialized colony subscriber: {broker_host}:{broker_port}")
+    
+    async def start(self):
+        """Start the MQTT subscriber task."""
+        if self._subscriber_task and not self._subscriber_task.done():
+            log.warning("[DAMA] Subscriber already running")
+            return
+        
+        self._subscriber_task = asyncio.create_task(self._run_subscriber_loop())
+        log.info("[DAMA] Subscriber task started")
+    
+    async def stop(self):
+        """Stop the MQTT subscriber gracefully."""
+        if self._subscriber_task:
+            self._subscriber_task.cancel()
+            try:
+                await self._subscriber_task
+            except asyncio.CancelledError:
+                log.info("[DAMA] Subscriber task cancelled")
+        
+        if self._mqtt_client:
+            await self._mqtt_client.disconnect()
+            self._connected = False
+            log.info("[DAMA] Disconnected from broker")
+    
+    async def get_claim(self, timeout: float = 1.0) -> Optional[Claim]:
+        """Get next deserialized claim from queue.
+        
+        Args:
+            timeout: Timeout in seconds (0 = non-blocking)
+        
+        Returns:
+            Claim object or None if queue empty
+        """
+        try:
+            if timeout == 0:
+                return self._claims_queue.get_nowait()
+            else:
+                return await asyncio.wait_for(
+                    self._claims_queue.get(),
+                    timeout=timeout
+                )
+        except (asyncio.TimeoutError, asyncio.QueueEmpty):
+            return None
+    
+    async def _run_subscriber_loop(self):
+        """Main subscriber loop with exponential backoff reconnection."""
+        while True:
+            try:
+                await self._subscribe_with_backoff()
+            except asyncio.CancelledError:
+                log.info("[DAMA] Subscriber loop cancelled")
+                break
+            except Exception as e:
+                log.error(f"[DAMA] Subscriber error: {e}")
+                await asyncio.sleep(min(self._retry_backoff, 60))
+                self._retry_backoff = min(self._retry_backoff * 2, 60)
+    
+    async def _subscribe_with_backoff(self):
+        """Connect and subscribe with exponential backoff."""
+        try:
+            import aiomqtt
+            
+            log.info(f"[DAMA] Connecting to {self.broker_host}:{self.broker_port}...")
+            async with aiomqtt.Client(
+                self.broker_host,
+                self.broker_port,
+                username=self.broker_user,
+                password=self.broker_password,
+            ) as client:
+                self._mqtt_client = client
+                self._connected = True
+                self._retry_backoff = 1  # Reset backoff on successful connect
+                log.info("[DAMA] Connected to broker, subscribing to dama/+/telemetry")
+                
+                async with client.messages() as messages:
+                    await client.subscribe("dama/+/telemetry")
+                    
+                    async for message in messages:
+                        try:
+                            await self._process_telemetry_message(message)
+                        except Exception as e:
+                            log.warning(f"[DAMA] Failed to process message: {e}")
+        
+        except ImportError:
+            log.error("[DAMA] aiomqtt not installed. Install with: pip install aiomqtt")
+        except Exception as e:
+            self._connected = False
+            log.warning(f"[DAMA] Connection failed: {e}. Retrying in {self._retry_backoff}s...")
+            raise
+    
+    async def _process_telemetry_message(self, message):
+        """Deserialize MQTT message into Claims and queue for analysis.
+        
+        Message format (dama/{device_id}/telemetry):
+        {
+            "device_id": "pixel-9-pro-xl",
+            "timestamp": "2026-05-01T03:15:00Z",
+            "gps": {"valid_fix": true, "latitude": 36.1699, "longitude": -115.1398, "age_ms": 150},
+            "wifi": {"networks": [{"ssid": "DefCon-WiFi", "rssi": -45}], "age_ms": 100},
+            "bluetooth": {"devices": [{"name": "Phone", "rssi": -60}], "age_ms": 200},
+            "battery": {"percentage": 85, "temperature_c": 35},
+            "system": {"cpu_usage": 15, "memory_usage": 60, "temperature_c": 42}
+        }
+        """
+        try:
+            # Parse topic to extract device_id
+            topic_parts = message.topic.split('/')
+            if len(topic_parts) < 2:
+                log.warning(f"[DAMA] Malformed topic: {message.topic}")
+                return
+            
+            device_id = topic_parts[1]
+            if not device_id or not re.match(r'^[a-zA-Z0-9_-]+$', device_id):
+                log.warning(f"[DAMA] Invalid device_id: {device_id}")
+                return
+            
+            # Deserialize payload
+            payload = json.loads(message.payload.decode())
+            if not isinstance(payload, dict):
+                log.warning(f"[DAMA] Payload is not dict: {type(payload).__name__}")
+                return
+            
+            timestamp = payload.get("timestamp", datetime.now(timezone.utc).isoformat())
+            
+            # Create claims from sensor data
+            claims = self._deserialize_claims(device_id, payload, timestamp)
+            
+            # Queue each claim
+            for claim in claims:
+                try:
+                    self._claims_queue.put_nowait(claim)
+                    log.debug(f"[DAMA] Queued claim: {claim.id} from {device_id}")
+                except asyncio.QueueFull:
+                    log.warning(f"[DAMA] Claim queue full, dropping oldest")
+                    try:
+                        self._claims_queue.get_nowait()  # Drop oldest
+                        self._claims_queue.put_nowait(claim)
+                    except asyncio.QueueEmpty:
+                        pass
+        
+        except json.JSONDecodeError as e:
+            log.warning(f"[DAMA] Invalid JSON payload: {e}")
+        except Exception as e:
+            log.error(f"[DAMA] Unexpected error processing telemetry: {e}")
+    
+    def _deserialize_claims(
+        self,
+        device_id: str,
+        payload: Dict[str, Any],
+        timestamp: str,
+    ) -> List[Claim]:
+        """Convert sensor payload into Claim objects for deep_think analysis.
+        
+        Each sensor type generates 1-2 claims:
+        - GPS: valid_fix, coordinates
+        - WiFi: network count, SSID list
+        - Bluetooth: device count, signals
+        - Battery: percentage, temperature
+        - System: CPU, memory, temperature
+        """
+        claims = []
+        request_id = str(uuid.uuid4())[:8]
+        base_metadata = {
+            "source": "mqtt_colony",
+            "device_id": device_id,
+            "request_id": request_id,
+        }
+        
+        # GPS claims
+        if "gps" in payload:
+            gps = payload["gps"]
+            if isinstance(gps, dict) and gps.get("valid_fix"):
+                claims.append(Claim(
+                    id=f"gps_fix_{device_id}_{request_id}",
+                    statement=f"GPS has valid fix on {device_id}",
+                    claim_type="gps_availability",
+                    subject="GPS.POSITION",
+                    expected_value={
+                        "valid_fix": True,
+                        "latitude": gps.get("latitude"),
+                        "longitude": gps.get("longitude"),
+                    },
+                    confidence_model=0.8,
+                    metadata={**base_metadata, "sensor": "gps"},
+                ))
+        
+        # WiFi claims
+        if "wifi" in payload:
+            wifi = payload["wifi"]
+            if isinstance(wifi, dict):
+                networks = wifi.get("networks", [])
+                if isinstance(networks, list):
+                    claims.append(Claim(
+                        id=f"wifi_count_{device_id}_{request_id}",
+                        statement=f"{len(networks)} WiFi networks visible on {device_id}",
+                        claim_type="wifi_availability",
+                        subject="WIFI.NEARBY_NETWORKS",
+                        expected_value=len(networks),
+                        confidence_model=0.75,
+                        metadata={**base_metadata, "sensor": "wifi", "count": len(networks)},
+                    ))
+        
+        # Battery claims
+        if "battery" in payload:
+            battery = payload["battery"]
+            if isinstance(battery, dict):
+                pct = battery.get("percentage")
+                if isinstance(pct, (int, float)):
+                    claims.append(Claim(
+                        id=f"battery_level_{device_id}_{request_id}",
+                        statement=f"Battery at {pct}% on {device_id}",
+                        claim_type="battery_level",
+                        subject="BATTERY.LEVEL",
+                        expected_value=pct,
+                        confidence_model=0.9,
+                        metadata={**base_metadata, "sensor": "battery"},
+                    ))
+                
+                temp = battery.get("temperature_c")
+                if isinstance(temp, (int, float)):
+                    claims.append(Claim(
+                        id=f"battery_temp_{device_id}_{request_id}",
+                        statement=f"Battery temperature at {temp}°C on {device_id}",
+                        claim_type="battery_temperature",
+                        subject="BATTERY.TEMPERATURE",
+                        expected_value=temp,
+                        confidence_model=0.8,
+                        metadata={**base_metadata, "sensor": "battery_temp"},
+                    ))
+        
+        # System claims
+        if "system" in payload:
+            system = payload["system"]
+            if isinstance(system, dict):
+                cpu = system.get("cpu_usage")
+                if isinstance(cpu, (int, float)):
+                    claims.append(Claim(
+                        id=f"cpu_usage_{device_id}_{request_id}",
+                        statement=f"CPU at {cpu}% on {device_id}",
+                        claim_type="cpu_usage",
+                        subject="SYSTEM.CPU",
+                        expected_value=cpu,
+                        confidence_model=0.7,
+                        metadata={**base_metadata, "sensor": "cpu"},
+                    ))
+                
+                mem = system.get("memory_usage")
+                if isinstance(mem, (int, float)):
+                    claims.append(Claim(
+                        id=f"mem_usage_{device_id}_{request_id}",
+                        statement=f"Memory at {mem}% on {device_id}",
+                        claim_type="memory_usage",
+                        subject="SYSTEM.MEMORY",
+                        expected_value=mem,
+                        confidence_model=0.7,
+                        metadata={**base_metadata, "sensor": "memory"},
+                    ))
+        
+        # Bluetooth claims
+        if "bluetooth" in payload:
+            bt = payload["bluetooth"]
+            if isinstance(bt, dict):
+                devices = bt.get("devices", [])
+                if isinstance(devices, list):
+                    claims.append(Claim(
+                        id=f"bt_devices_{device_id}_{request_id}",
+                        statement=f"{len(devices)} Bluetooth devices visible on {device_id}",
+                        claim_type="bluetooth_availability",
+                        subject="BLUETOOTH.NEARBY_DEVICES",
+                        expected_value=len(devices),
+                        confidence_model=0.7,
+                        metadata={**base_metadata, "sensor": "bluetooth", "count": len(devices)},
+                    ))
+        
+        log.debug(f"[DAMA] Deserialized {len(claims)} claims from {device_id}")
+        return claims
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Return health status of subscriber."""
+        return {
+            "connected": self._connected,
+            "broker": f"{self.broker_host}:{self.broker_port}",
+            "queue_depth": self._claims_queue.qsize(),
+            "task_running": self._subscriber_task is not None and not self._subscriber_task.done(),
+        }

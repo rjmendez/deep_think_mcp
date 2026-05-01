@@ -617,3 +617,26 @@ class MQTTGroundTruthProvider:
                     contradictions.append(contradiction_dict)
         
         return contradictions
+    
+    async def get_context(self, query: str) -> Dict[str, Any]:
+        """Fetch context from MQTT telemetry for a query.
+        
+        Returns information about available devices, domains, and sensor data
+        that can help validate claims.
+        
+        Args:
+            query: Context query (e.g., "device locations", "battery status")
+        
+        Returns:
+            Dict with available_devices, available_domains, and query status
+        """
+        devices = await self.available_devices()
+        domains = await self.available_domains()
+        
+        return {
+            "query": query,
+            "available_devices": devices,
+            "available_domains": domains,
+            "status": "ready",
+            "connected": self.connected,
+        }

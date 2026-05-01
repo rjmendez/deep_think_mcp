@@ -23,6 +23,97 @@ from .types import ProviderConfig, PassResult
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY: Local-only LLM enforcement for MQTT operations
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SecurityError(Exception):
+    """Raised when security policy is violated (e.g., cloud provider used in local-only mode)."""
+    pass
+
+
+def _validate_provider_is_local(provider: str, force_local: bool) -> None:
+    """Validate provider is local (Ollama only) when force_local_models=True.
+    
+    Raises SecurityError if cloud provider attempted in local-only mode.
+    """
+    if not force_local:
+        return
+    
+    cloud_providers = {"anthropic", "copilot", "azure", "openai"}
+    if provider.lower() in cloud_providers:
+        msg = (
+            f"[SECURITY] Cloud provider '{provider}' blocked in local-only mode. "
+            f"force_local_models=True requires Ollama-only. "
+            f"Set DEEP_THINK_FORCE_LOCAL=0 to allow cloud providers."
+        )
+        log.error(msg)
+        raise SecurityError(msg)
+
+
+async def _check_ollama_available(base_url: str = "") -> bool:
+    """Check if Ollama is reachable and has models. Returns True if available and has models.
+    
+    Used for startup validation when force_local_models=True.
+    """
+    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{base_url}/api/tags")
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            if not models:
+                log.error(f"[MQTT] Ollama reachable at {base_url} but no models installed")
+                return False
+            log.info(f"[MQTT] Ollama validated: {len(models)} models available at {base_url}")
+            return True
+    except Exception as e:
+        log.error(f"[MQTT] Ollama unavailable at {base_url}: {e}")
+        return False
+
+
+async def _validate_and_enforce_local_models(
+    cfg: ProviderConfig,
+    force_local: bool,
+    device_id: str = "",
+) -> None:
+    """Enforce local-only model policy for MQTT operations.
+    
+    When force_local_models=True:
+    - Verify all tiers route to Ollama only
+    - Check Ollama is available
+    - Log enforcement action
+    """
+    if not force_local:
+        return
+    
+    ollama_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    cfg.data_policy = "local"  # Force data_policy=local
+    
+    # Import here to avoid circular imports
+    from .provider import _tier_provider
+    
+    # Validate each tier routes to Ollama
+    for tier in ("light", "medium", "heavy"):
+        provider = _tier_provider(cfg, tier)
+        _validate_provider_is_local(provider, force_local=True)
+    
+    # Check Ollama availability
+    available = await _check_ollama_available(cfg.base_url)
+    if not available:
+        msg = f"[MQTT] Ollama unavailable for {device_id}" if device_id else "[MQTT] Ollama unavailable"
+        if ollama_mode:
+            log.error(f"{msg} — failing hard (OLLAMA_ONLY_MODE=1)")
+            raise SecurityError(msg)
+        log.warning(f"{msg} — degrading gracefully, will retry")
+    
+    log.info(
+        f"[MQTT] Local-only enforcement active for {device_id}" if device_id 
+        else "[MQTT] Local-only enforcement active"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Credential reading
 # ---------------------------------------------------------------------------
