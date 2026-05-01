@@ -357,8 +357,219 @@ class MQTTClaimsProcessor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle Management
+# MQTT Confirmation Subscriber
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+class ConfirmationSubscriber:
+    """Subscribe to anomaly confirmation feedback from devices.
+    
+    Responsibilities:
+        1. Subscribe to dama/+/anomaly_confirmation topic
+        2. Parse confirmation payloads (finding_id, device_id, confirmed, evidence)
+        3. Route confirmations to FeedbackStore for immediate processing
+        4. Handle deserialization errors gracefully
+        5. Normalize UUIDs from payload to hex format
+    """
+    
+    def __init__(
+        self,
+        mqtt_host: str = "botnet.floppydicks.net",
+        mqtt_port: int = 1883,
+        mqtt_username: str = "dama",
+        mqtt_password: str = "",
+    ) -> None:
+        """Initialize confirmation subscriber.
+        
+        Args:
+            mqtt_host: MQTT broker hostname
+            mqtt_port: MQTT broker port
+            mqtt_username: MQTT username
+            mqtt_password: MQTT password
+        """
+        try:
+            import aiomqtt
+            self._aiomqtt = aiomqtt
+        except ImportError:
+            self._aiomqtt = None
+            log.warning("[MQTT] aiomqtt not installed, confirmation subscriber disabled")
+        
+        self.mqtt_host = mqtt_host
+        self.mqtt_port = mqtt_port
+        self.mqtt_username = mqtt_username
+        self.mqtt_password = mqtt_password
+        
+        self._client: Optional[Any] = None
+        self._connected = False
+        self._running = False
+        self._subscription_task: Optional[asyncio.Task] = None
+        
+        # Import feedback store
+        try:
+            from mqtt.feedback_store import FeedbackStore
+            self.feedback_store = FeedbackStore()
+        except ImportError:
+            self.feedback_store = None
+            log.error("[MQTT] Failed to import FeedbackStore")
+        
+        log.debug(
+            f"ConfirmationSubscriber initialized: {mqtt_host}:{mqtt_port}"
+        )
+    
+    async def start(self) -> None:
+        """Start the confirmation subscriber."""
+        if not self._aiomqtt or not self.feedback_store:
+            log.warning("[MQTT] Confirmation subscriber disabled (missing dependencies)")
+            return
+        
+        self._running = True
+        try:
+            self._client = self._aiomqtt.Client(
+                self.mqtt_host,
+                self.mqtt_port,
+                username=self.mqtt_username,
+                password=self.mqtt_password,
+                clean_session=True,
+            )
+            await self._client.connect()
+            self._connected = True
+            log.info(f"[MQTT] Confirmation subscriber connected to {self.mqtt_host}:{self.mqtt_port}")
+            
+            # Start subscription listener
+            self._subscription_task = asyncio.create_task(self._subscription_loop())
+        except Exception as e:
+            log.error(f"[MQTT] Failed to connect confirmation subscriber: {e}")
+            self._connected = False
+    
+    async def stop(self) -> None:
+        """Stop the confirmation subscriber."""
+        self._running = False
+        
+        if self._subscription_task:
+            self._subscription_task.cancel()
+            try:
+                await self._subscription_task
+            except asyncio.CancelledError:
+                log.debug("[MQTT] Confirmation subscription cancelled")
+        
+        if self._client and self._connected:
+            try:
+                await self._client.disconnect()
+                self._connected = False
+                log.info("[MQTT] Confirmation subscriber disconnected")
+            except Exception as e:
+                log.error(f"[MQTT] Error disconnecting confirmation subscriber: {e}")
+    
+    async def subscribe_to_confirmations(self) -> None:
+        """Subscribe to confirmation topic and process messages.
+        
+        Subscribes to dama/+/anomaly_confirmation and processes confirmations
+        by calling feedback_store.record_confirmation() immediately (no batching).
+        """
+        if not self.feedback_store:
+            log.error("[MQTT] No feedback store available")
+            return
+        
+        await self.subscribe_to_confirmations_with_store(self.feedback_store)
+    
+    async def subscribe_to_confirmations_with_store(self, feedback_store: Any) -> None:
+        """Subscribe to confirmations with a specific feedback store.
+        
+        Args:
+            feedback_store: FeedbackStore instance to record confirmations
+        """
+        from mqtt.models import Confirmation, normalize_uuid
+        
+        if not self._client or not self._running:
+            log.warning("[MQTT] Confirmation subscriber not ready")
+            return
+        
+        try:
+            # Subscribe to wildcard for all devices
+            await self._client.subscribe("dama/+/anomaly_confirmation")
+            log.info("[MQTT] Subscribed to anomaly confirmation topics")
+            
+            async with self._client.messages() as messages:
+                async for message in messages:
+                    try:
+                        topic = message.topic
+                        payload_str = message.payload.decode()
+                        
+                        # Parse topic: dama/{device_id}/anomaly_confirmation
+                        parts = topic.split("/")
+                        if len(parts) < 2:
+                            log.warning(f"[MQTT] Invalid confirmation topic: {topic}")
+                            continue
+                        
+                        device_id = parts[1]
+                        
+                        try:
+                            payload = json.loads(payload_str)
+                        except json.JSONDecodeError as e:
+                            log.error(f"[MQTT] Failed to deserialize confirmation: {e}")
+                            continue
+                        
+                        # Extract fields
+                        try:
+                            finding_id = payload.get("finding_id", "")
+                            confirmed = payload.get("confirmed", False)
+                            evidence = payload.get("evidence", "")
+                            timestamp = payload.get("timestamp", "")
+                            
+                            # Validate required fields
+                            if not finding_id or not device_id:
+                                log.error("[MQTT] Missing required field in confirmation payload")
+                                continue
+                            
+                            # Normalize finding_id from payload
+                            try:
+                                normalized_finding_id = normalize_uuid(finding_id)
+                            except Exception as e:
+                                log.error(f"[MQTT] Failed to normalize UUID: {e}")
+                                continue
+                            
+                            # Create confirmation object
+                            confirmation = Confirmation(
+                                finding_id=normalized_finding_id,
+                                device_id=device_id,
+                                confirmed=confirmed,
+                                evidence=evidence,
+                                timestamp=timestamp,
+                            )
+                            
+                            # Record confirmation immediately (no batching)
+                            result = feedback_store.record_confirmation(confirmation)
+                            
+                            log.debug(
+                                f"Confirmation received: finding_id={normalized_finding_id} "
+                                f"device={device_id} confirmed={confirmed}"
+                            )
+                            
+                        except KeyError as e:
+                            log.error(f"[MQTT] Missing required field in confirmation: {e}")
+                            continue
+                        except Exception as e:
+                            log.error(f"[MQTT] Error processing confirmation: {e}")
+                            continue
+                    
+                    except asyncio.CancelledError:
+                        log.debug("[MQTT] Confirmation subscription cancelled")
+                        break
+                    except Exception as e:
+                        log.error(f"[MQTT] Subscription loop error: {e}")
+        
+        except asyncio.CancelledError:
+            log.debug("[MQTT] Confirmation subscription cancelled")
+        except Exception as e:
+            log.error(f"[MQTT] Confirmation subscription error: {e}")
+    
+    async def _subscription_loop(self) -> None:
+        """Internal subscription loop."""
+        try:
+            await self.subscribe_to_confirmations()
+        except Exception as e:
+            log.error(f"[MQTT] Confirmation subscription loop error: {e}")
+
 
 
 # Global state (used by engine integration hooks)

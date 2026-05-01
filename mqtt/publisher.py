@@ -20,14 +20,21 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass, asdict, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Optional, Callable, Awaitable
+from typing import Any, Optional, Callable, Awaitable, List
+from uuid import uuid4
 
 try:
     import aiomqtt
 except ImportError:
     aiomqtt = None
+
+# Import Finding from models for feedback loop integration
+try:
+    from mqtt.models import Finding, Confirmation, AnomalyType
+except ImportError:
+    Finding = None  # Will be defined locally as fallback
 
 log = logging.getLogger(__name__)
 
@@ -429,7 +436,71 @@ class MQTTFindingsPublisher:
             self.store.save_finding(finding)
             return False
 
-    def _schedule_batch_timeout(self, device_id: str) -> None:
+    async def publish_findings(self, findings: List[Any]) -> List[str]:
+        """Publish multiple findings with UUID normalization and TTL.
+        
+        Process findings from ground_truth anomalies:
+        - Set finding.id = uuid4().hex (normalized to hex format)
+        - Set finding.expires_at = now() + timedelta(days=7) for DefCon TTL
+        - Validate confidence (0.0 to 1.0)
+        - Serialize to JSON with all field types handled correctly
+        - Publish to dama/colony/findings/{device_id} with QoS=1
+        
+        Args:
+            findings: List of Finding objects to publish
+            
+        Returns:
+            List of finding IDs published
+        """
+        if not self.enabled:
+            log.debug(f"Publishing disabled, skipping {len(findings)} findings")
+            return []
+
+        published_ids: List[str] = []
+        
+        try:
+            # Process each finding
+            for finding in findings:
+                try:
+                    # Ensure finding has an ID (normalize to hex format)
+                    if not finding.id or finding.id == "":
+                        finding.id = uuid4().hex
+                    
+                    # Set TTL to 7 days if not already set
+                    if not finding.expires_at:
+                        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+                        finding.expires_at = expires_at.isoformat().replace("+00:00", "Z")
+                    
+                    # Validate confidence
+                    if not 0.0 <= finding.confidence <= 1.0:
+                        log.error(
+                            f"Invalid confidence {finding.confidence} for finding {finding.id}, "
+                            f"must be 0.0 to 1.0"
+                        )
+                        continue
+                    
+                    # Queue finding for publishing
+                    success = await self.publish_finding(finding)
+                    if success:
+                        published_ids.append(finding.id)
+                        log.debug(
+                            f"Finding published: id={finding.id} "
+                            f"device={finding.device_id}"
+                        )
+                    else:
+                        log.warning(
+                            f"Failed to queue finding {finding.id} for {finding.device_id}"
+                        )
+                
+                except Exception as e:
+                    log.error(f"Error processing finding: {e}", exc_info=True)
+                    continue
+            
+            return published_ids
+        
+        except Exception as e:
+            log.error(f"Error publishing findings batch: {e}", exc_info=True)
+            return published_ids
         """Schedule automatic batch publish after timeout.
         
         Args:
