@@ -1,0 +1,152 @@
+{
+  "extraction_0_25": {
+    "task_class": "extraction",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.987,
+    "primary_cost": 0.0189,
+    "primary_latency_ms": 11975.4,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.958,
+    "fallback_model": "qwen3.5",
+    "sample_count": 15
+  },
+  "general_0_25": {
+    "task_class": "general",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.963,
+    "primary_cost": 0.0386,
+    "primary_latency_ms": 11909.4,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.927,
+    "fallback_model": "qwen3.5",
+    "sample_count": 27
+  },
+  "data_governance_0_25": {
+    "task_class": "data_governance",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.967,
+    "primary_cost": 0.0495,
+    "primary_latency_ms": 12087.4,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.937,
+    "fallback_model": "qwen3.5",
+    "sample_count": 20
+  },
+  "safety_0_25": {
+    "task_class": "safety",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.964,
+    "primary_cost": 0.0189,
+    "primary_latency_ms": 12258.1,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.913,
+    "fallback_model": "qwen3.5",
+    "sample_count": 29
+  },
+  "code_review_0_25": {
+    "task_class": "code_review",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.977,
+    "primary_cost": 0.0529,
+    "primary_latency_ms": 11858.1,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.938,
+    "fallback_model": "qwen3.5",
+    "sample_count": 23
+  },
+  "synthesis_0_25": {
+    "task_class": "synthesis",
+    "complexity_range": [
+      0,
+      25
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.971,
+    "primary_cost": 0.0766,
+    "primary_latency_ms": 12401.3,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.921,
+    "fallback_model": "qwen3.5",
+    "sample_count": 27
+  },
+  "reasoning_25_50": {
+    "task_class": "reasoning",
+    "complexity_range": [
+      25,
+      50
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.962,
+    "primary_cost": 0.0644,
+    "primary_latency_ms": 11934.7,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.783,
+    "fallback_model": "qwen3.5",
+    "sample_count": 21
+  },
+  "investigation_25_50": {
+    "task_class": "investigation",
+    "complexity_range": [
+      25,
+      50
+    ],
+    "primary_model": "opus",
+    "primary_quality": 0.961,
+    "primary_cost": 0.0776,
+    "primary_latency_ms": 12361.1,
+    "secondary_model": "sonnet",
+    "secondary_quality": 0.935,
+    "fallback_model": "llama3.1",
+    "sample_count": 20
+  },
+  "code_review_25_50": {
+    "task_class": "code_review",
+    "complexity_range": [
+      25,
+      50
+    ],
+    "primary_model": "sonnet",
+    "primary_quality": 1.0,
+    "primary_cost": 0.0253,
+    "primary_latency_ms": 6232.0,
+    "secondary_model": "opus",
+    "secondary_quality": 0.928,
+    "fallback_model": "llama3.1",
+    "sample_count": 1
+  },
+  "general_25_50": {
+    "task_class": "general",
+    "complexity_range": [
+      25,
+      50
+    ],
+    "primary_model": "sonnet",
+    "primary_quality": 0.942,
+    "primary_cost": 0.0094,
+    "primary_latency_ms": 5723.4,
+    "secondary_model": null,
+    "secondary_quality": null,
+    "fallback_model": "opus",
+    "sample_count": 1
+  }
+}

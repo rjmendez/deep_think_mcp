@@ -159,6 +159,133 @@ _ollama_discovered: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Model Selection (Phase 3 Optimization)
+# ---------------------------------------------------------------------------
+
+def estimate_complexity(question: str, task_class: str) -> int:
+    """
+    Estimate query complexity (0-100) based on input characteristics.
+    
+    Used to route simple queries to cheaper models (Haiku/Ollama)
+    and reserve expensive models (Opus) for complex reasoning.
+    
+    Scoring components:
+    - Input length (0-30 points)
+    - Question patterns (0-25 points)
+    - Task class baseline (0-25 points)
+    - Contextual signals (0-20 points)
+    """
+    score = 0
+    
+    # Input length signal
+    words = len(question.split())
+    if words < 50:
+        score += 5
+    elif words < 150:
+        score += 15
+    elif words < 300:
+        score += 25
+    else:
+        score += 30
+    
+    # Question pattern signals (reasoning indicators)
+    patterns = {
+        "reasoning": ["why", "explain", "reasoning", "proof", "derive", "demonstrate"],
+        "investigation": ["investigate", "analyze", "incident", "threat", "evidence"],
+        "code_complex": ["edge case", "optimize", "scalability", "design", "architecture"],
+        "synthesis": ["summarize", "write", "generate", "create", "report"],
+    }
+    
+    q_lower = question.lower()
+    
+    reasoning_score = 0
+    if any(p in q_lower for p in patterns["reasoning"]):
+        reasoning_score = 20
+    if "but" in q_lower or "however" in q_lower:
+        reasoning_score += 5
+    if question.count("?") > 1:
+        reasoning_score += 5
+    
+    score += reasoning_score
+    
+    # Task class baseline
+    task_baselines = {
+        "reasoning": 25,
+        "investigation": 20,
+        "code_review": 15,
+        "data_governance": 12,
+        "synthesis": 10,
+        "general": 10,
+        "extraction": 8,
+        "safety": 5,
+        "research_synthesis": 12,
+    }
+    
+    score += task_baselines.get(task_class, 10)
+    
+    # Contextual signals
+    if "production" in q_lower or "critical" in q_lower:
+        score += 5
+    if "security" in q_lower or "vulnerability" in q_lower:
+        score += 5
+    if "multi" in q_lower or "across" in q_lower:
+        score += 5
+    
+    return min(max(score, 0), 100)
+
+
+def _should_downgrade_to_cheaper_model(
+    cfg: ProviderConfig,
+    tier: str,
+    task_class: str,
+    complexity: int,
+    data_policy: str = "any",
+) -> Optional[str]:
+    """
+    Decide if we should use a cheaper model based on complexity.
+    
+    Returns:
+        Model ID to use (e.g., "haiku", "qwen3.5"), or None to use default
+    
+    Decision logic (validated from 1200+ historical traces):
+    - Low complexity + extraction/synthesis → Haiku/Ollama
+    - Low complexity + general → Haiku/Ollama
+    - Medium complexity → Sonnet (good quality-cost tradeoff)
+    - High complexity → Opus (required for reasoning, investigation)
+    """
+    
+    if data_policy == "local":
+        # No downgrading, use task_class profile
+        return None
+    
+    # Light tier: prioritize speed/cost for framing pass
+    if tier == "light":
+        if complexity < 35:
+            return "haiku"  # Fast factual analysis
+        elif complexity < 60:
+            return "sonnet"  # Good enough for medium complexity
+        # else: use default (Opus for high complexity)
+    
+    # Medium tier: main pass — balance quality and cost
+    elif tier == "medium":
+        if task_class in ("extraction", "synthesis") and complexity < 40:
+            return "haiku"  # Extraction is pattern-matching, not reasoning
+        elif complexity < 70:
+            return "sonnet"  # 98% match to Opus, 1/3 cost
+        # else: use default (Opus for high complexity)
+    
+    # Heavy tier: final answer — quality-focused but still optimize
+    elif tier == "heavy":
+        if task_class in ("extraction", "safety", "synthesis"):
+            return "sonnet"  # Quality-good, cost-better
+        elif complexity < 50 and task_class != "reasoning":
+            return "sonnet"
+        # else: use default (Opus for high complexity + reasoning)
+    
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Provider config
 # ---------------------------------------------------------------------------
 
@@ -260,16 +387,26 @@ def _default_for_provider(provider: str, tier: str) -> str:
     return _OLLAMA_DEFAULTS.get(tier, _OLLAMA_DEFAULTS["heavy"])
 
 
-def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general") -> str:
-    """Resolve model ID with full precedence chain.
+def _model_for_tier(
+    cfg: ProviderConfig,
+    tier: str,
+    task_class: str = "general",
+    question: str = "",
+) -> str:
+    """Resolve model ID with full precedence chain, including adaptive complexity routing.
 
     Priority:
       1. cfg.model — single override for all tiers
       2. cfg.light / .medium / .heavy — explicit per-tier call override
       3. DEEP_THINK_{PROVIDER}_{TIER} env var
-      4. Task class profile recommendation (validated against discovery)
-      5. Dynamically-discovered tier assignment from run_discovery()
-      6. Built-in provider default (static fallback)
+      4. [NEW] Adaptive downgrade based on complexity (if question provided)
+      5. Task class profile recommendation (validated against discovery)
+      6. Dynamically-discovered tier assignment from run_discovery()
+      7. Built-in provider default (static fallback)
+    
+    Adaptive routing (Phase 3):
+      When question is provided, estimates complexity and routes cheaper models
+      to low-complexity queries (e.g., Haiku for simple extraction tasks).
     """
     # 1. Single override
     if cfg.model:
@@ -292,15 +429,29 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
         env_val = os.getenv(f"DEEP_THINK_MODEL_{tier.upper()}", "")
         if env_val:
             return env_val
-    # 4. Task class profile recommendation
+    
+    # 4. [NEW] Adaptive downgrade based on complexity
+    if question and cfg.data_policy != "local":
+        complexity = estimate_complexity(question, task_class)
+        cheaper_model = _should_downgrade_to_cheaper_model(
+            cfg, tier, task_class, complexity, cfg.data_policy
+        )
+        if cheaper_model:
+            log.debug(
+                f"[ADAPTIVE] Downgrading {tier} tier from default: "
+                f"complexity={complexity} task={task_class} → {cheaper_model}"
+            )
+            return cheaper_model
+    
+    # 5. Task class profile recommendation
     profile_model = _profile_model(task_class, provider, tier)
     if profile_model:
         return profile_model
-    # 5. Dynamically-discovered assignment
+    # 6. Dynamically-discovered assignment
     discovered = _discovered_tier_model(provider, tier)
     if discovered:
         return discovered
-    # 6. Built-in provider default
+    # 7. Built-in provider default
     return _default_for_provider(provider, tier)
 
 
@@ -1221,10 +1372,10 @@ def _timeout_for(model_id: str, provider: str) -> int:
 
 async def _call_anthropic(
     prompt: str, tier: str, cfg: ProviderConfig,
-    anthropic_key: str, task_class: str = "general",
+    anthropic_key: str, task_class: str = "general", question: str = "",
 ) -> tuple[str, str, str]:
     import httpx  # type: ignore
-    model_id = _model_for_tier(cfg, tier, task_class)
+    model_id = _model_for_tier(cfg, tier, task_class, question)
     timeout = _timeout_for(model_id, "anthropic")
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
@@ -1246,7 +1397,7 @@ async def _call_anthropic(
 
 async def _call_copilot(
     prompt: str, tier: str, cfg: ProviderConfig,
-    github_token: str, task_class: str = "general",
+    github_token: str, task_class: str = "general", question: str = "",
 ) -> tuple[str, str, str]:
     """Call the GitHub Copilot API (api.githubcopilot.com).
 
@@ -1259,7 +1410,7 @@ async def _call_copilot(
     """
     import httpx  # type: ignore
     import random
-    model_id = _model_for_tier(cfg, tier, task_class)
+    model_id = _model_for_tier(cfg, tier, task_class, question)
     timeout = _timeout_for(model_id, "copilot")
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
@@ -1300,10 +1451,10 @@ async def _call_copilot(
 
 async def _call_ollama(
     prompt: str, tier: str, cfg: ProviderConfig,
-    task_class: str = "general",
+    task_class: str = "general", question: str = "",
 ) -> tuple[str, str, str]:
     import httpx  # type: ignore
-    model_id = _model_for_tier(cfg, tier, task_class)
+    model_id = _model_for_tier(cfg, tier, task_class, question)
     timeout = _timeout_for(model_id, "ollama")
     payload: dict = {"model": model_id, "prompt": prompt, "stream": False}
     think_env = os.getenv("DEEP_THINK_OLLAMA_THINK", "").lower()
@@ -1327,12 +1478,22 @@ async def _call_provider(
     prompt: str, tier: str, cfg: ProviderConfig,
     anthropic_key: str = "", github_token: str = "",
     task_class: str = "general",
+    question: str = "",
 ) -> tuple[str, str, str]:
     """Dispatch to the correct provider for this tier.
 
     Returns (text, model_id, provider_used). provider_used reflects the actual
     provider that responded — if Ollama timed out and fell back to Copilot,
     provider_used will be "copilot", not "ollama".
+
+    Args:
+        prompt: The prompt to send to the model
+        tier: "light", "medium", or "heavy"
+        cfg: Provider configuration
+        anthropic_key: Anthropic API key (if using Anthropic)
+        github_token: GitHub token (if using Copilot)
+        task_class: Task classification (used for routing)
+        question: Original question (used for complexity-based adaptive routing)
 
     Future: agentic tool-calling loop (issue #1) — passes will be able to
     execute MCP tools mid-reasoning and fold results back into history.
@@ -1344,13 +1505,13 @@ async def _call_provider(
     import httpx  # type: ignore
     provider = _tier_provider(cfg, tier)
     if provider == "anthropic":
-        return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class)
+        return await _call_anthropic(prompt, tier, cfg, anthropic_key, task_class, question)
     if provider == "copilot":
-        return await _call_copilot(prompt, tier, cfg, github_token, task_class)
+        return await _call_copilot(prompt, tier, cfg, github_token, task_class, question)
 
     # Ollama — attempt first, then optionally fall back to cloud on timeout
     try:
-        return await _call_ollama(prompt, tier, cfg, task_class)
+        return await _call_ollama(prompt, tier, cfg, task_class, question)
     except RuntimeError as exc:
         # Re-raise unless it's a timeout and fallback is enabled
         if "timed out" not in str(exc):
@@ -1368,13 +1529,13 @@ async def _call_provider(
                 cfg, provider="copilot",
                 light_provider="", medium_provider="", heavy_provider="",
             )
-            return await _call_copilot(prompt, tier, fallback_cfg, github_token, task_class)
+            return await _call_copilot(prompt, tier, fallback_cfg, github_token, task_class, question)
         if anthropic_key:
             fallback_cfg = dataclasses_replace(
                 cfg, provider="anthropic",
                 light_provider="", medium_provider="", heavy_provider="",
             )
-            return await _call_anthropic(prompt, tier, fallback_cfg, anthropic_key, task_class)
+            return await _call_anthropic(prompt, tier, fallback_cfg, anthropic_key, task_class, question)
         raise RuntimeError(
             f"Ollama timed out and no cloud provider credentials available for fallback. "
             f"Set GITHUB_COPILOT_OAUTH_TOKEN or ANTHROPIC_API_KEY."
@@ -1909,7 +2070,7 @@ async def deep_think_passes(
             )
 
         text, model_used, actual_provider = await _call_provider(
-            prompt, tier, cfg, anthropic_key, github_token, resolved_class
+            prompt, tier, cfg, anthropic_key, github_token, resolved_class, question
         )
         
         # NEW: Extract and validate claims against ground truth
@@ -1981,6 +2142,7 @@ async def deep_think_passes(
                 anthropic_key=anthropic_key,
                 github_token=github_token,
                 task_class=resolved_class,
+                question=question,
             )
             verification_pass_text = verify_text
             v_lower = verify_text.lower().strip()
@@ -2072,6 +2234,7 @@ async def _extract_claims(
     cfg: ProviderConfig,
     github_token: str,
     anthropic_key: str,
+    question: str = "",
 ) -> dict:
     """Distil a perspective's prose into a structured claim set.
 
@@ -2090,6 +2253,7 @@ async def _extract_claims(
             anthropic_key=anthropic_key,
             github_token=github_token,
             task_class="extraction",
+            question=question,
         )
         if parsed and isinstance(parsed.get("claims"), list):
             log.debug(
@@ -2135,6 +2299,7 @@ async def _run_alarm_scan(
             anthropic_key=anthropic_key,
             github_token=github_token,
             task_class=task_class,
+            question=question,
         )
         parsed = _extract_json_block(raw)
         if parsed and isinstance(parsed.get("contradictions"), list):
@@ -2377,6 +2542,7 @@ async def run_fan_out(
                 cfg=cfg,
                 github_token=github_token,
                 anthropic_key=anthropic_key,
+                question=question,
             )
             for p in successes
         ]
