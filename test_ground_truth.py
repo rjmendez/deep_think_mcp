@@ -109,7 +109,7 @@ async def test_mqtt_batch_validation(mock_mqtt_provider):
     ]
 
     log.info(f"Validating {len(claims)} claims via MQTT...")
-    results = await provider.validate_batch(claims)
+    results = await provider.validate_batch(claims, context={"device_id": "test-device"})
 
     # Assert all results are ValidationResult instances
     assert len(results) == len(claims), "Should have one result per claim"
@@ -121,6 +121,8 @@ async def test_mqtt_batch_validation(mock_mqtt_provider):
         assert hasattr(result, 'claim_id'), "Result should have claim_id"
         assert hasattr(result, 'is_valid'), "Result should have is_valid"
         assert hasattr(result, 'confidence'), "Result should have confidence"
+        # Validate confidence is in expected range
+        assert 0.0 <= result.confidence <= 1.0, f"Confidence should be in [0.0, 1.0], got {result.confidence}"
 
 
 @pytest.mark.asyncio
