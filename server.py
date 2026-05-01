@@ -45,12 +45,12 @@ from fastmcp import FastMCP
 # Modular imports from new structure
 from .engine import (
     build_provider_config,
-    _tier_provider,
     TASK_CLASS_PROFILES,
     model_summary,
     PERSPECTIVE_MANDATES,
     deep_think_passes,
 )
+from .engine.provider import _tier_provider
 from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
 from .engine.mqtt_tasks import MQTTEngineAdapter

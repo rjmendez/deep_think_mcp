@@ -493,7 +493,184 @@ class FeedbackStore:
             log.error(f"Failed to cleanup expired findings: {e}")
             return 0
     
-    def close(self) -> None:
+    async def record_correlation(self, 
+                                  correlation_id: str,
+                                  timestamp: str,
+                                  location_hash: str,
+                                  observing_devices: List[str],
+                                  sensor_snapshot: Dict[str, Any],
+                                  novelty_score: float,
+                                  fleet_prevalence: float,
+                                  entropy_breakdown: Dict[str, float],
+                                  is_anomalous_cluster: bool,
+                                  anomaly_details: Dict[str, Any]) -> bool:
+        """Record a correlation finding in the database.
+        
+        Args:
+            correlation_id: UUID of correlation
+            timestamp: ISO 8601 timestamp
+            location_hash: Hashed location (GPS or WiFi-based)
+            observing_devices: List of device IDs observing this
+            sensor_snapshot: Aggregated sensor values
+            novelty_score: Novelty score (0-1)
+            fleet_prevalence: % of fleet that's seen this (0-1)
+            entropy_breakdown: Per-sensor entropy contributions
+            is_anomalous_cluster: True if co-located devices diverge
+            anomaly_details: Details about anomalies
+            
+        Returns:
+            True if recorded successfully, False otherwise
+        """
+        try:
+            correlation_id = normalize_uuid(correlation_id)
+            
+            import json
+            with self.conn:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """INSERT INTO correlations 
+                       (id, timestamp, location_hash, observing_devices, 
+                        sensor_snapshot, novelty_score, fleet_prevalence, 
+                        entropy_breakdown, is_anomalous_cluster, anomaly_details, 
+                        expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        correlation_id,
+                        timestamp,
+                        location_hash,
+                        json.dumps(observing_devices),
+                        json.dumps(sensor_snapshot, default=str),
+                        novelty_score,
+                        fleet_prevalence,
+                        json.dumps(entropy_breakdown, default=str),
+                        1 if is_anomalous_cluster else 0,
+                        json.dumps(anomaly_details, default=str) if anomaly_details else None,
+                        # TTL: 7 days from now
+                        (datetime.now(timezone.utc).replace(microsecond=0) + 
+                         __import__('datetime').timedelta(days=7)).isoformat()
+                    )
+                )
+            
+            log.debug(f"Recorded correlation: {correlation_id}")
+            return True
+        
+        except Exception as e:
+            log.error(f"Failed to record correlation: {e}")
+            return False
+    
+    async def annotate_correlation(self,
+                                    correlation_id: str,
+                                    annotator_id: str,
+                                    label: str,
+                                    evidence: str = "",
+                                    confidence: float = 0.8) -> bool:
+        """Add annotation to a correlation finding.
+        
+        Args:
+            correlation_id: UUID of correlation
+            annotator_id: ID of person annotating
+            label: Label/category (e.g., "RF_hacking_village")
+            evidence: Supporting evidence
+            confidence: Confidence in annotation (0-1)
+            
+        Returns:
+            True if annotated successfully, False otherwise
+        """
+        try:
+            correlation_id = normalize_uuid(correlation_id)
+            annotation_id = str(uuid4()).replace("-", "").lower()
+            
+            with self.conn:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """INSERT INTO correlation_annotations
+                       (id, correlation_id, annotator_id, label, evidence, confidence)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (annotation_id, correlation_id, annotator_id, label, evidence, confidence)
+                )
+            
+            log.debug(f"Annotated correlation {correlation_id}: {label}")
+            return True
+        
+        except Exception as e:
+            log.error(f"Failed to annotate correlation: {e}")
+            return False
+    
+    def get_correlations_by_location(self, location_hash: str) -> List[Dict[str, Any]]:
+        """Get all correlations observed at a location.
+        
+        Args:
+            location_hash: The location hash
+            
+        Returns:
+            List of correlation records
+        """
+        try:
+            import json
+            with self.conn:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """SELECT id, timestamp, location_hash, observing_devices,
+                              sensor_snapshot, novelty_score, fleet_prevalence,
+                              entropy_breakdown, is_anomalous_cluster, anomaly_details
+                       FROM correlations
+                       WHERE location_hash = ?
+                       ORDER BY timestamp DESC""",
+                    (location_hash,)
+                )
+                
+                correlations = []
+                for row in cursor.fetchall():
+                    correlations.append({
+                        'id': row[0],
+                        'timestamp': row[1],
+                        'location_hash': row[2],
+                        'observing_devices': json.loads(row[3]),
+                        'sensor_snapshot': json.loads(row[4]),
+                        'novelty_score': row[5],
+                        'fleet_prevalence': row[6],
+                        'entropy_breakdown': json.loads(row[7]),
+                        'is_anomalous_cluster': bool(row[8]),
+                        'anomaly_details': json.loads(row[9]) if row[9] else {}
+                    })
+                
+                return correlations
+        except Exception as e:
+            log.error(f"Failed to get correlations: {e}")
+            return []
+    
+    def get_novelty_distribution(self) -> Dict[str, Any]:
+        """Get statistics on novelty scores across all correlations.
+        
+        Returns:
+            Dict with novelty statistics
+        """
+        try:
+            with self.conn:
+                cursor = self.conn.cursor()
+                
+                # Get novelty stats
+                cursor.execute(
+                    """SELECT 
+                       COUNT(*) as total,
+                       MIN(novelty_score) as min_novelty,
+                       MAX(novelty_score) as max_novelty,
+                       AVG(novelty_score) as avg_novelty,
+                       COUNT(CASE WHEN novelty_score > 0.8 THEN 1 END) as high_novelty
+                       FROM correlations"""
+                )
+                row = cursor.fetchone()
+                
+                return {
+                    'total_correlations': row[0],
+                    'min_novelty': row[1],
+                    'max_novelty': row[2],
+                    'avg_novelty': round(row[3], 3) if row[3] else 0,
+                    'high_novelty_count': row[4] or 0
+                }
+        except Exception as e:
+            log.error(f"Failed to get novelty distribution: {e}")
+            return {}
         """Close database connection."""
         try:
             self.conn.close()

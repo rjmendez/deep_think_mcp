@@ -372,9 +372,9 @@ def _tier_provider(cfg: ProviderConfig, tier: str) -> str:
         return "ollama"
     override = getattr(cfg, f"{tier}_provider", "")
     effective = override if override else cfg.provider
-    # data_policy="cloud": force light tier to ollama if no explicit override
+    # data_policy="cloud": force light tier to provider specified at call time if no explicit override
     if cfg.data_policy == "cloud" and tier == "light" and not override:
-        return "ollama"
+        return cfg.provider
     return effective
 
 
