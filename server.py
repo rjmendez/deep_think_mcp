@@ -52,8 +52,8 @@ from .engine import (
     deep_think_passes,
 )
 from . import store, worker, discover as _discover
-from . import mqtt_integration
-from .engine_mqtt_tasks import MQTTEngineAdapter
+from . import mqtt as mqtt_integration
+from .engine.mqtt_tasks import MQTTEngineAdapter
 
 log = logging.getLogger(__name__)
 

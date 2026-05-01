@@ -18,7 +18,7 @@ from typing import Optional
 
 import aiomqtt
 
-from mqtt_resilience import (
+from mqtt.resilience import (
     CircuitBreaker,
     HealthCheckHandler,
     HeartbeatPublisher,
