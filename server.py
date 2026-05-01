@@ -141,7 +141,7 @@ async def deep_think_async(
 
 
 @mcp.tool()
-async def get_thinking_result(job_id: str) -> dict:
+async def get_thinking_result(job_id: str, include_reasoning_chain: bool = False) -> dict:
     """Poll a deep_think job for results.
 
     Returns status (queued → running → complete | failed),
@@ -149,6 +149,15 @@ async def get_thinking_result(job_id: str) -> dict:
 
     For fan_out jobs, also surfaces confidence_score, converged_claims,
     contested_areas, and claim_sets at the top level for easy inspection.
+
+    Args:
+        job_id:                  The job_id returned by deep_think_async or deep_think_fan_out.
+        include_reasoning_chain: If True, attach the full intermediate pass outputs from
+                                 pass_cache as a "reasoning_chain" field — one entry per
+                                 perspective (or "main" for standard jobs), each with an
+                                 ordered list of passes (framing, tier, model, provider,
+                                 output). Useful for forensic review and debugging.
+                                 Default False to keep normal poll responses compact.
     """
     job = store.get_job(job_id)
     if not job:
@@ -199,6 +208,9 @@ async def get_thinking_result(job_id: str) -> dict:
             response["result"] = job["result"]
     elif job["status"] == "failed":
         response["error"] = job.get("error")
+
+    if include_reasoning_chain:
+        response["reasoning_chain"] = store.get_full_reasoning_chain(job_id)
 
     return response
 
