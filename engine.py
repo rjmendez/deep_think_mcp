@@ -57,6 +57,95 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY: Local-only LLM enforcement for MQTT operations
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SecurityError(Exception):
+    """Raised when security policy is violated (e.g., cloud provider used in local-only mode)."""
+    pass
+
+
+def _validate_provider_is_local(provider: str, force_local: bool) -> None:
+    """Validate provider is local (Ollama only) when force_local_models=True.
+    
+    Raises SecurityError if cloud provider attempted in local-only mode.
+    """
+    if not force_local:
+        return
+    
+    cloud_providers = {"anthropic", "copilot", "azure", "openai"}
+    if provider.lower() in cloud_providers:
+        msg = (
+            f"[SECURITY] Cloud provider '{provider}' blocked in local-only mode. "
+            f"force_local_models=True requires Ollama-only. "
+            f"Set DEEP_THINK_FORCE_LOCAL=0 to allow cloud providers."
+        )
+        log.error(msg)
+        raise SecurityError(msg)
+
+
+async def _check_ollama_available(base_url: str = "") -> bool:
+    """Check if Ollama is reachable and has models. Returns True if available and has models.
+    
+    Used for startup validation when force_local_models=True.
+    """
+    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{base_url}/api/tags")
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            if not models:
+                log.error(f"[MQTT] Ollama reachable at {base_url} but no models installed")
+                return False
+            log.info(f"[MQTT] Ollama validated: {len(models)} models available at {base_url}")
+            return True
+    except Exception as e:
+        log.error(f"[MQTT] Ollama unavailable at {base_url}: {e}")
+        return False
+
+
+async def _validate_and_enforce_local_models(
+    cfg: "ProviderConfig",
+    force_local: bool,
+    device_id: str = "",
+) -> None:
+    """Enforce local-only model policy for MQTT operations.
+    
+    When force_local_models=True:
+    - Verify all tiers route to Ollama only
+    - Check Ollama is available
+    - Log enforcement action
+    """
+    if not force_local:
+        return
+    
+    ollama_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    cfg.data_policy = "local"  # Force data_policy=local
+    
+    # Validate each tier routes to Ollama
+    for tier in ("light", "medium", "heavy"):
+        provider = _tier_provider(cfg, tier)
+        _validate_provider_is_local(provider, force_local=True)
+    
+    # Check Ollama availability
+    available = await _check_ollama_available(cfg.base_url)
+    if not available:
+        msg = f"[MQTT] Ollama unavailable for {device_id}" if device_id else "[MQTT] Ollama unavailable"
+        if ollama_mode:
+            log.error(f"{msg} — failing hard (OLLAMA_ONLY_MODE=1)")
+            raise SecurityError(msg)
+        log.warning(f"{msg} — degrading gracefully, will retry")
+    
+    log.info(
+        f"[MQTT] Local-only enforcement active for {device_id}" if device_id 
+        else "[MQTT] Local-only enforcement active"
+    )
+
 # Ground truth provider — optional dependency
 try:
     from ground_truth import GroundTruthProvider, Claim, create_ground_truth_provider
@@ -1650,6 +1739,8 @@ async def deep_think_passes(
     job_id: str = "",
     perspective_name: str = "",
     ground_truth_provider: Optional[Any] = None,
+    force_local_models: bool = False,
+    device_id: str = "",
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
@@ -1660,10 +1751,33 @@ async def deep_think_passes(
     mandate_prefix: When set, injected into EVERY pass prompt before the question.
                     Used by run_fan_out() to enforce a specific analytical perspective
                     throughout the full reasoning chain.
+    force_local_models: When True, enforce local-only Ollama, block cloud providers.
+                        Used for MQTT operations to prevent data leakage.
+                        Environment override: DEEP_THINK_FORCE_LOCAL (default: true for MQTT).
+    device_id: Device ID for logging (e.g., "ant_001"). Used to tag MQTT enforcement logs.
     """
     cfg = provider_cfg or build_provider_config()
+    
+    # Check environment override for force_local_models (security gate)
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    force_local_models = force_local_models or env_force_local
+    
+    # Check for production security lock (strictest mode)
+    ollama_only_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    if ollama_only_mode:
+        force_local_models = True
+        log.info("[SECURITY] OLLAMA_ONLY_MODE=1 detected, forcing local-only models")
+    
+    # Enforce local-only models if requested (async validation + setup)
+    if force_local_models:
+        await _validate_and_enforce_local_models(cfg, force_local_models, device_id)
+        if device_id:
+            log.info(f"[MQTT] Running local-only deep_think for device {device_id}")
+    
     if data_policy and data_policy != "any":
         cfg.data_policy = data_policy
+    elif force_local_models:
+        cfg.data_policy = "local"  # Ensure local is set
 
     passes = max(2, min(passes, 6))
 
@@ -2046,6 +2160,8 @@ async def run_fan_out(
     max_width: int = 6,
     confidence_threshold: int = 50,
     extract_claims: bool = False,
+    force_local_models: bool = False,
+    device_id: str = "",
 ) -> str:
     """Run a perspective fan-out: width parallel mandate-driven agents × height passes each.
 
@@ -2073,6 +2189,9 @@ async def run_fan_out(
         extract_claims:       If True, distil each perspective's prose into a structured claim set
                               (light-tier model) before synthesis. Reduces synthesis context ~10-20×
                               and surfaces numerical confidence per claim. Default False.
+        force_local_models:   When True, enforce local-only Ollama, block cloud providers.
+                              Used for MQTT operations to prevent data leakage.
+        device_id:            Device ID for logging. Used to tag MQTT enforcement logs.
 
     Returns JSON string with perspectives + synthesis, matching deep_think schema shape.
     """
@@ -2085,8 +2204,28 @@ async def run_fan_out(
     else:
         _cfg_pool = [provider_cfg or build_provider_config()]
 
+    # Check environment override for force_local_models (security gate)
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    force_local_models = force_local_models or env_force_local
+    
+    # Check for production security lock (strictest mode)
+    ollama_only_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    if ollama_only_mode:
+        force_local_models = True
+    
+    # Enforce local-only models on all configs in pool
+    if force_local_models:
+        for cfg in _cfg_pool:
+            await _validate_and_enforce_local_models(cfg, force_local_models, device_id)
+        if device_id:
+            log.info(f"[MQTT] Running local-only fan-out for device {device_id}")
+
     # Synthesis always uses the first (or only) config — typically cloud heavy.
     cfg = _cfg_pool[0]
+    if force_local_models:
+        cfg.data_policy = "local"
+    elif data_policy and data_policy != "any":
+        cfg.data_policy = data_policy
 
     width = max(1, min(width, 6))
     height = max(1, min(height, 5))
@@ -2162,6 +2301,8 @@ async def run_fan_out(
                 mandate_prefix=mandate_text,
                 job_id=job_id,
                 perspective_name=name,
+                force_local_models=force_local_models,
+                device_id=device_id,
             )
         try:
             parsed = json.loads(raw)
@@ -2297,6 +2438,8 @@ async def run_fan_out(
         provider_cfg=cfg,
         task_class="synthesis",
         data_policy=data_policy,
+        force_local_models=force_local_models,
+        device_id=device_id,
     )
 
     # Extract the deep_think_passes wrapper, then parse the synthesis JSON
