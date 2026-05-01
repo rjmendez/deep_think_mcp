@@ -13,7 +13,7 @@ Components:
 """
 
 from mqtt.config import MQTTConfig
-from mqtt.models import Finding
+from mqtt.models import Finding, Confirmation
 from mqtt.subscriber import (
     MQTTClaimsProcessor,
     mqtt_startup,
@@ -24,6 +24,7 @@ from mqtt.subscriber import (
     is_mqtt_enabled,
 )
 from mqtt.publisher import MQTTFindingsPublisher, FindingsPersistenceStore
+from mqtt.feedback_store import FeedbackStore
 from mqtt.resilience import (
     CircuitBreakerState,
     CircuitBreaker,
@@ -39,6 +40,7 @@ from mqtt.resilience import (
 __all__ = [
     "MQTTConfig",
     "Finding",
+    "Confirmation",
     "MQTTClaimsProcessor",
     "mqtt_startup",
     "mqtt_shutdown",
@@ -48,6 +50,7 @@ __all__ = [
     "is_mqtt_enabled",
     "MQTTFindingsPublisher",
     "FindingsPersistenceStore",
+    "FeedbackStore",
     "CircuitBreakerState",
     "CircuitBreaker",
     "MQTTHealthMonitor",
