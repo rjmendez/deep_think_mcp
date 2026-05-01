@@ -51,9 +51,19 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, replace as dataclasses_replace
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+# Ground truth provider — optional dependency
+try:
+    from ground_truth import GroundTruthProvider, Claim, create_ground_truth_provider
+except ImportError:
+    GroundTruthProvider = None  # Handle missing ground_truth module gracefully
+    Claim = None
+    create_ground_truth_provider = None
 
 # Ollama model availability cache — populated by refresh_ollama_models() at startup.
 _ollama_discovered: set[str] = set()
@@ -1336,6 +1346,183 @@ async def _run_safety_precheck(question: str, cfg: ProviderConfig) -> str | None
         return None
 
 
+async def _extract_claims_from_pass_output(
+    pass_num: int,
+    model_output: str,
+    task_class: str,
+) -> list[Any]:
+    """
+    Extract atomic claims from unstructured model output.
+    
+    Strategy: Use regex + heuristics to identify sentences that look like facts.
+    Split by periods, filter short/compound sentences, remove duplicates.
+    
+    Returns list of Claim objects (from ground_truth module).
+    """
+    if not Claim:
+        return []
+    
+    sentences = re.split(r'(?<=[.!?])\s+', model_output.strip())
+    claims_list = []
+    seen = set()
+    claim_id_counter = 0
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        
+        # Filter out questions, imperatives, and very short sentences
+        if not sentence or len(sentence) < 10:
+            continue
+        if sentence.endswith('?') or sentence.startswith(('What', 'How', 'When', 'Where', 'Why', 'Do', 'Can', 'Should')):
+            continue
+        
+        # Skip duplicate sentences
+        if sentence in seen:
+            continue
+        seen.add(sentence)
+        
+        # Extract confidence level if present in the sentence
+        confidence_model = 0.5
+        confidence_match = re.search(r'[Cc]onfidence[:\s]+([0-9.]+)', sentence)
+        if confidence_match:
+            try:
+                confidence_model = min(1.0, max(0.0, float(confidence_match.group(1))))
+            except ValueError:
+                confidence_model = 0.5
+        
+        # Infer claim type from keywords
+        claim_type = "general"
+        if any(x in sentence.lower() for x in ['gps', 'position', 'location', 'latitude', 'longitude']):
+            claim_type = "telemetry_gps"
+        elif any(x in sentence.lower() for x in ['stale', 'fresh', 'age', 'staleness', 'updated']):
+            claim_type = "telemetry_staleness"
+        elif any(x in sentence.lower() for x in ['error', 'failure', 'failed', 'crash', 'exception']):
+            claim_type = "error_detection"
+        elif any(x in sentence.lower() for x in ['code', 'bug', 'defect', 'vulnerability']):
+            claim_type = "code_defect"
+        elif any(x in sentence.lower() for x in ['database', 'connection', 'network', 'timeout']):
+            claim_type = "system_health"
+        
+        # Extract subject (first noun-like word or phrase before verb)
+        subject = "unknown"
+        words = sentence.split()
+        if len(words) > 0:
+            subject = words[0] if len(words[0]) > 2 else ' '.join(words[:2])
+        
+        claim_id = f"pass{pass_num}_c{claim_id_counter}"
+        claim_id_counter += 1
+        
+        try:
+            claim = Claim(
+                id=claim_id,
+                statement=sentence,
+                claim_type=claim_type,
+                subject=subject,
+                expected_value={"inferred": True},
+                confidence_model=confidence_model,
+            )
+            claims_list.append(claim)
+        except Exception as e:
+            log.debug(f"Failed to create claim: {e}")
+            continue
+    
+    return claims_list
+
+
+async def _validate_claims_against_ground_truth(
+    claims: list[Any],
+    ground_truth_provider: Any,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Validate extracted claims against ground truth.
+    
+    Returns: {
+        "claims": [Claim, ...],
+        "validation_results": [ValidationResult, ...],
+        "hallucination_count": int,
+        "overall_confidence": float,  # mean of validated confidences
+        "contradictions": [...]
+    }
+    """
+    if not ground_truth_provider or not claims:
+        return {
+            "claims": [],
+            "validation_results": [],
+            "hallucination_count": 0,
+            "overall_confidence": 0.5,
+            "contradictions": [],
+        }
+    
+    try:
+        # Validate all claims in a batch
+        validation_results = await ground_truth_provider.validate_batch(claims, context=context)
+        
+        # Count hallucinations (invalid claims)
+        hallucination_count = sum(1 for vr in validation_results if not vr.is_valid)
+        hallucination_details = [
+            {
+                "claim_id": vr.claim_id,
+                "claim_statement": next(
+                    (c.statement for c in claims if c.id == vr.claim_id),
+                    "unknown"
+                ),
+                "type": "hallucination",
+                "contradiction": vr.contradiction_source or "no match in ground truth",
+            }
+            for vr in validation_results if not vr.is_valid
+        ]
+        
+        # Calculate mean confidence from validation results
+        confidences = [vr.confidence for vr in validation_results if vr.confidence is not None]
+        overall_confidence = sum(confidences) / len(confidences) if confidences else 0.5
+        
+        # Detect contradictions with prior passes
+        prior_passes = context.get("prior_passes", [])
+        contradictions = []
+        if prior_passes and hasattr(ground_truth_provider, 'detect_contradictions'):
+            prior_claims = []
+            for ph in prior_passes:
+                if isinstance(ph, dict) and "validation" in ph:
+                    if ph["validation"] and "claims" in ph["validation"]:
+                        prior_claims.extend(ph["validation"]["claims"])
+            if prior_claims:
+                try:
+                    contradictions = await ground_truth_provider.detect_contradictions(
+                        claims, prior_claims
+                    )
+                except Exception as e:
+                    log.debug(f"Contradiction detection failed: {e}")
+                    contradictions = []
+        
+        return {
+            "claims": [c.to_dict() for c in claims],
+            "validation_results": [vr.to_dict() for vr in validation_results],
+            "hallucination_count": hallucination_count,
+            "overall_confidence": overall_confidence,
+            "contradictions": contradictions,
+            "hallucination_details": hallucination_details,
+        }
+    except asyncio.TimeoutError:
+        log.warning("Ground truth provider timeout during validation")
+        return {
+            "claims": [c.to_dict() for c in claims],
+            "validation_results": [],
+            "hallucination_count": 0,
+            "overall_confidence": 0.5,
+            "contradictions": [],
+        }
+    except Exception as e:
+        log.error(f"Ground truth validation failed: {e}")
+        return {
+            "claims": [c.to_dict() for c in claims],
+            "validation_results": [],
+            "hallucination_count": 0,
+            "overall_confidence": 0.5,
+            "contradictions": [],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Core reasoning loop
 # ---------------------------------------------------------------------------
@@ -1352,6 +1539,7 @@ async def deep_think_passes(
     verify: bool = False,
     job_id: str = "",
     perspective_name: str = "",
+    ground_truth_provider: Optional[Any] = None,
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
@@ -1489,6 +1677,30 @@ async def deep_think_passes(
         text, model_used, actual_provider = await _call_provider(
             prompt, tier, cfg, anthropic_key, github_token, resolved_class
         )
+        
+        # NEW: Extract and validate claims against ground truth
+        validation_result = None
+        measured_confidence = None
+        if ground_truth_provider:
+            try:
+                claims = await _extract_claims_from_pass_output(i + 1, text, resolved_class)
+                validation_result = await _validate_claims_against_ground_truth(
+                    claims,
+                    ground_truth_provider,
+                    context={"prior_passes": history, "question": question},
+                )
+                measured_confidence = validation_result.get("overall_confidence", 0.5)
+                log.debug(
+                    "Pass %d validation: %d claims extracted, %d hallucinations, confidence=%.2f",
+                    i + 1, len(claims), validation_result.get("hallucination_count", 0), measured_confidence,
+                )
+            except asyncio.TimeoutError:
+                log.warning(f"Ground truth provider timeout on pass {i + 1}")
+                validation_result = None
+            except Exception as e:
+                log.error(f"Ground truth validation failed on pass {i + 1}: {e}")
+                validation_result = None
+        
         history.append({
             "pass": i + 1,
             "framing": framing,
@@ -1496,6 +1708,8 @@ async def deep_think_passes(
             "provider": actual_provider,
             "model": model_used,
             "output": text,
+            "validation": validation_result,
+            "measured_confidence": measured_confidence,
         })
         log.debug(
             "Pass %d/%d complete (%s via %s/%s)",
