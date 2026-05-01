@@ -594,6 +594,40 @@ def set_pass_cache(
         conn.close()
 
 
+def get_full_reasoning_chain(job_id: str) -> list[dict]:
+    """Return all pass_cache rows for a job, ordered by perspective then pass_num.
+
+    Groups into a list of perspective dicts:
+        [{"perspective": str, "passes": [{"pass_num", "framing", "tier",
+                                           "model_used", "provider", "output"}, ...]}, ...]
+
+    Perspective "" (empty string) is renamed to "main" for clarity.
+    Expired rows are included — this is a forensic/reporting query, not a resume query.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT perspective, pass_num, framing, tier, model_used, provider, output "
+            "FROM pass_cache WHERE job_id=? ORDER BY perspective ASC, pass_num ASC",
+            (job_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        key = row["perspective"] or "main"
+        grouped.setdefault(key, []).append({
+            "pass_num":   row["pass_num"],
+            "framing":    row["framing"],
+            "tier":       row["tier"],
+            "model_used": row["model_used"],
+            "provider":   row["provider"],
+            "output":     row["output"],
+        })
+    return [{"perspective": k, "passes": v} for k, v in grouped.items()]
+
+
 def evict_expired_pass_cache() -> int:
     """Remove expired pass cache entries. Returns count removed."""
     now = datetime.now(timezone.utc).isoformat()
