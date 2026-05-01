@@ -528,6 +528,24 @@ class NovaGroundTruthProvider:
             contradictions = verify_result.get("contradictions", [])
             is_valid = verify_result.get("grounded", False)
             
+            # Validate evidence schema: must be list of dicts
+            if not isinstance(evidence, list):
+                log.warning(f"[{request_id}] Invalid evidence type: {type(evidence).__name__}, expected list")
+                evidence = []
+            else:
+                # Validate each evidence item is a dict with expected fields
+                validated_evidence = []
+                for idx, item in enumerate(evidence):
+                    if not isinstance(item, dict):
+                        log.warning(f"[{request_id}] Evidence item {idx} is not a dict: {type(item).__name__}")
+                        continue
+                    # Check for minimum required fields (source/content)
+                    if not item.get("source") and not item.get("content"):
+                        log.warning(f"[{request_id}] Evidence item {idx} missing source and content fields")
+                        continue
+                    validated_evidence.append(item)
+                evidence = validated_evidence
+            
             # If contradictions found, reduce confidence
             if contradictions and len(contradictions) > 0:
                 measured_confidence = max(0.0, measured_confidence - 0.3)
@@ -1703,6 +1721,18 @@ class MQTTGroundTruthProvider:
                 )
             
             sensor_value = sensor_data.get("data", {})
+            
+            # Validate sensor_value is not empty dict
+            if not sensor_value or not isinstance(sensor_value, dict):
+                return ValidationResult(
+                    claim_id=claim.id,
+                    is_valid=False,
+                    ground_truth_value=None,
+                    evidence=[],
+                    confidence=0.0,
+                    contradiction_source="empty_sensor_data",
+                    metadata={"provider": "mqtt", "reason": "sensor_data_empty_or_invalid_type"},
+                )
             
             # Validate with subject-specific tolerance windows
             # These match DAMA phone telemetry schema
