@@ -281,16 +281,19 @@ class TestFeedbackStore:
             expires_at=(datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         )
         
-        # Record confirmations with different timestamps to avoid deduplication
-        import time
-        confirmations = [True, True, False]
-        for i, confirmed in enumerate(confirmations):
-            time.sleep(0.01)  # Small delay to ensure different timestamp buckets
+        # Record confirmations from different devices to avoid deduplication hash collision
+        confirmations_data = [
+            ("device_001", True, "Test 1"),
+            ("device_002", True, "Test 2"),
+            ("device_003", False, "Test 3")
+        ]
+        
+        for device_id, confirmed, evidence in confirmations_data:
             confirmation = Confirmation(
                 finding_id=finding_id,
-                device_id="device_001",
+                device_id=device_id,
                 confirmed=confirmed,
-                evidence="Test",
+                evidence=evidence,
                 timestamp=now_iso()
             )
             store.record_confirmation(confirmation)
@@ -301,7 +304,7 @@ class TestFeedbackStore:
         assert stats['confirmed_count'] == 2
         assert stats['rejected_count'] == 1
         assert abs(stats['confirmation_rate'] - (2/3)) < 0.01
-        assert stats['unique_devices'] >= 1
+        assert stats['unique_devices'] >= 3
         assert stats['unique_findings'] >= 1
     
     def test_get_finding_stats_by_device(self, store: FeedbackStore) -> None:
