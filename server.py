@@ -1,4 +1,36 @@
-"""FastMCP server — exposes deep_think_async, get_thinking_result, list_thinking_jobs."""
+"""FastMCP server for deep-think multi-pass reasoning.
+
+This module implements the MCP (Model Context Protocol) server that exposes
+deep_think reasoning as a callable tool. It manages job lifecycle, async
+worker coordination, and persistence.
+
+ENDPOINTS:
+  POST /initialize           Start a new MCP session
+  POST /call/deep_think_async  Queue a reasoning job (returns job_id)
+  GET  /call/get_thinking_result  Poll job status and retrieve results
+  GET  /call/list_thinking_jobs    List all jobs in database
+
+TOOLS EXPOSED:
+  deep_think_async          Multi-pass reasoning (2-6 passes with different framings)
+  get_thinking_result       Poll job status and retrieve full reasoning chain
+  list_thinking_jobs        List jobs by status
+
+JOB FLOW:
+  1. Client calls deep_think_async with question + passes
+  2. Server queues job in SQLite (store.py)
+  3. Worker process picks up job (worker.py)
+  4. Worker calls engine.deep_think_passes for actual reasoning
+  5. Client polls get_thinking_result to check status
+  6. When complete, client receives full reasoning chain + answer
+
+PERSISTENCE:
+  - Jobs stored in SQLite (store.py) with status (queued/running/complete/failed)
+  - Reasoning chains kept in memory during execution
+  - Failed jobs retain error logs for debugging
+
+BACKGROUND TASKS:
+  - Ollama model discovery (if OLLAMA_BASE_URL set) — runs in parallel on startup
+  - Worker loop — continuously processes job queue (worker.py)"""
 
 import asyncio
 import json
@@ -9,9 +41,15 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from . import engine, store, worker
-
-from . import discover as _discover
+# Modular imports from new structure
+from .engine import (
+    build_provider_config,
+    _tier_provider,
+    TASK_CLASS_PROFILES,
+    model_summary,
+    PERSPECTIVE_MANDATES,
+)
+from . import store, worker, discover as _discover
 
 log = logging.getLogger(__name__)
 
@@ -41,9 +79,9 @@ async def _lifespan(app):
 
 def _ollama_in_use() -> bool:
     """Return True if any provider tier resolves to Ollama."""
-    cfg = engine.build_provider_config()
+    cfg = build_provider_config()
     return any(
-        engine._tier_provider(cfg, tier) == "ollama"
+        _tier_provider(cfg, tier) == "ollama"
         for tier in ("light", "medium", "heavy")
     )
 
@@ -117,9 +155,9 @@ async def deep_think_async(
     if data_policy and data_policy != "any":
         pc["data_policy"] = data_policy
 
-    cfg = engine.build_provider_config(pc)
-    resolved_class = task_class if task_class in engine.TASK_CLASS_PROFILES else "general"
-    summary = engine.model_summary(cfg, resolved_class)
+    cfg = build_provider_config(pc)
+    resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
+    summary = model_summary(cfg, resolved_class)
 
     job_id = store.create_job(
         question=question,
@@ -321,9 +359,9 @@ async def deep_think_fan_out(
     if data_policy and data_policy != "any":
         pc["data_policy"] = data_policy
 
-    cfg = engine.build_provider_config(pc)
-    resolved_class = task_class if task_class in engine.TASK_CLASS_PROFILES else "general"
-    summary = engine.model_summary(cfg, resolved_class)
+    cfg = build_provider_config(pc)
+    resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
+    summary = model_summary(cfg, resolved_class)
 
     # Clip to valid ranges
     width = max(1, min(width, 6))
@@ -350,7 +388,7 @@ async def deep_think_fan_out(
     )
 
     # List which perspectives will run
-    mandates = engine.PERSPECTIVE_MANDATES.get(resolved_class, engine.PERSPECTIVE_MANDATES["general"])
+    mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
     perspective_names = [m["name"] for m in mandates[:width]]
 
     return {

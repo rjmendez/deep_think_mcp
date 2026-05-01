@@ -944,20 +944,36 @@ class MQTTGroundTruthProvider:
         
         Args:
             broker_host: MQTT broker hostname
-            broker_port: MQTT broker port
-            keepalive: MQTT keepalive interval in seconds
-            cache_ttl_seconds: Sensor data TTL before expiry
+            broker_port: MQTT broker port (must be 1-65535)
+            keepalive: MQTT keepalive interval in seconds (must be positive)
+            cache_ttl_seconds: Sensor data TTL before expiry (must be positive)
             broker_user: MQTT username (default: env MQTT_USERNAME or "dama")
             broker_password: MQTT password (default: env MQTT_PASSWORD or "")
             max_cache_size: Max telemetry entries before eviction (default: 10000)
             mqtt_qos: MQTT Quality of Service level (0, 1, or 2; default: 1)
         """
+        # Validate broker_port range (1-65535)
+        if not isinstance(broker_port, int) or broker_port < 1 or broker_port > 65535:
+            raise ValueError(f"broker_port must be int in range 1-65535, got {broker_port}")
+        
+        # Validate keepalive (positive int)
+        if not isinstance(keepalive, int) or keepalive <= 0:
+            raise ValueError(f"keepalive must be positive int, got {keepalive}")
+        
+        # Validate cache_ttl_seconds (positive int)
+        if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds <= 0:
+            raise ValueError(f"cache_ttl_seconds must be positive int, got {cache_ttl_seconds}")
+        
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.keepalive = keepalive
         self.cache_ttl_seconds = cache_ttl_seconds
         self.max_cache_size = max_cache_size
         self.mqtt_qos = int(os.getenv("MQTT_QoS", str(mqtt_qos)))
+        
+        # Validate mqtt_qos (must be 0, 1, or 2)
+        if self.mqtt_qos not in (0, 1, 2):
+            raise ValueError(f"mqtt_qos must be 0, 1, or 2; got {self.mqtt_qos}")
         
         # Credentials from parameters or environment
         self.broker_user = broker_user or os.getenv("MQTT_USERNAME", "dama")
@@ -1173,6 +1189,11 @@ class MQTTGroundTruthProvider:
                         topic = message.topic
                         payload = json.loads(message.payload.decode())
                         
+                        # Validate payload is dict (json.loads can return any JSON type)
+                        if not isinstance(payload, dict):
+                            log.warning(f"Invalid payload type from {topic}: expected dict, got {type(payload).__name__}")
+                            continue
+                        
                         # Parse device_id from topic "dama/{device_id}/telemetry"
                         parts = topic.split('/')
                         if len(parts) >= 2:
@@ -1303,9 +1324,15 @@ class MQTTGroundTruthProvider:
                 gps = payload["gps"]
                 expected_gps_keys = self.sensor_registry.get("gps", [])
                 if validate_section("gps", expected_gps_keys, gps):
-                    age_ms = gps.get("age_ms", 0)
-                    # Handle negative age_ms
-                    if age_ms < 0:
+                    age_ms = gps.get("age_ms")
+                    # Validate age_ms is integer and non-negative
+                    if age_ms is None:
+                        log.warning(f"Missing age_ms in gps, treating data as stale")
+                        age_ms = 999999  # Very large value signals missing/stale
+                    elif not isinstance(age_ms, int):
+                        log.warning(f"Invalid age_ms type in gps: {type(age_ms).__name__}, treating as stale")
+                        age_ms = 999999
+                    elif age_ms < 0:
                         log.warning(f"Negative age_ms in gps: {age_ms}. Treating as stale.")
                         age_ms = 999999  # Very large value signals stale data
                     self._sensor_cache[device_id]["GPS.POSITION"] = {
@@ -1322,9 +1349,15 @@ class MQTTGroundTruthProvider:
                 wifi = payload["wifi"]
                 expected_wifi_keys = self.sensor_registry.get("wifi", [])
                 if validate_section("wifi", expected_wifi_keys, wifi):
-                    age_ms = wifi.get("age_ms", 0)
-                    # Handle negative age_ms
-                    if age_ms < 0:
+                    age_ms = wifi.get("age_ms")
+                    # Validate age_ms is integer and non-negative
+                    if age_ms is None:
+                        log.warning(f"Missing age_ms in wifi, treating data as stale")
+                        age_ms = 999999
+                    elif not isinstance(age_ms, int):
+                        log.warning(f"Invalid age_ms type in wifi: {type(age_ms).__name__}, treating as stale")
+                        age_ms = 999999
+                    elif age_ms < 0:
                         log.warning(f"Negative age_ms in wifi: {age_ms}. Treating as stale.")
                         age_ms = 999999
                     self._sensor_cache[device_id]["WIFI.NEARBY_NETWORKS"] = {
@@ -1341,9 +1374,15 @@ class MQTTGroundTruthProvider:
                 bt = payload["bluetooth"]
                 expected_bt_keys = self.sensor_registry.get("bluetooth", [])
                 if validate_section("bluetooth", expected_bt_keys, bt):
-                    age_ms = bt.get("age_ms", 0)
-                    # Handle negative age_ms
-                    if age_ms < 0:
+                    age_ms = bt.get("age_ms")
+                    # Validate age_ms is integer and non-negative
+                    if age_ms is None:
+                        log.warning(f"Missing age_ms in bluetooth, treating data as stale")
+                        age_ms = 999999
+                    elif not isinstance(age_ms, int):
+                        log.warning(f"Invalid age_ms type in bluetooth: {type(age_ms).__name__}, treating as stale")
+                        age_ms = 999999
+                    elif age_ms < 0:
                         log.warning(f"Negative age_ms in bluetooth: {age_ms}. Treating as stale.")
                         age_ms = 999999
                     self._sensor_cache[device_id]["BT.NEARBY_DEVICES"] = {
@@ -1709,10 +1748,34 @@ class MQTTGroundTruthProvider:
                     ground_truth_value = actual
             
             elif "GPS" in claim.subject.upper() or "LOCATION" in claim.subject.upper():
-                # GPS: Exact fix validation or coordinate match
-                gps_fix = sensor_value.get("gps_fix", False)
-                is_valid = gps_fix  # True if GPS has valid fix
+                # GPS: Validate fix and optionally check expected coordinates
+                gps_fix = sensor_value.get("gps_fix", False) or sensor_value.get("valid_fix", False)
+                
+                # Use dedicated method to calculate confidence with staleness penalty
                 confidence = self._validate_gps_availability(sensor_value)
+                is_valid = gps_fix
+                
+                # If claim has expected_value with coordinates, validate against them
+                if gps_fix and claim.expected_value and isinstance(claim.expected_value, dict):
+                    expected_lat = claim.expected_value.get("latitude")
+                    expected_lon = claim.expected_value.get("longitude")
+                    
+                    # Only apply coordinate validation if expected_value has latitude/longitude
+                    if expected_lat is not None and expected_lon is not None:
+                        actual_lat = sensor_value.get("latitude")
+                        actual_lon = sensor_value.get("longitude")
+                        
+                        if actual_lat is not None and actual_lon is not None:
+                            # Calculate coordinate distance (simple Euclidean, not geodesic)
+                            lat_diff = abs(actual_lat - expected_lat)
+                            lon_diff = abs(actual_lon - expected_lon)
+                            coord_distance = (lat_diff**2 + lon_diff**2) ** 0.5
+                            
+                            # 0.01 degree ≈ 1.1km; degrade confidence per degree of distance
+                            is_valid = coord_distance <= 0.1  # ~11km tolerance
+                            # Apply coordinate penalty on top of staleness
+                            confidence = max(0.0, confidence - (coord_distance * 5.0))
+                
                 ground_truth_value = {
                     "valid_fix": gps_fix,
                     "latitude": sensor_value.get("latitude"),
