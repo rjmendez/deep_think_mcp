@@ -1528,6 +1528,116 @@ async def _validate_claims_against_ground_truth(
 # ---------------------------------------------------------------------------
 
 
+def _select_adaptive_framing(
+    pass_number: int,
+    total_passes: int,
+    directives: list[tuple[str, str]],
+    validation_result: dict | None,
+) -> tuple[str, str]:
+    """Select next framing adaptively based on validation results.
+    
+    If no validation data, falls back to sequential selection.
+    If validation shows problems, routes to diagnostic framings.
+    
+    Strategy:
+    - HIGH hallucination (>40%) → adversarial_brief (challenge claims)
+    - CONTRADICTIONS → prosecution_defense (compare, resolve)
+    - LOW confidence (<0.5) → evidence_inventory (catalog, gaps)
+    - MODERATE confidence (0.5-0.7) → hypothesis_matrix (alternatives)
+    - HIGH confidence (>0.8) + low hallucinations → validation (stress-test)
+    - No validation → sequential fallback
+    
+    Args:
+        pass_number: Current pass number (1-indexed)
+        total_passes: Total passes planned
+        directives: Full directive list for this task class
+        validation_result: Validation metrics from previous pass
+    
+    Returns:
+        (framing_name, directive_text) tuple
+    """
+    is_final = pass_number == total_passes
+    
+    # Final pass always uses last directive (synthesis/finalization)
+    if is_final:
+        return directives[-1]
+    
+    # No validation data? Use sequential fallback
+    if not validation_result:
+        # Default sequential: pick from directives by pass number
+        idx = min(pass_number - 1, len(directives) - 2)
+        return directives[idx]
+    
+    # Extract validation metrics
+    measured_confidence = validation_result.get("overall_confidence", 0.5)
+    hallucination_count = validation_result.get("hallucination_count", 0)
+    total_claims = validation_result.get("total_claims", 1)
+    contradictions = validation_result.get("contradictions", [])
+    
+    hallucination_rate = hallucination_count / max(total_claims, 1)
+    
+    # Adaptive routing based on validation results
+    
+    # 1. HIGH hallucination rate (>40%) → Use "adversarial_brief"
+    #    (challenge claims, demand evidence, expect contradiction)
+    if hallucination_rate > 0.4:
+        for framing, directive in directives:
+            if framing in ("adversarial_brief", "prosecution_defense", "attack_surface"):
+                log.info(
+                    "Adaptive: hallucination_rate=%.0f%% → routing to %s",
+                    hallucination_rate * 100, framing
+                )
+                return (framing, directive)
+    
+    # 2. CONTRADICTIONS detected → Use "prosecution_defense"
+    #    (compare claims, resolve contradictions, weigh evidence)
+    if contradictions and len(contradictions) > 1:
+        for framing, directive in directives:
+            if framing in ("prosecution_defense", "narrative_stress_test", "multi_perspective"):
+                log.info(
+                    "Adaptive: %d contradictions detected → routing to %s",
+                    len(contradictions), framing
+                )
+                return (framing, directive)
+    
+    # 3. LOW confidence (<0.5) → Use "evidence_inventory"
+    #    (catalog all evidence, identify gaps, assess reliability)
+    if measured_confidence < 0.5:
+        for framing, directive in directives:
+            if framing in ("evidence_inventory", "evidence_mapping", "source_analysis"):
+                log.info(
+                    "Adaptive: confidence=%.2f (low) → routing to %s",
+                    measured_confidence, framing
+                )
+                return (framing, directive)
+    
+    # 4. MODERATE confidence (0.5-0.7) → Use "hypothesis_matrix"
+    #    (enumerate alternatives, test each, compare)
+    if 0.5 <= measured_confidence < 0.7:
+        for framing, directive in directives:
+            if framing in ("hypothesis_matrix", "multi_perspective", "socratic_dialogue"):
+                log.info(
+                    "Adaptive: confidence=%.2f (moderate) → routing to %s",
+                    measured_confidence, framing
+                )
+                return (framing, directive)
+    
+    # 5. HIGH confidence (>0.8) AND low hallucinations → Use "validation"
+    #    (verify assumptions, stress-test claims, look for edge cases)
+    if measured_confidence > 0.8 and hallucination_rate < 0.15:
+        for framing, directive in directives:
+            if framing in ("validation", "narrative_stress_test", "correctness_analysis"):
+                log.info(
+                    "Adaptive: confidence=%.2f (high) + hallucination_rate=%.0f%% → routing to %s",
+                    measured_confidence, hallucination_rate * 100, framing
+                )
+                return (framing, directive)
+    
+    # Fallback: sequential selection
+    idx = min(pass_number - 1, len(directives) - 2)
+    return directives[idx]
+
+
 async def deep_think_passes(
     question: str,
     passes: int = 3,
@@ -1653,11 +1763,21 @@ async def deep_think_passes(
             )
 
     for i in range(len(history), passes):
-        is_final = i == passes - 1
-        framing, directive = (
-            directives[-1] if is_final else directives[min(i, len(directives) - 2)]
-        )
-        tier = "heavy" if is_final else _FRAMING_TIER.get(framing, "medium")
+        # Adaptive framing selection based on prior pass validation results
+        if i == 0:
+            # First pass: use first directive
+            framing, directive = directives[0]
+        else:
+            # Subsequent passes: adapt based on validation from prior pass
+            prior_validation = history[i - 1].get("validation") if i > 0 else None
+            framing, directive = _select_adaptive_framing(
+                i + 1,  # pass_number (1-indexed)
+                passes,  # total_passes
+                directives,
+                prior_validation,
+            )
+        
+        tier = "heavy" if i == passes - 1 else _FRAMING_TIER.get(framing, "medium")
 
         if history:
             prior = "\n\n".join(
