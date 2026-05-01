@@ -1562,7 +1562,7 @@ class MQTTGroundTruthProvider:
                 }
                 
                 # If time_range requested, include historical values
-                if time_range and hasattr(sensor, 'history'):
+                if time_range and "history" in sensor:
                     start, end = time_range
                     historical = [
                         {"timestamp": ts.isoformat(), "value": val}
@@ -1676,6 +1676,17 @@ class MQTTGroundTruthProvider:
         Returns:
             ValidationResult with is_valid and confidence based on sensor data
         """
+        # Validate claim has required fields
+        if not claim or not claim.id or not claim.subject:
+            return ValidationResult(
+                claim_id=claim.id if claim else "unknown",
+                is_valid=False,
+                ground_truth_value=None,
+                evidence=[],
+                confidence=0.0,
+                metadata={"provider": "mqtt", "reason": "invalid_claim_missing_id_or_subject"},
+            )
+        
         context = context or {}
         device_id = context.get("device_id")
         
