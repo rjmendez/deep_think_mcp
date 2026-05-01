@@ -91,8 +91,8 @@ _COPILOT_DEFAULTS = {
 }
 _OLLAMA_DEFAULTS = {
     "light":  "phi4-mini:latest",
-    "medium": "qwen3:8b",
-    "heavy":  "deepseek-r1:8b",
+    "medium": "qwen3.5:27b",
+    "heavy":  "llama3.1:8b",
 }
 
 
