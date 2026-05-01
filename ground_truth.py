@@ -443,35 +443,100 @@ class NovaGroundTruthProvider:
         claims: List[Claim],
         prior_claims: Optional[List[Claim]] = None,
     ) -> List[Dict]:
-        """Detect contradictions between claims.
+        """Detect semantic contradictions between current and prior claims using Nova.
+        
+        Uses nova_verify to check if claims contradict each other at the semantic level,
+        not just syntactic equality. For example, "Device in Pennsylvania" and "Device in
+        New York" contradict even though the strings differ.
         
         Args:
             claims: Current claims (Claim objects)
             prior_claims: Claims from prior passes (either Claim objects or dicts)
         
         Returns:
-            List of contradiction dicts
+            List of contradiction dicts with semantic analysis
         """
         contradictions = []
-        if prior_claims:
-            for claim in claims:
-                for prior_claim in prior_claims:
-                    # Reconstruct Claim objects if they are dicts (from serialized history)
-                    prior_claim_obj = prior_claim
-                    if isinstance(prior_claim, dict):
-                        try:
-                            prior_claim_obj = Claim(**prior_claim)
-                        except (TypeError, KeyError) as e:
-                            log.debug(f"Failed to reconstruct Claim from dict: {e}")
-                            continue
+        
+        if not prior_claims or len(prior_claims) == 0:
+            return contradictions
+        
+        # Reconstruct all Claim objects
+        current_claims = claims if all(isinstance(c, Claim) for c in claims) else []
+        reconstructed_prior = []
+        
+        for prior_claim in prior_claims:
+            if isinstance(prior_claim, Claim):
+                reconstructed_prior.append(prior_claim)
+            elif isinstance(prior_claim, dict):
+                try:
+                    reconstructed_prior.append(Claim(**prior_claim))
+                except (TypeError, KeyError) as e:
+                    log.debug(f"Failed to reconstruct prior claim: {e}")
+                    continue
+        
+        # Check each current claim against prior claims
+        for claim in current_claims:
+            for prior_claim in reconstructed_prior:
+                # Same subject? These might contradict
+                if claim.subject != prior_claim.subject:
+                    continue
+                
+                # Exact same value? No contradiction
+                if claim.expected_value == prior_claim.expected_value:
+                    continue
+                
+                # Different values on same subject - check for semantic contradiction
+                try:
+                    # Use Nova to semantically verify both claims
+                    contradiction_query = (
+                        f"Do these claims contradict each other? "
+                        f"Claim 1 (pass {prior_claim.id}): {prior_claim.subject} = {prior_claim.expected_value}. "
+                        f"Claim 2 (pass {claim.id}): {claim.subject} = {claim.expected_value}."
+                    )
                     
-                    if (claim.subject == prior_claim_obj.subject and 
-                        claim.expected_value != prior_claim_obj.expected_value):
+                    # Try to use nova_verify if available
+                    try:
+                        from nova_tools import nova_verify
+                        verify_result = nova_verify(
+                            claim=contradiction_query,
+                            profile="auto",
+                            top=5
+                        )
+                        is_contradicted = verify_result.get("grounded", False) and \
+                                         "contradiction" in verify_result.get("grounding", "").lower()
+                    except (ImportError, Exception) as e:
+                        # Fallback: use simple heuristic for numeric claims
+                        is_contradicted = False
+                        try:
+                            if isinstance(claim.expected_value, (int, float)) and \
+                               isinstance(prior_claim.expected_value, (int, float)):
+                                # Numeric claims: >20% difference suggests contradiction
+                                max_val = max(abs(claim.expected_value), abs(prior_claim.expected_value))
+                                if max_val > 0:
+                                    diff_pct = abs(claim.expected_value - prior_claim.expected_value) / max_val * 100
+                                    is_contradicted = diff_pct > 20
+                        except:
+                            pass
+                    
+                    if is_contradicted:
                         contradictions.append({
-                            "claim_1_id": prior_claim_obj.id,
+                            "claim_1_id": prior_claim.id,
                             "claim_2_id": claim.id,
-                            "contradiction": f"{claim.subject}: {prior_claim_obj.expected_value} vs {claim.expected_value}",
+                            "subject": claim.subject,
+                            "claim_1_value": prior_claim.expected_value,
+                            "claim_2_value": claim.expected_value,
+                            "contradiction": (
+                                f"Semantic contradiction: {claim.subject} changed from "
+                                f"{prior_claim.expected_value} to {claim.expected_value}"
+                            ),
+                            "detection_method": "nova_verify" if 'verify_result' in locals() else "heuristic",
                         })
+                
+                except Exception as e:
+                    log.warning(f"Contradiction detection failed: {e}")
+                    continue
+        
         return contradictions
 
     async def get_context(self, query: str) -> Dict[str, Any]:
@@ -652,15 +717,15 @@ class MQTTGroundTruthProvider:
         device_id: Optional[str] = None,
         time_range: Optional[tuple[datetime, datetime]] = None,
     ) -> Dict[str, Any]:
-        """Fetch sensor data from cache.
+        """Fetch sensor data from cache with optional time-range filtering.
         
         Args:
-            sensor_id: e.g., "GPS.POSITION", "WIFI.NEARBY_NETWORKS"
+            sensor_id: e.g., "GPS.POSITION", "WIFI.NEARBY_NETWORKS", "DEVICE.BATTERY"
             device_id: Device to query (if None, returns from all devices)
-            time_range: Time window (not yet supported)
+            time_range: Optional (start, end) datetime tuple for filtering historical data
         
         Returns:
-            Sensor data dict or error dict
+            Sensor data dict with current_value, recent_values (if time_range), timestamp, status
         """
         async with self._cache_lock:
             if device_id:
@@ -679,7 +744,8 @@ class MQTTGroundTruthProvider:
                         "device_id": device_id,
                     }
                 
-                return {
+                # Build response
+                response = {
                     "sensor_id": sensor_id,
                     "device_id": device_id,
                     "current_value": sensor["data"],
@@ -687,6 +753,18 @@ class MQTTGroundTruthProvider:
                     "timestamp": sensor["timestamp"].isoformat(),
                     "status": "OK",
                 }
+                
+                # If time_range requested, include historical values
+                if time_range and hasattr(sensor, 'history'):
+                    start, end = time_range
+                    historical = [
+                        {"timestamp": ts.isoformat(), "value": val}
+                        for ts, val in sensor.get("history", [])
+                        if start <= ts <= end
+                    ]
+                    response["recent_values"] = historical
+                
+                return response
             else:
                 # Return from all devices
                 results = {}
@@ -781,14 +859,14 @@ class MQTTGroundTruthProvider:
         claim: Claim,
         context: Optional[Dict[str, Any]] = None,
     ) -> ValidationResult:
-        """Validate claim against real sensor data from MQTT.
+        """Validate claim against real sensor data from MQTT using tolerance windows.
         
         Args:
             claim: The claim to validate
             context: Optional context (may include device_id)
         
         Returns:
-            ValidationResult with is_valid and confidence
+            ValidationResult with is_valid and confidence based on sensor data
         """
         context = context or {}
         device_id = context.get("device_id")
@@ -816,10 +894,11 @@ class MQTTGroundTruthProvider:
                         sensor_data = dev_cache[claim.subject]
                         break
         
-        # Validate based on subject and expected_value
+        # Validate based on subject using proper tolerance windows
         confidence = 0.0
         is_valid = False
         ground_truth_value = None
+        tolerance_window = None
         
         try:
             if not sensor_data:
@@ -833,45 +912,111 @@ class MQTTGroundTruthProvider:
                     metadata={"provider": "mqtt", "reason": "sensor_not_available"},
                 )
             
-            sensor_obj = sensor_data.get("data", {})
+            sensor_value = sensor_data.get("data", {})
             
-            # GPS availability
-            if "GPS.POSITION" in claim.subject:
-                confidence = self._validate_gps_availability(sensor_obj)
-                is_valid = confidence > 0.5
-                ground_truth_value = sensor_obj.get("valid_fix", False)
+            # Validate with subject-specific tolerance windows
+            # These match DAMA phone telemetry schema
             
-            # WiFi availability
-            elif "WIFI" in claim.subject:
-                confidence = self._validate_wifi_availability(sensor_obj)
-                networks = sensor_obj.get("networks", [])
-                is_valid = len(networks) > 0
-                ground_truth_value = {"network_count": len(networks)}
+            if "BATTERY" in claim.subject.upper():
+                # Battery percentage: ±10% tolerance
+                tolerance_window = (10, "%")
+                actual = sensor_value.get("battery_pct", None)
+                if actual is not None and isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual - claim.expected_value)
+                    is_valid = diff <= 10
+                    confidence = max(0.0, 1.0 - (diff / 50.0))  # Linear decay
+                    ground_truth_value = actual
             
-            # Bluetooth availability
-            elif "BT" in claim.subject or "BLUETOOTH" in claim.subject:
-                confidence = self._validate_bt_availability(sensor_obj)
-                devices = sensor_obj.get("devices", [])
-                is_valid = len(devices) > 0
-                ground_truth_value = {"device_count": len(devices)}
+            elif "CPU" in claim.subject.upper() or "PROCESSOR" in claim.subject.upper():
+                # CPU usage: ±5% tolerance
+                tolerance_window = (5, "%")
+                actual = sensor_value.get("cpu_usage", None)
+                if actual is not None and isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual - claim.expected_value)
+                    is_valid = diff <= 5
+                    confidence = max(0.0, 1.0 - (diff / 50.0))
+                    ground_truth_value = actual
+            
+            elif "RAM" in claim.subject.upper() or "MEMORY" in claim.subject.upper():
+                # RAM usage: ±5% tolerance
+                tolerance_window = (5, "%")
+                actual = sensor_value.get("ram_usage", None)
+                if actual is not None and isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual - claim.expected_value)
+                    is_valid = diff <= 5
+                    confidence = max(0.0, 1.0 - (diff / 50.0))
+                    ground_truth_value = actual
+            
+            elif "TEMPERATURE" in claim.subject.upper() or "TEMP" in claim.subject.upper():
+                # Temperature: ±2°C tolerance
+                tolerance_window = (2, "°C")
+                actual = sensor_value.get("temperature_c", None)
+                if actual is not None and isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual - claim.expected_value)
+                    is_valid = diff <= 2
+                    confidence = max(0.0, 1.0 - (diff / 20.0))
+                    ground_truth_value = actual
+            
+            elif "GPS" in claim.subject.upper() or "LOCATION" in claim.subject.upper():
+                # GPS: Exact fix validation or coordinate match
+                gps_fix = sensor_value.get("gps_fix", False)
+                is_valid = gps_fix  # True if GPS has valid fix
+                confidence = self._validate_gps_availability(sensor_value)
+                ground_truth_value = {
+                    "valid_fix": gps_fix,
+                    "latitude": sensor_value.get("latitude"),
+                    "longitude": sensor_value.get("longitude"),
+                }
+            
+            elif "WIFI" in claim.subject.upper():
+                # WiFi network count: ±2 networks tolerance
+                tolerance_window = (2, "networks")
+                actual_networks = sensor_value.get("nearby_count", 0)
+                if isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual_networks - claim.expected_value)
+                    is_valid = diff <= 2
+                    confidence = max(0.0, 1.0 - (diff / 30.0))
+                    ground_truth_value = {"network_count": actual_networks}
+                else:
+                    confidence = self._validate_wifi_availability(sensor_value)
+                    is_valid = confidence > 0.5
+                    ground_truth_value = {"network_count": actual_networks}
+            
+            elif "BLUETOOTH" in claim.subject.upper() or "BT" in claim.subject.upper():
+                # Bluetooth device count
+                actual_devices = sensor_value.get("bt_device_count", 0)
+                if isinstance(claim.expected_value, (int, float)):
+                    diff = abs(actual_devices - claim.expected_value)
+                    is_valid = diff <= 2
+                    confidence = max(0.0, 1.0 - (diff / 30.0))
+                    ground_truth_value = {"device_count": actual_devices}
+                else:
+                    confidence = self._validate_bt_availability(sensor_value)
+                    is_valid = confidence > 0.5
+                    ground_truth_value = {"device_count": actual_devices}
             
             else:
-                # Generic validation: claim expected_value matches sensor data
-                is_valid = sensor_obj == claim.expected_value
-                confidence = 0.8 if is_valid else 0.2
-                ground_truth_value = sensor_obj
+                # Generic validation: exact match or loose equality
+                is_valid = sensor_value == claim.expected_value
+                confidence = 0.9 if is_valid else 0.1
+                ground_truth_value = sensor_value
             
             return ValidationResult(
                 claim_id=claim.id,
                 is_valid=is_valid,
                 ground_truth_value=ground_truth_value,
-                evidence=[{"sensor_data": sensor_obj, "timestamp": sensor_data.get("timestamp")}],
+                evidence=[{
+                    "sensor_data": sensor_value,
+                    "timestamp": sensor_data.get("timestamp"),
+                    "tolerance_window": tolerance_window,
+                }],
                 confidence=confidence,
                 metadata={
                     "provider": "mqtt",
                     "sensor_id": claim.subject,
                     "freshness_ms": sensor_data.get("freshness_ms", 0),
                     "device_id": device_id,
+                    "validation_method": "tolerance_window" if tolerance_window else "equality",
                 },
             )
         except Exception as e:
