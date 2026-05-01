@@ -277,6 +277,8 @@ async def deep_think_passes(
     model: Optional[str] = None,
     provider_config: Optional[dict] = None,
     ground_truth_provider: Optional[Any] = None,
+    force_local_models: bool = False,
+    device_id: str = "",
 ) -> dict:
     """Main multi-pass reasoning loop.
     
@@ -288,12 +290,28 @@ async def deep_think_passes(
         model: Override model for all tiers
         provider_config: Per-call provider overrides
         ground_truth_provider: Optional ground truth validator
+        force_local_models: When True, enforce local-only Ollama, block cloud providers.
+                            Used for MQTT operations to prevent data leakage.
+        device_id: Device ID for logging (e.g., "ant_001"). Used to tag MQTT enforcement logs.
     
     Returns:
         Dict with keys: final_answer, pass_outputs, confidence, duration_secs
     """
     import time
+    import os
+    
     start_time = time.time()
+    
+    # Check environment override for force_local_models (security gate)
+    import os
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    force_local_models = force_local_models or env_force_local
+    
+    # Check for production security lock (strictest mode)
+    ollama_only_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    if ollama_only_mode:
+        force_local_models = True
+        log.info("[SECURITY] OLLAMA_ONLY_MODE=1 detected, forcing local-only models")
     
     # Auto-classify if not provided
     if not task_class:
@@ -307,6 +325,25 @@ async def deep_think_passes(
     task_profile = directives_module.TASK_CLASS_PROFILES[task_class]
     directives = task_profile.get("directives", [])
     
+    # Initialize provider config
+    if provider_config is None:
+        provider_config = {}
+    
+    # Create provider config object
+    cfg = provider_module.build_provider_config(provider_config)
+    
+    # Enforce local-only models if requested (async validation + setup)
+    if force_local_models:
+        await provider_module._validate_and_enforce_local_models(cfg, force_local_models, device_id)
+        if device_id:
+            log.info(f"[MQTT] Running local-only deep_think for device {device_id}")
+    
+    # Apply data_policy override
+    if data_policy and data_policy != "any":
+        cfg.data_policy = data_policy
+    elif force_local_models:
+        cfg.data_policy = "local"  # Ensure local is set
+    
     # Run safety precheck if required
     if task_profile.get("safety_precheck"):
         safe, reason = await provider_module._run_safety_precheck(question)
@@ -318,10 +355,6 @@ async def deep_think_passes(
                 "confidence": 0.0,
                 "duration_secs": time.time() - start_time,
             }
-    
-    # Initialize provider config
-    if provider_config is None:
-        provider_config = {}
     
     pass_outputs = []
     validation_results = []
@@ -408,6 +441,8 @@ async def run_fan_out(
     model: Optional[str] = None,
     provider_config: Optional[dict] = None,
     ground_truth_provider: Optional[Any] = None,
+    force_local_models: bool = False,
+    device_id: str = "",
 ) -> dict:
     """Fan-out reasoning with multiple perspectives.
     
@@ -420,12 +455,45 @@ async def run_fan_out(
         model: Override model for all tiers
         provider_config: Per-call provider overrides
         ground_truth_provider: Optional ground truth validator
+        force_local_models: When True, enforce local-only Ollama, block cloud providers.
+                            Used for MQTT operations to prevent data leakage.
+        device_id: Device ID for logging. Used to tag MQTT enforcement logs.
     
     Returns:
         Dict with final_answer, perspective_outputs, synthesis, confidence, duration_secs
     """
     import time
+    import os
+    
     start_time = time.time()
+    
+    # Check environment override for force_local_models (security gate)
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    force_local_models = force_local_models or env_force_local
+    
+    # Check for production security lock (strictest mode)
+    ollama_only_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
+    if ollama_only_mode:
+        force_local_models = True
+    
+    # Enforce local-only models on all configs
+    if provider_config is None:
+        provider_config = {}
+    
+    cfg = provider_module.build_provider_config(provider_config)
+    
+    if force_local_models:
+        await provider_module._validate_and_enforce_local_models(cfg, force_local_models, device_id)
+        if device_id:
+            log.info(f"[MQTT] Running local-only fan-out for device {device_id}")
+    
+    # Apply data_policy override
+    if force_local_models:
+        cfg.data_policy = "local"
+        provider_config["data_policy"] = "local"
+    elif data_policy and data_policy != "any":
+        cfg.data_policy = data_policy
+        provider_config["data_policy"] = data_policy
     
     # Auto-classify if not provided
     if not task_class:
