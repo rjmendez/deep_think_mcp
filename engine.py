@@ -473,7 +473,20 @@ DATA_GOVERNANCE_DIRECTIVES: list[tuple[str, str]] = [
     ("telemetry_inventory", "Catalog all sensor streams and their expected freshness. Identify which are stale, missing, or duplicated."),
     ("integrity_analysis", "Analyze each stream for data quality issues: gaps, spikes, anomalies. Assess signal vs noise."),
     ("attribution_grounding", "For each issue found, identify the root cause: device hardware, OS interference, network loss, or sensor fusion algorithm."),
-    ("remediation_synthesis", "For each root cause, propose concrete remediation steps: firmware patch, OS config, network protocol change, algorithm tuning."),
+    ("remediation_synthesis", """For each root cause, propose concrete remediation steps: firmware patch, OS config, network protocol change, algorithm tuning.
+
+[OUTPUT FORMAT - STRICT]
+Output ONLY JSON object (no markdown, no prose):
+{
+  "root_causes": [{"id": string, "name": string, "category": string}],
+  "remediation_stacks": {
+    "cause_id": [{"layer": string, "action": string, "specifics": string}]
+  },
+  "decision_tree": {"node": string, "children": []}
+}
+- NO Unicode box-drawing characters (┌─┬┐└┴┘├┤).
+- NO markdown tables.
+- NO narrative text outside JSON structure."""),
 ]
 
 # Research synthesis: grounded literature analysis (evidence chains for DAMA insights)
@@ -483,7 +496,24 @@ RESEARCH_SYNTHESIS_DIRECTIVES: list[tuple[str, str]] = [
     ("draft_synthesis", "Write a draft answer with citations embedded. Use evidence grades to mark confidence per claim."),
     ("uncertainty_analysis", "Identify gaps in evidence. Flag claims with insufficient grounding. Suggest additional research directions."),
     ("adversarial_review", "Challenge the draft: What alternative explanations exist? What edge cases does it miss? What contradictions appear?"),
-    ("finalized_output", "Revise draft incorporating adversarial feedback. Output as JSON with claims[], grounding_score (0-1), citations[] (source, confidence, chunk_id)."),
+    ("finalized_output", """Revise draft incorporating adversarial feedback.
+
+[OUTPUT FORMAT - STRICT]
+Output ONLY JSON object (no markdown, no prose):
+{
+  "topic": string,
+  "summary": string,
+  "claims": [
+    {"id": string, "statement": string, "category": string, "confidence": "high"|"medium"|"low"}
+  ],
+  "citations": [
+    {"claim_ids": [string], "source": string, "confidence": number (0-1), "chunk_id": string}
+  ],
+  "grounding_score": number (0-1)
+}
+- NO markdown tables.
+- NO narrative text outside JSON structure.
+- All claims must be cited."""),
 ]
 
 # Map framing name → preferred tier (used to assign tier when directive count < 4)
@@ -518,7 +548,7 @@ TASK_CLASS_PROFILES: dict = {
     "general": {
         "description": "General-purpose reasoning and analysis. Default when no other class fits.",
         "directives": PASS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -533,7 +563,7 @@ TASK_CLASS_PROFILES: dict = {
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -541,7 +571,7 @@ TASK_CLASS_PROFILES: dict = {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
         "directives": SAFETY_DIRECTIVES,
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -556,7 +586,7 @@ TASK_CLASS_PROFILES: dict = {
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3:8b",          "heavy": "deepseek-r1:8b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
@@ -564,7 +594,7 @@ TASK_CLASS_PROFILES: dict = {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
         "directives": REASONING_DIRECTIVES,
         # deepseek-r1:8b is the pure reasoning specialist; ideal for all challenge and synthesis passes
-        "ollama":    {"light": "phi4-mini:latest",  "medium": "deepseek-r1:8b",    "heavy": "deepseek-r1:8b"},
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",    "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
