@@ -931,6 +931,130 @@
 </div>
 
 </div>
-<div class="footer">Multi-Agent Analysis with Hallucination Mitigation · deep-think-mcp Reference</div>
+
+<!-- SECTION 11: LESSONS FROM LIVE TESTING -->
+<div class="section" id="section11">
+  <h2><span class="num">11</span> Lessons from Live Security Incident Triage</h2>
+  <p class="lead">The following was learned running <code>investigation</code> class jobs against real security incidents in a production SOC environment. These findings shaped bug fixes, design decisions, and operational guidance for the framework.</p>
+
+  <h3>Deep Think vs Fan-Out — When to Use Each</h3>
+  <table class="htable" style="margin-top:0.75rem;">
+    <tr>
+      <th style="width:20%"></th>
+      <th>Deep Think (4 passes)</th>
+      <th>Fan-Out (6 perspectives × 2 passes)</th>
+    </tr>
+    <tr>
+      <td><strong>Best for</strong></td>
+      <td>Clear-cut incidents, initial triage, time-sensitive calls</td>
+      <td>Ambiguous incidents where disposition is genuinely contested</td>
+    </tr>
+    <tr>
+      <td><strong>Output shape</strong></td>
+      <td>Single coherent narrative with ranked alternatives</td>
+      <td>Explicit <code>converged_claims</code> + <code>contested_areas</code> split</td>
+    </tr>
+    <tr>
+      <td><strong>Key value</strong></td>
+      <td>Clean single story the analyst can act on immediately</td>
+      <td>Surfaces genuine disagreement — the prosecution/defense split is the real signal</td>
+    </tr>
+    <tr>
+      <td><strong>Confidence</strong></td>
+      <td>Usually higher (single narrative)</td>
+      <td>Lower, more honest — contested areas structurally cap the score</td>
+    </tr>
+    <tr>
+      <td><strong>Typical latency</strong></td>
+      <td>~7 min (Sonnet 4.6 heavy)</td>
+      <td>~8.5 min (Sonnet 4.6 heavy)</td>
+    </tr>
+  </table>
+  <div class="callout-green" style="margin-top:1rem;">
+    <p><strong>Recommended workflow:</strong> Run deep think first for fast triage. Add fan-out when deep think returns moderate confidence (50–70%) or when you need to know <em>why</em> analysts would disagree on disposition. The two runs together take ~16 minutes and produce a more complete picture than either alone.</p>
+  </div>
+
+  <h3 style="margin-top:1.75rem;">Confidence Score Calibration</h3>
+  <p style="font-size:0.93rem;color:#cbd5e1;margin-bottom:1rem;">Observed on real incidents — a 62% score on a hard incident is the <em>correct</em> output, not a failure. Do not tune the system to chase higher confidence on ambiguous evidence; that produces false confidence, not better analysis.</p>
+  <div class="cards">
+    <div class="card green">
+      <div class="label">93% — Clear FP</div>
+      <div class="desc">Nessus vulnerability scanner hitting npm <code>package.json</code>. All signals aligned: known scanner, clean hash, no lateral movement, matches prior FP pattern exactly.</div>
+    </div>
+    <div class="card amber">
+      <div class="label">62% — Genuinely Ambiguous</div>
+      <div class="desc">Whole-drive AV exclusion (<code>c:\</code>) + lsass.exe read 8 min later. Missing script source, prior FP pattern present but not applicable to this alert category. 62% was the honest answer.</div>
+    </div>
+    <div class="card red">
+      <div class="label">Anti-pattern: Forcing Closure</div>
+      <div class="desc">A 62% result on a T1562.001 with an unreviewed script is a <em>PENDING VALIDATION</em> disposition, not a false positive. Fan-out's contested_areas are the escalation trigger.</div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.75rem;">Mixed Provider Routing — What Actually Runs</h3>
+  <p style="font-size:0.93rem;color:#cbd5e1;margin-bottom:1rem;">With <code>DEEP_THINK_LIGHT_PROVIDER=ollama</code>, <code>DEEP_THINK_HEAVY_PROVIDER=copilot</code>, and <code>DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true</code> (the recommended production config), actual call routing may differ from configured routing when Ollama times out:</p>
+  <ul class="checklist">
+    <li><span class="dot"></span><strong>Light/medium passes attempt Ollama first.</strong> If the remote Ollama server is slow or busy, they time out and automatically fall back to Copilot. The fallback is transparent to the caller.</li>
+    <li><span class="dot"></span><strong>Check <code>pass_cache.provider</code> after a job</strong> to confirm actual routing. Prior to fix <code>2d91ac4</code>, this field incorrectly recorded the <em>intended</em> provider, not the actual one. <code>model_used</code> was always correct.</li>
+    <li><span class="dot"></span><strong>All Ollama pass results are cached.</strong> A timed-out pass that fell back to Copilot will have <code>provider=copilot</code> in the cache — if the job resumes, it won't retry Ollama for that pass.</li>
+  </ul>
+
+  <h3 style="margin-top:1.75rem;">Pass Cache and Perspective Cache Interaction</h3>
+  <p style="font-size:0.93rem;color:#cbd5e1;margin-bottom:1rem;">Fan-out jobs use two independent caches with different scoping rules:</p>
+  <table class="htable" style="margin-top:0.5rem;">
+    <tr>
+      <th style="width:22%">Cache</th>
+      <th>Scope</th>
+      <th>Effect on Reasoning Reports</th>
+    </tr>
+    <tr>
+      <td><code>pass_cache</code></td>
+      <td>Job-scoped — tied to a specific <code>job_id</code></td>
+      <td>Contains all intermediate pass outputs for this job. Always available via <code>include_reasoning_chain=true</code>.</td>
+    </tr>
+    <tr>
+      <td><code>perspective_cache</code></td>
+      <td>Content-addressed — shared across jobs with identical question + mandate + model</td>
+      <td>Cache hits replay a prior perspective result without re-running passes. <code>pass_cache</code> gets a stub row (<code>framing="perspective_cache_hit"</code>) so the perspective appears in reports, but intermediate passes are not available for the reused execution.</td>
+    </tr>
+  </table>
+  <div class="callout-green" style="margin-top:1rem;">
+    <p><strong>Practical implication:</strong> If you run two fan-out jobs on the same incident (e.g. one with Opus 4.7 and one with Sonnet 4.6), perspectives that used the same model will be replayed from cache. Only perspectives whose model changed will re-run. This is intentional — it cuts latency by ~40% on repeated analysis while guaranteeing identical conclusions for identical inputs.</p>
+  </div>
+
+  <h3 style="margin-top:1.75rem;">Full Reasoning Chain Retrieval</h3>
+  <p style="font-size:0.93rem;color:#cbd5e1;margin-bottom:1rem;">Use <code>include_reasoning_chain=true</code> in <code>get_thinking_result</code> to retrieve every intermediate pass alongside the final answer. This is the primary tool for forensic review of AI reasoning — examining <em>how</em> the model arrived at a conclusion, not just <em>what</em> it concluded.</p>
+  <div class="cards">
+    <div class="card blue">
+      <div class="label">When to use</div>
+      <div class="desc">Investigating a surprising or contested conclusion. Reviewing reasoning quality before escalating to a customer. Generating full triage reports for coworkers.</div>
+    </div>
+    <div class="card green">
+      <div class="label">What it returns</div>
+      <div class="desc">All pass outputs grouped by perspective, with framing label, tier, model, and actual provider used. For fan-out: all 6 perspectives including cache-hit stubs.</div>
+    </div>
+    <div class="card amber">
+      <div class="label">Default behavior</div>
+      <div class="desc"><code>include_reasoning_chain=false</code> — normal polling stays compact. Only attach when you actually need to inspect the chain; full chains can be 100KB+.</div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1.75rem;">Sonnet 4.6 vs Opus 4.7 as Heavy Model</h3>
+  <p style="font-size:0.93rem;color:#cbd5e1;margin-bottom:1rem;">Benchmarked on a complex security incident (AV exclusion + lsass read, 6 perspectives × 2 passes fan-out):</p>
+  <div class="cards">
+    <div class="card red">
+      <div class="label">Opus 4.7 — 11m 58s</div>
+      <div class="desc">Synthesis was <strong>truncated mid-sentence</strong> — model hit the token limit during the integration pass. Confidence: 62%.</div>
+    </div>
+    <div class="card green">
+      <div class="label">Sonnet 4.6 — 8m 33s</div>
+      <div class="desc">Synthesis was complete. Same 62% confidence. ~30% faster. <strong>Recommended default for investigation class.</strong></div>
+    </div>
+  </div>
+  <p style="font-size:0.88rem;color:#94a3b8;margin-top:0.75rem;">Reserve Opus 4.7 for synthesis tasks where answer completeness is more important than latency, or when Sonnet 4.6 produces truncated synthesis on very long perspective inputs.</p>
+</div>
+
+</div>
+<div class="footer">Multi-Agent Analysis with Hallucination Mitigation · deep-think-mcp Reference · Updated 2026-04-30</div>
 </body>
 </html>

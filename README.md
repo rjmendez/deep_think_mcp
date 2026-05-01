@@ -233,11 +233,84 @@ Parameters:
 
 Poll a job by `job_id`. Status: `queued → running → complete | failed`.
 
-When complete, returns the full `reasoning_chain` (all passes) and `final_answer`.
+When complete, returns the `result` (final answer + metadata).
+
+| Parameter | Default | Description |
+|---|---|---|
+| `job_id` | — | Job ID returned by `deep_think_async` or `deep_think_fan_out` |
+| `include_reasoning_chain` | `false` | When `true`, attaches a `reasoning_chain` field with all intermediate pass outputs from `pass_cache`, grouped by perspective. Use for forensic review, debugging, or generating full reasoning reports. Omit for normal polling — response stays compact. |
+
+`reasoning_chain` shape (when included):
+```json
+[
+  {
+    "perspective": "main",
+    "passes": [
+      {"pass_num": 1, "framing": "decomposition", "tier": "light",
+       "model_used": "phi4-mini:latest", "provider": "ollama", "output": "..."},
+      {"pass_num": 4, "framing": "synthesis", "tier": "heavy",
+       "model_used": "claude-opus-4.7", "provider": "copilot", "output": "..."}
+    ]
+  },
+  {
+    "perspective": "defense",
+    "passes": [...]
+  }
+]
+```
+
+For fan-out jobs, perspectives are named (`defense`, `prosecution`, `forensics`, etc.). For standard jobs, the single perspective is named `main`. Perspectives that were served from `perspective_cache` (cache hits from prior runs) appear with a single stub pass: `framing = "perspective_cache_hit"`, `tier/model/provider = "cached"`.
 
 ### `list_thinking_jobs`
 
 List recent jobs. Filter by `status` (`all`, `queued`, `running`, `complete`, `failed`).
+
+## Lessons from Live Security Incident Triage
+
+The following was learned running `investigation` class jobs against real GreyMatter incidents (RQ41335165, RQ41295056). Findings shaped several bug fixes and design decisions.
+
+### Deep think vs fan-out — when to use each
+
+| | Deep think (4 passes) | Fan-out (6 perspectives × 2 passes) |
+|---|---|---|
+| **Best for** | Clear-cut incidents, initial triage, time-sensitive | Ambiguous incidents where disposition is contested |
+| **Output** | Single coherent narrative | Explicit `converged_claims` + `contested_areas` |
+| **Value** | Clean single story | Surfaces genuine disagreement — the "prosecution vs defense" split is the real signal |
+| **Confidence** | Usually higher (single narrative) | Lower, more honest — contested areas cap the score |
+| **Cost** | ~7 min (Sonnet 4.6 heavy) | ~8.5 min (Sonnet 4.6 heavy) |
+
+Run **deep think first** for fast triage. Add **fan-out** when deep think returns moderate confidence (50–70%) or when you need to know *why* analysts would disagree.
+
+### Confidence calibration
+
+- **93%** — Clear false positive (RQ41335165: Nessus scanner hitting npm package.json, all signals aligned)
+- **62%** — Genuinely ambiguous incident (RQ41295056: AV exclusion + lsass read, missing script source, prior FP pattern present but not applicable)
+
+A 62% result from fan-out is **correct** on a hard incident. Do not tune the system to chase higher numbers on ambiguous evidence — that produces false confidence, not better analysis.
+
+### Mixed provider setup (Ollama light/medium + Copilot heavy)
+
+When using per-tier provider overrides (`DEEP_THINK_LIGHT_PROVIDER=ollama`, `DEEP_THINK_HEAVY_PROVIDER=copilot`) with `DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true`:
+
+- Light/medium passes are attempted on Ollama first. If they time out, the call falls back to Copilot automatically.
+- Prior to fix `2d91ac4`, the `provider` column in `pass_cache` recorded the *intended* provider (`"ollama"`) even when the fallback to Copilot actually served the call. `model_used` was always correct. The fix propagates a 3-tuple `(text, model, provider_used)` from `_call_provider` through all callers.
+- **Practical implication**: if your Ollama server is remote and occasionally slow, all passes may end up served by Copilot. Check `pass_cache.provider` after a job to confirm actual routing.
+
+### Pass cache and perspective cache interaction
+
+Fan-out jobs use two caches: `perspective_cache` (full perspective output, content-addressed) and `pass_cache` (per-pass intermediate outputs, job-scoped).
+
+- Perspective cache hits are **cross-job**: if two fan-out jobs ask the same question with the same model, perspectives from job 1 are replayed in job 2 without re-running.
+- Prior to fix `2d91ac4`, perspective cache hits skipped `pass_cache` writes entirely, leaving those perspectives absent from the reasoning chain. The fix writes a stub `pass_cache` row (framing=`"perspective_cache_hit"`) so all perspectives always appear in reports.
+- When generating full reasoning reports, stubs indicate "this perspective ran in a prior job and was reused" — the final answer is identical but intermediate passes are not available for the reused execution.
+
+### Sonnet 4.6 vs Opus 4.7 as heavy model
+
+On a complex security incident (RQ41295056):
+- **Opus 4.7 fan-out**: 11m 58s, synthesis was truncated (hit token limit mid-sentence)
+- **Sonnet 4.6 fan-out**: 8m 33s (~30% faster), synthesis was complete, same 62% confidence
+
+Sonnet 4.6 is the recommended default heavy model for `investigation` class in production. Reserve Opus 4.7 for synthesis tasks where answer completeness is critical and latency is acceptable.
 
 ## Architecture
 
