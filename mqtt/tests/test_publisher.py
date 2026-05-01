@@ -18,8 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mqtt_findings_publisher import (
-    Finding,
+from mqtt.models import Finding
+from mqtt.publisher import (
     FindingsPersistenceStore,
     MQTTFindingsPublisher,
     findings_from_deep_think_result,

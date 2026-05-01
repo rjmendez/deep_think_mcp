@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from mqtt_resilience import (
+from mqtt.resilience import (
     CircuitBreaker,
     CircuitBreakerState,
     HealthCheckHandler,

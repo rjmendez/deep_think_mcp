@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # Import modules to test
-from mqtt_integration import (
-    MQTTConfig,
+from mqtt.config import MQTTConfig
+from mqtt.subscriber import (
     MQTTClaimsProcessor,
     mqtt_startup,
     mqtt_shutdown,

@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from mqtt_findings_publisher import (
+from mqtt.publisher import (
     MQTTFindingsPublisher,
     findings_from_deep_think_result,
     load_config_from_env,
