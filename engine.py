@@ -1061,7 +1061,7 @@ def _timeout_for(model_id: str, provider: str) -> int:
 async def _call_anthropic(
     prompt: str, tier: str, cfg: ProviderConfig,
     anthropic_key: str, task_class: str = "general",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
     timeout = _timeout_for(model_id, "anthropic")
@@ -1080,13 +1080,13 @@ async def _call_anthropic(
             },
         )
         resp.raise_for_status()
-        return resp.json()["content"][0]["text"].strip(), model_id
+        return resp.json()["content"][0]["text"].strip(), model_id, "anthropic"
 
 
 async def _call_copilot(
     prompt: str, tier: str, cfg: ProviderConfig,
     github_token: str, task_class: str = "general",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Call the GitHub Copilot API (api.githubcopilot.com).
 
     Requires a GitHub OAuth token (gho_) with copilot scope.
@@ -1117,7 +1117,7 @@ async def _call_copilot(
                 },
             )
         if resp.is_success:
-            return resp.json()["choices"][0]["message"]["content"].strip(), model_id
+            return resp.json()["choices"][0]["message"]["content"].strip(), model_id, "copilot"
 
         body = resp.text[:400]
         is_tpm = "tpm:" in resp.headers.get("x-endpoint-client-forbidden", "")
@@ -1140,7 +1140,7 @@ async def _call_copilot(
 async def _call_ollama(
     prompt: str, tier: str, cfg: ProviderConfig,
     task_class: str = "general",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     import httpx  # type: ignore
     model_id = _model_for_tier(cfg, tier, task_class)
     timeout = _timeout_for(model_id, "ollama")
@@ -1153,7 +1153,7 @@ async def _call_ollama(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(f"{cfg.base_url}/api/generate", json=payload)
             resp.raise_for_status()
-            return resp.json().get("response", "").strip(), model_id
+            return resp.json().get("response", "").strip(), model_id, "ollama"
     except httpx.TimeoutException as exc:
         raise RuntimeError(
             f"Ollama model '{model_id}' timed out after {timeout}s "
@@ -1166,8 +1166,12 @@ async def _call_provider(
     prompt: str, tier: str, cfg: ProviderConfig,
     anthropic_key: str = "", github_token: str = "",
     task_class: str = "general",
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Dispatch to the correct provider for this tier.
+
+    Returns (text, model_id, provider_used). provider_used reflects the actual
+    provider that responded — if Ollama timed out and fell back to Copilot,
+    provider_used will be "copilot", not "ollama".
 
     Future: agentic tool-calling loop (issue #1) — passes will be able to
     execute MCP tools mid-reasoning and fold results back into history.
@@ -1225,7 +1229,7 @@ async def classify_task(
     """
     prompt = _TASK_CLASSIFIER_PROMPT.format(question=question[:600])
     try:
-        text, _ = await asyncio.wait_for(
+        text, _, _ = await asyncio.wait_for(
             _call_provider(prompt, "light", cfg, anthropic_key, github_token, "general"),
             timeout=20.0,
         )
@@ -1420,26 +1424,26 @@ async def deep_think_passes(
                 f"Pass 1/{passes}: {directive}"
             )
 
-        text, model_used = await _call_provider(
+        text, model_used, actual_provider = await _call_provider(
             prompt, tier, cfg, anthropic_key, github_token, resolved_class
         )
         history.append({
             "pass": i + 1,
             "framing": framing,
             "tier": tier,
-            "provider": _tier_provider(cfg, tier),
+            "provider": actual_provider,
             "model": model_used,
             "output": text,
         })
         log.debug(
             "Pass %d/%d complete (%s via %s/%s)",
-            i + 1, passes, framing, _tier_provider(cfg, tier), model_used,
+            i + 1, passes, framing, actual_provider, model_used,
         )
         if job_id:
             await asyncio.to_thread(
                 _store.set_pass_cache,
                 job_id, perspective_name, i + 1, _run_sig,
-                framing, tier, model_used, _tier_provider(cfg, tier), text,
+                framing, tier, model_used, actual_provider, text,
             )
 
     final_answer = history[-1]["output"]
@@ -1460,7 +1464,7 @@ async def deep_think_passes(
             "If you find issues, provide a corrected or supplemented final answer."
         )
         try:
-            verify_text, verify_model = await _call_provider(
+            verify_text, verify_model, _ = await _call_provider(
                 prompt=verify_prompt,
                 tier="heavy",
                 cfg=cfg,
@@ -1569,7 +1573,7 @@ async def _extract_claims(
 
     prompt = _CLAIM_EXTRACTION_PROMPT.format(analysis=analysis_text[:4000])
     try:
-        raw, model_id = await _call_provider(
+        raw, model_id, _ = await _call_provider(
             prompt=prompt,
             tier="light",
             cfg=cfg,
@@ -1577,7 +1581,6 @@ async def _extract_claims(
             github_token=github_token,
             task_class="extraction",
         )
-        parsed = _extract_json_block(raw)
         if parsed and isinstance(parsed.get("claims"), list):
             log.debug(
                 "Claim extraction: perspective=%s claims=%d model=%s",
@@ -1615,7 +1618,7 @@ async def _run_alarm_scan(
         perspectives=perspectives_text,
     )
     try:
-        raw, _model = await _call_provider(
+        raw, _model, _ = await _call_provider(
             prompt=prompt,
             tier="medium",
             cfg=cfg,
@@ -1733,6 +1736,14 @@ async def run_fan_out(
         cached = await asyncio.to_thread(_store.get_perspective_cache, cache_key)
         if cached:
             log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
+            # Write a stub pass_cache row so reports show all perspectives consistently.
+            if job_id:
+                await asyncio.to_thread(
+                    _store.set_pass_cache,
+                    job_id, name, 1, cache_key,
+                    "perspective_cache_hit", "cached", "cached", "cached",
+                    cached["final_answer"],
+                )
             return {
                 "name": name,
                 "status": "complete",
