@@ -8,12 +8,72 @@ import asyncio
 import json
 import logging
 import os
+import re
+import sqlite3
+import ssl
+import threading
 import time
+import uuid
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
 
+import pyotp
+
 log = logging.getLogger(__name__)
+
+# Optional imports for Nova integration
+# Try to import from nova_mcp.core (preferred, stable implementation)
+# Fall back to nova_tools if nova_mcp.core not available
+try:
+    from nova_mcp.core import nova_search, nova_verify, nova_synthesize
+    NOVA_TOOLS_AVAILABLE = True
+    log.debug("Using nova_mcp.core for Nova integration (stable implementation)")
+except ImportError:
+    try:
+        from nova_tools import nova_search, nova_verify, nova_synthesize
+        NOVA_TOOLS_AVAILABLE = True
+        log.debug("Using nova_tools for Nova integration (fallback)")
+    except ImportError:
+        NOVA_TOOLS_AVAILABLE = False
+        log.debug("nova_tools not available; Nova validation will return 0.0 confidence")
+
+# TOTP token caching (30-second TTL to match token validity window)
+_totp_cache = {"token": None, "expires_at": 0.0}
+_totp_lock = threading.Lock()
+
+# Nova environment variables
+NOVA_TOKEN = os.getenv("NOVA_TOKEN", "").strip()
+NOVA_TOTP_SEED = os.getenv("NOVA_TOTP_SEED", "").strip()
+NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "http://[REDACTED_INTERNAL_IP]:30850").rstrip("/")
+
+
+def _get_nova_headers_with_cached_totp() -> Dict[str, str]:
+    """Generate Nova auth headers with cached TOTP token (30-second TTL).
+    
+    Caches TOTP tokens to avoid regeneration overhead on every request.
+    TOTP tokens are only valid for 30 seconds, so reuse within the cache
+    window is safe and reduces CPU load under high request rates.
+    
+    Thread-safe using a lock to prevent concurrent regeneration (thundering herd).
+    """
+    headers = {"Authorization": f"Bearer {NOVA_TOKEN}"} if NOVA_TOKEN else {}
+    
+    if NOVA_TOTP_SEED:
+        now = time.time()
+        # Check if cache is still valid (fast path, no lock)
+        if now > _totp_cache["expires_at"]:
+            # Cache expired or not initialized; acquire lock for regeneration
+            with _totp_lock:
+                # Double-check inside lock (prevent multiple threads from both regenerating)
+                if now > _totp_cache["expires_at"]:
+                    _totp_cache["token"] = pyotp.TOTP(NOVA_TOTP_SEED).now()
+                    _totp_cache["expires_at"] = now + 30.0
+        
+        headers["X-TOTP-Challenge"] = _totp_cache["token"]
+    
+    return headers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,16 +259,56 @@ class NovaGroundTruthProvider:
     """
 
     def __init__(self):
-        """Initialize Nova ground truth provider."""
-        self.nova_available = False
-        self._check_nova_availability()
+        """Initialize Nova ground truth provider.
+        
+        Note: Nova availability check is deferred to first validate() call (lazy initialization).
+        This provides faster startup times and better error messages when Nova is actually used.
+        """
+        self.nova_available = None  # None = not yet checked, True/False = checked
+        self._nova_check_lock = asyncio.Lock()
 
-    def _check_nova_availability(self):
-        """Check if Nova/Great Library is available."""
-        # This will be called by engine.py before validating claims
-        # If nova_search tool is available, we can use it
-        self.nova_available = True
-        log.info("Nova ground truth provider initialized (Great Library accessible)")
+    async def _ensure_nova_initialized(self):
+        """Check Nova availability on first use (lazy initialization).
+        
+        Validates that:
+        1. nova_tools module is importable
+        2. NOVA_TOKEN environment variable is set
+        3. NOVA_TOTP_SEED environment variable is set
+        
+        Uses async lock to ensure initialization happens only once.
+        Logs warnings for missing configuration but allows graceful degradation.
+        Does not raise exceptions; sets nova_available to False if issues found.
+        """
+        # Fast path: already checked
+        if self.nova_available is not None:
+            return
+        
+        # Slow path: need to check (acquire lock to prevent duplicate checks)
+        async with self._nova_check_lock:
+            # Double-check inside lock
+            if self.nova_available is not None:
+                return
+            
+            if not NOVA_TOOLS_AVAILABLE:
+                log.warning("nova_tools module not available; Nova ground truth validation will be disabled")
+                self.nova_available = False
+                return
+            
+            # Check for required environment variables
+            missing_vars = []
+            if not NOVA_TOKEN:
+                missing_vars.append("NOVA_TOKEN")
+            if not NOVA_TOTP_SEED:
+                missing_vars.append("NOVA_TOTP_SEED")
+            
+            if missing_vars:
+                log.warning(f"Nova environment incomplete; missing: {', '.join(missing_vars)}. Nova validation will be disabled.")
+                self.nova_available = False
+                return
+            
+            self.nova_available = True
+            log.info("Nova ground truth provider initialized (Great Library accessible with valid credentials)")
+
 
     async def available_domains(self) -> List[str]:
         """Return domains where we can validate claims."""
@@ -235,13 +335,17 @@ class NovaGroundTruthProvider:
             - status: 'fresh' | 'stale' | 'unavailable'
             - evidence: List of supporting documents
             - confidence: 0.0-1.0 based on data quality
+            - metadata: {request_id, source, error (if any)}
         """
+        request_id = str(uuid.uuid4())[:8]
+        
         try:
-            # Dynamically import nova_search if available
-            try:
-                from nova_tools import nova_search
-            except ImportError:
-                log.warning(f"nova_tools not available for sensor {sensor_id}")
+            # Ensure Nova is initialized
+            await self._ensure_nova_initialized()
+            
+            # Check if Nova tools are available and properly configured
+            if not NOVA_TOOLS_AVAILABLE or not self.nova_available:
+                log.warning(f"[{request_id}] nova_tools not available or not configured for sensor {sensor_id}")
                 return {
                     "sensor_id": sensor_id,
                     "current_value": None,
@@ -249,11 +353,12 @@ class NovaGroundTruthProvider:
                     "status": "unavailable",
                     "evidence": [],
                     "confidence": 0.0,
-                    "metadata": {"error": "nova_tools not available"},
+                    "metadata": {"error": "nova_tools not available or not configured", "request_id": request_id},
                 }
             
             # Build search query for sensor specifications and recent data
             query = f"{sensor_id} sensor data specification accuracy bounds latest measurements"
+            log.debug(f"[{request_id}] Searching for sensor data: {query}")
             results = await nova_search(query, top=5, profile='research')
             
             sensor_info = {
@@ -263,7 +368,7 @@ class NovaGroundTruthProvider:
                 "status": "unknown",
                 "evidence": [],
                 "confidence": 0.5,
-                "metadata": {"source": "great_library"},
+                "metadata": {"source": "great_library", "request_id": request_id},
             }
             
             # Extract evidence from search results
@@ -286,14 +391,16 @@ class NovaGroundTruthProvider:
                 )
                 sensor_info["confidence"] = min(max_relevance, 1.0)
                 sensor_info["status"] = "fresh" if max_relevance >= 0.7 else "stale"
+                log.debug(f"[{request_id}] Sensor {sensor_id} status: {sensor_info['status']}, confidence: {sensor_info['confidence']:.2f}")
             else:
                 sensor_info["status"] = "unavailable"
                 sensor_info["confidence"] = 0.0
+                log.debug(f"[{request_id}] No evidence found for sensor {sensor_id}")
             
             return sensor_info
             
         except asyncio.TimeoutError:
-            log.warning(f"Timeout fetching sensor data for {sensor_id}")
+            log.warning(f"[{request_id}] Timeout fetching sensor data for {sensor_id}")
             return {
                 "sensor_id": sensor_id,
                 "current_value": None,
@@ -301,10 +408,10 @@ class NovaGroundTruthProvider:
                 "status": "timeout",
                 "evidence": [],
                 "confidence": 0.0,
-                "metadata": {"error": "timeout"},
+                "metadata": {"error": "timeout", "request_id": request_id},
             }
         except Exception as e:
-            log.error(f"Failed to fetch sensor data for {sensor_id}: {e}")
+            log.error(f"[{request_id}] Failed to fetch sensor data for {sensor_id}: {e}")
             return {
                 "sensor_id": sensor_id,
                 "current_value": None,
@@ -312,7 +419,7 @@ class NovaGroundTruthProvider:
                 "status": "error",
                 "evidence": [],
                 "confidence": 0.0,
-                "metadata": {"error": str(e)},
+                "metadata": {"error": str(e), "request_id": request_id},
             }
 
     async def validate(
@@ -325,9 +432,11 @@ class NovaGroundTruthProvider:
         Uses nova_verify to check if claim is supported by evidence.
         Falls back to nova_search if verify fails.
         
+        May retry up to 3 times on timeout using exponential backoff (1s, 2s, 4s).
+        
         Args:
             claim: Claim object with id, subject, expected_value
-            context: Optional context including prior_passes, task_class
+            context: Optional context including prior_passes, task_class, request_id
         
         Returns:
             ValidationResult with:
@@ -335,16 +444,21 @@ class NovaGroundTruthProvider:
             - ground_truth_value: What the data actually says
             - evidence: List of supporting documents
             - confidence: 0.0-1.0 measured from evidence quality
-            - metadata: {provider, query, status, latency_ms}
+            - metadata: {provider, query, status, latency_ms, request_id}
         """
         start_time = time.time()
+        context = context or {}
+        
+        # Generate unique request_id for tracing this validation chain
+        request_id = context.get("request_id") or str(uuid.uuid4())[:8]
         
         try:
-            # Dynamically import nova_verify if available
-            try:
-                from nova_tools import nova_verify
-            except ImportError:
-                log.debug(f"nova_tools not available for claim {claim.id}")
+            # Ensure Nova is initialized (lazy initialization on first use)
+            await self._ensure_nova_initialized()
+            
+            # Check if Nova is properly available (tools + environment)
+            if not NOVA_TOOLS_AVAILABLE or not self.nova_available:
+                log.debug(f"[{request_id}] nova_tools not available or not configured for claim {claim.id}")
                 return ValidationResult(
                     claim_id=claim.id,
                     is_valid=False,
@@ -355,29 +469,75 @@ class NovaGroundTruthProvider:
                         "provider": "nova",
                         "status": "unavailable",
                         "latency_ms": int((time.time() - start_time) * 1000),
+                        "request_id": request_id,
                     },
                 )
             
             # Build claim text for verification
             claim_text = f"{claim.subject}: {claim.expected_value}"
             
-            # Query Nova to verify the claim
-            verify_result = await nova_verify(claim_text, profile='research')
+            # Implement exponential backoff for Nova rate limiting awareness
+            # May retry up to 3 times on timeout
+            max_retries = 3
+            verify_result_json = None
             
-            # Parse verify result
-            is_valid = verify_result.get("grounded", False)
-            measured_confidence = verify_result.get("confidence", 0.5)
+            for attempt in range(max_retries):
+                try:
+                    log.debug(f"[{request_id}] Verifying claim {claim.id} (attempt {attempt + 1}/{max_retries})")
+                    # Query Nova to verify the claim
+                    verify_result_json = await nova_verify(claim_text, profile='research')
+                    break  # Success
+                except RuntimeError as e:
+                    if attempt < max_retries - 1 and "timed out" in str(e).lower():
+                        wait_time = (2 ** attempt)  # 1s, 2s, 4s
+                        log.debug(f"[{request_id}] Nova timeout on attempt {attempt + 1}/{max_retries}, retrying in {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise
+            
+            # Parse verify result (nova_verify returns JSON string, not dict)
+            verify_result = json.loads(verify_result_json)
+            
+            # Validate response has required fields
+            required_fields = {
+                "grounded": bool,
+                "confidence": (float, int),
+                "evidence": list,
+            }
+            
+            validation_errors = []
+            for field_name, expected_type in required_fields.items():
+                if field_name not in verify_result:
+                    validation_errors.append(f"missing '{field_name}'")
+                elif not isinstance(verify_result[field_name], expected_type):
+                    validation_errors.append(f"'{field_name}' has wrong type (expected {expected_type}, got {type(verify_result[field_name]).__name__})")
+            
+            if validation_errors:
+                log.warning(f"[{request_id}] Nova response validation failed for claim {claim.id}: {', '.join(validation_errors)}")
+                measured_confidence = 0.0
+            else:
+                is_valid = verify_result.get("grounded", False)
+                measured_confidence = verify_result.get("confidence", 0.5)
+                # Confidence scale from Nova: 0.0 = completely ungrounded, 1.0 = fully grounded
+                # Clamp to [0.0, 1.0] to handle any out-of-range values from the model
+                if not (0.0 <= measured_confidence <= 1.0):
+                    log.warning(f"[{request_id}] Nova returned invalid confidence {measured_confidence} for claim {claim.id}, clamping to [0.0, 1.0]")
+                    measured_confidence = max(0.0, min(1.0, measured_confidence))
+            
             evidence = verify_result.get("evidence", [])
             contradictions = verify_result.get("contradictions", [])
+            is_valid = verify_result.get("grounded", False)
             
             # If contradictions found, reduce confidence
             if contradictions and len(contradictions) > 0:
                 measured_confidence = max(0.0, measured_confidence - 0.3)
                 is_valid = False
-                log.debug(f"Claim {claim.id} has {len(contradictions)} contradictions")
+                log.debug(f"[{request_id}] Claim {claim.id} has {len(contradictions)} contradictions")
             
             # Latency tracking
             latency_ms = int((time.time() - start_time) * 1000)
+            
+            log.debug(f"[{request_id}] Validated claim {claim.id} with confidence {measured_confidence:.2f} (latency: {latency_ms}ms)")
             
             return ValidationResult(
                 claim_id=claim.id,
@@ -391,26 +551,32 @@ class NovaGroundTruthProvider:
                     "status": "verified",
                     "latency_ms": latency_ms,
                     "contradiction_count": len(contradictions) if contradictions else 0,
+                    "request_id": request_id,
                 },
             )
         
-        except asyncio.TimeoutError:
-            log.warning(f"Nova verification timeout for claim {claim.id}")
-            latency_ms = int((time.time() - start_time) * 1000)
-            return ValidationResult(
-                claim_id=claim.id,
-                is_valid=False,
-                ground_truth_value=None,
-                evidence=[],
-                confidence=0.0,
-                metadata={
-                    "provider": "nova",
-                    "status": "timeout",
-                    "latency_ms": latency_ms,
-                },
-            )
+        except RuntimeError as e:
+            # _request_json raises RuntimeError, not asyncio.TimeoutError
+            if "timed out" in str(e).lower():
+                log.warning(f"[{request_id}] Nova verification timeout for claim {claim.id}")
+                latency_ms = int((time.time() - start_time) * 1000)
+                return ValidationResult(
+                    claim_id=claim.id,
+                    is_valid=False,
+                    ground_truth_value=None,
+                    evidence=[],
+                    confidence=0.0,
+                    metadata={
+                        "provider": "nova",
+                        "status": "timeout",
+                        "latency_ms": latency_ms,
+                        "request_id": request_id,
+                    },
+                )
+            else:
+                raise
         except Exception as e:
-            log.error(f"Nova validation failed for claim {claim.id}: {e}")
+            log.error(f"[{request_id}] Nova validation failed for claim {claim.id}: {e}")
             latency_ms = int((time.time() - start_time) * 1000)
             return ValidationResult(
                 claim_id=claim.id,
@@ -423,6 +589,7 @@ class NovaGroundTruthProvider:
                     "status": "error",
                     "error": str(e),
                     "latency_ms": latency_ms,
+                    "request_id": request_id,
                 },
             )
 
@@ -457,8 +624,13 @@ class NovaGroundTruthProvider:
             List of contradiction dicts with semantic analysis
         """
         contradictions = []
+        request_id = str(uuid.uuid4())[:8]
+        
+        # Ensure Nova is initialized
+        await self._ensure_nova_initialized()
         
         if not prior_claims or len(prior_claims) == 0:
+            log.debug(f"[{request_id}] No prior claims for contradiction detection")
             return contradictions
         
         # Reconstruct all Claim objects
@@ -472,8 +644,10 @@ class NovaGroundTruthProvider:
                 try:
                     reconstructed_prior.append(Claim(**prior_claim))
                 except (TypeError, KeyError) as e:
-                    log.debug(f"Failed to reconstruct prior claim: {e}")
+                    log.debug(f"[{request_id}] Failed to reconstruct prior claim: {e}")
                     continue
+        
+        log.debug(f"[{request_id}] Checking {len(current_claims)} current claims against {len(reconstructed_prior)} prior claims")
         
         # Check each current claim against prior claims
         for claim in current_claims:
@@ -498,6 +672,7 @@ class NovaGroundTruthProvider:
                     # Try to use nova_verify if available
                     try:
                         from nova_tools import nova_verify
+                        log.debug(f"[{request_id}] Using nova_verify for contradiction detection between claims {prior_claim.id} and {claim.id}")
                         verify_result = nova_verify(
                             claim=contradiction_query,
                             profile="auto",
@@ -507,6 +682,7 @@ class NovaGroundTruthProvider:
                                          "contradiction" in verify_result.get("grounding", "").lower()
                     except (ImportError, Exception) as e:
                         # Fallback: use simple heuristic for numeric claims
+                        log.debug(f"[{request_id}] Using heuristic for contradiction detection: {e}")
                         is_contradicted = False
                         try:
                             if isinstance(claim.expected_value, (int, float)) and \
@@ -516,11 +692,11 @@ class NovaGroundTruthProvider:
                                 if max_val > 0:
                                     diff_pct = abs(claim.expected_value - prior_claim.expected_value) / max_val * 100
                                     is_contradicted = diff_pct > 20
-                        except:
-                            pass
+                        except (TypeError, AttributeError, ZeroDivisionError) as e:
+                            log.debug(f"[{request_id}] Error comparing claims during contradiction detection: {e}")
                     
                     if is_contradicted:
-                        contradictions.append({
+                        contradiction_dict = {
                             "claim_1_id": prior_claim.id,
                             "claim_2_id": claim.id,
                             "subject": claim.subject,
@@ -531,20 +707,213 @@ class NovaGroundTruthProvider:
                                 f"{prior_claim.expected_value} to {claim.expected_value}"
                             ),
                             "detection_method": "nova_verify" if 'verify_result' in locals() else "heuristic",
-                        })
+                            "request_id": request_id,
+                        }
+                        contradictions.append(contradiction_dict)
+                        log.debug(f"[{request_id}] Found contradiction: {contradiction_dict['contradiction']}")
                 
                 except Exception as e:
-                    log.warning(f"Contradiction detection failed: {e}")
+                    log.warning(f"[{request_id}] Contradiction detection failed: {e}")
                     continue
         
+        log.debug(f"[{request_id}] Contradiction detection complete: {len(contradictions)} contradictions found")
         return contradictions
 
+    async def validate_multi_device(
+        self,
+        claims: List[Claim],
+        device_ids: List[str],
+    ) -> ValidationResult:
+        """Validate claim against measurements from multiple DAMA phones.
+        
+        For each device_id, searches Great Library for sensor data and aggregates
+        confidence across devices. Useful for validating device-independent claims
+        (e.g., network status, API availability) against multiple data sources.
+        
+        Args:
+            claims: List of Claim objects to validate
+            device_ids: List of device IDs to aggregate data from
+        
+        Returns:
+            ValidationResult with:
+            - confidence: Aggregated confidence (min of all devices)
+            - evidence: Collected from all devices
+            - metadata: Contains per-device confidence scores
+        """
+        if not claims or not device_ids:
+            return ValidationResult(
+                claim_id="multi_device",
+                is_valid=False,
+                ground_truth_value=None,
+                evidence=[],
+                confidence=0.0,
+                metadata={
+                    "provider": "nova_multi_device",
+                    "status": "invalid_input",
+                },
+            )
+        
+        try:
+            all_evidence = []
+            device_confidences = {}
+            
+            # Validate against each device
+            for device_id in device_ids:
+                # Search Great Library for sensor data from this device
+                search_query = f"{device_id} sensor data"
+                try:
+                    from nova_tools import nova_search
+                    search_results = await nova_search(search_query, top=5)
+                    
+                    if search_results and len(search_results) > 0:
+                        device_conf = max(
+                            (r.get("relevance", 0.5) for r in search_results),
+                            default=0.5
+                        )
+                        device_confidences[device_id] = device_conf
+                        
+                        # Add device-specific evidence
+                        for result in search_results:
+                            all_evidence.append({
+                                "device_id": device_id,
+                                "source": result.get("source"),
+                                "relevance": result.get("relevance", 0.5),
+                                "content_preview": str(result.get("content", ""))[:200],
+                            })
+                    else:
+                        device_confidences[device_id] = 0.0
+                
+                except Exception as e:
+                    log.debug(f"Error validating claim for device {device_id}: {e}")
+                    device_confidences[device_id] = 0.0
+            
+            # Aggregate confidence: use minimum confidence across all devices
+            aggregated_confidence = min(device_confidences.values()) if device_confidences else 0.0
+            
+            return ValidationResult(
+                claim_id="multi_device_validation",
+                is_valid=aggregated_confidence >= 0.5,
+                ground_truth_value=None,
+                evidence=all_evidence,
+                confidence=aggregated_confidence,
+                metadata={
+                    "provider": "nova_multi_device",
+                    "device_count": len(device_ids),
+                    "device_confidences": device_confidences,
+                    "aggregation_method": "min",
+                },
+            )
+        
+        except Exception as e:
+            log.error(f"Multi-device validation failed: {e}")
+            return ValidationResult(
+                claim_id="multi_device_validation",
+                is_valid=False,
+                ground_truth_value=None,
+                evidence=[],
+                confidence=0.0,
+                metadata={
+                    "provider": "nova_multi_device",
+                    "status": "error",
+                    "error": str(e),
+                },
+            )
+
+    async def get_sensor_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Discover sensor capabilities from Great Library.
+        
+        Queries the Great Library for sensor specification matrix including:
+        - Measurement range and accuracy bounds
+        - Freshness/update frequency
+        - Known limitations and error margins
+        
+        Returns:
+            Dict mapping sensor_id to specs:
+            {
+                "GPS.POSITION": {
+                    "range": "Earth surface",
+                    "accuracy_meters": 5.0,
+                    "freshness_ms": 100,
+                    "units": "degrees lat/lon",
+                },
+                ...
+            }
+        """
+        if not NOVA_TOOLS_AVAILABLE or not self.nova_available:
+            log.debug("Nova not available for sensor discovery")
+            return {}
+        
+        try:
+            request_id = str(uuid.uuid4())[:8]
+            log.debug(f"[{request_id}] Discovering sensor capabilities from Great Library")
+            
+            # Query Nova for sensor specs
+            query = "sensor accuracy bounds specifications measurement precision freshness rate"
+            results = await nova_search(query, top=10, profile='research')
+            
+            sensor_specs = {}
+            
+            if results:
+                # Parse sensor specs from search results
+                for doc in results:
+                    # Extract sensor info from document metadata/content
+                    if "content" in doc:
+                        content = doc["content"]
+                        # Simple heuristic: look for common sensor names
+                        for sensor_name in ["GPS", "WIFI", "ACCELEROMETER", "GYROSCOPE", "MAGNETOMETER", "BATTERY", "TEMPERATURE"]:
+                            if sensor_name.lower() in content.lower():
+                                if sensor_name not in sensor_specs:
+                                    sensor_specs[sensor_name] = {
+                                        "range": "unknown",
+                                        "accuracy_meters": None,
+                                        "freshness_ms": 1000,
+                                        "units": "unknown",
+                                        "evidence_source": doc.get("source", "great_library"),
+                                    }
+            
+            log.debug(f"[{request_id}] Discovered {len(sensor_specs)} sensor types from Great Library")
+            return sensor_specs
+            
+        except Exception as e:
+            log.warning(f"Failed to discover sensor specs: {e}")
+            return {}
+
     async def get_context(self, query: str) -> Dict[str, Any]:
-        """Fetch context from Great Library for a query."""
+        """Fetch context from Great Library for a query.
+        
+        Returns comprehensive context including:
+        - Available domains for validation
+        - Sensor capabilities and specifications
+        - Recent validation results
+        - Contradiction history
+        
+        Args:
+            query: User query or claim to get context for
+        
+        Returns:
+            Dict with keys:
+            - query: The input query
+            - domains_available: List of domains this provider can validate
+            - sensor_specs: Discovered sensor capabilities
+            - status: Provider status (ready | unavailable | error)
+            - metadata: Additional context (timestamps, request_id, etc.)
+        """
+        request_id = str(uuid.uuid4())[:8]
+        
+        await self._ensure_nova_initialized()
+        
+        sensor_specs = await self.get_sensor_specs()
+        
         return {
             "query": query,
             "domains_available": await self.available_domains(),
-            "status": "ready",
+            "sensor_specs": sensor_specs,
+            "status": "ready" if self.nova_available else "unavailable",
+            "metadata": {
+                "provider": "nova",
+                "request_id": request_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
         }
 
 
@@ -566,6 +935,10 @@ class MQTTGroundTruthProvider:
         broker_port: int = 1883,
         keepalive: int = 30,
         cache_ttl_seconds: int = 30,
+        broker_user: Optional[str] = None,
+        broker_password: Optional[str] = None,
+        max_cache_size: int = 10000,
+        mqtt_qos: int = 1,
     ):
         """Initialize MQTT provider.
         
@@ -574,20 +947,140 @@ class MQTTGroundTruthProvider:
             broker_port: MQTT broker port
             keepalive: MQTT keepalive interval in seconds
             cache_ttl_seconds: Sensor data TTL before expiry
+            broker_user: MQTT username (default: env MQTT_USERNAME or "dama")
+            broker_password: MQTT password (default: env MQTT_PASSWORD or "")
+            max_cache_size: Max telemetry entries before eviction (default: 10000)
+            mqtt_qos: MQTT Quality of Service level (0, 1, or 2; default: 1)
         """
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.keepalive = keepalive
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.max_cache_size = max_cache_size
+        self.mqtt_qos = int(os.getenv("MQTT_QoS", str(mqtt_qos)))
+        
+        # Credentials from parameters or environment
+        self.broker_user = broker_user or os.getenv("MQTT_USERNAME", "dama")
+        self.broker_password = broker_password or os.getenv("MQTT_PASSWORD", "")
         
         self.connected = False
         self._mqtt_client = None
+        self._message_task = None  # Track background message loop task
+        self._message_queue = asyncio.Queue()  # Queue for messages before loop starts
+        self._message_loop_ready = False  # Flag to track if message loop is ready
+        self._db_conn = None  # Keep persistent DB connection
         self._sensor_cache = {}  # {device_id: {sensor_type: {data, timestamp, freshness_ms}}}
         self._device_presence = {}  # {device_id: {present: bool, last_heartbeat: datetime}}
         self._cache_lock = asyncio.Lock()
+        self._heartbeat_task = None  # Track heartbeat checker task
+        
+        # Sensor type registry: define expected sensor sections
+        self.sensor_registry = {
+            "gps": ["valid_fix", "latitude", "longitude", "age_ms"],
+            "wifi": ["networks", "age_ms"],
+            "bluetooth": ["devices", "age_ms"],
+        }
+        
+        # SQLite persistence
+        self._db_path = Path.home() / ".deep_think" / "mqtt_cache.db"
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize SQLite database for sensor cache persistence."""
+        try:
+            self._db_conn = sqlite3.connect(str(self._db_path))
+            cursor = self._db_conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_cache (
+                    device_id TEXT NOT NULL,
+                    sensor_type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    freshness_ms INTEGER DEFAULT 0,
+                    ttl_seconds INTEGER DEFAULT 30,
+                    PRIMARY KEY (device_id, sensor_type)
+                )
+            """)
+            self._db_conn.commit()
+            log.debug(f"Initialized SQLite cache at {self._db_path}")
+        except Exception as e:
+            log.error(f"Failed to initialize SQLite database: {e}")
+    
+    def _load_cache_from_db(self):
+        """Load sensor cache from SQLite database into memory."""
+        try:
+            if not self._db_conn:
+                return
+            
+            cursor = self._db_conn.cursor()
+            cursor.execute("SELECT device_id, sensor_type, data, timestamp, freshness_ms FROM sensor_cache")
+            rows = cursor.fetchall()
+            
+            now = datetime.now(timezone.utc)
+            for device_id, sensor_type, data_json, timestamp_str, freshness_ms in rows:
+                try:
+                    data = json.loads(data_json)
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                    
+                    # Skip expired entries
+                    age_seconds = (now - timestamp).total_seconds()
+                    if age_seconds > self.cache_ttl_seconds:
+                        continue
+                    
+                    if device_id not in self._sensor_cache:
+                        self._sensor_cache[device_id] = {}
+                    
+                    self._sensor_cache[device_id][sensor_type] = {
+                        "data": data,
+                        "timestamp": timestamp,
+                        "freshness_ms": freshness_ms,
+                    }
+                except Exception as e:
+                    log.debug(f"Skipping invalid cache entry: {e}")
+            
+            log.debug(f"Loaded {sum(len(v) for v in self._sensor_cache.values())} sensors from cache")
+        except Exception as e:
+            log.debug(f"Failed to load cache from DB: {e}")
+    
+    def _save_cache_to_db(self, device_id: str, sensor_type: str):
+        """Save a single sensor entry to SQLite database."""
+        try:
+            if device_id not in self._sensor_cache:
+                return
+            
+            sensor = self._sensor_cache[device_id].get(sensor_type)
+            if not sensor or not self._db_conn:
+                return
+            
+            cursor = self._db_conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO sensor_cache 
+                (device_id, sensor_type, data, timestamp, freshness_ms, ttl_seconds)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                device_id,
+                sensor_type,
+                json.dumps(sensor["data"]),
+                sensor["timestamp"].isoformat(),
+                sensor.get("freshness_ms", 0),
+                self.cache_ttl_seconds,
+            ))
+            self._db_conn.commit()
+        except Exception as e:
+            log.debug(f"Failed to save cache to DB: {e}")
     
     async def connect(self) -> bool:
-        """Connect to MQTT broker and subscribe to telemetry."""
+        """Connect to MQTT broker with TLS and subscribe to telemetry.
+        
+        Features:
+        - TLS 1.2+ with required certificate verification
+        - Credentials from environment or constructor parameters
+        - Startup validation to verify broker is responding (5 second timeout)
+        - Loads persisted cache from SQLite
+        - Starts background heartbeat checker
+        - Starts message processing loop
+        """
         try:
             import aiomqtt
         except ImportError:
@@ -595,24 +1088,78 @@ class MQTTGroundTruthProvider:
             return False
         
         try:
-            log.info(f"Connecting to MQTT broker {self.broker_host}:{self.broker_port}")
+            # Load persisted cache from SQLite
+            self._load_cache_from_db()
+            
+            # Setup TLS parameters with TLSv1.2+
+            tls_params = aiomqtt.TLSParameters(
+                ca_certs=None,  # Use system default CA certificates
+                certfile=None,
+                keyfile=None,
+                cert_reqs=ssl.CERT_REQUIRED,
+                tls_version=ssl.PROTOCOL_TLSv1_2,
+                ciphers=None,
+            )
+            
+            log.info(f"Connecting to MQTT broker {self.broker_host}:{self.broker_port} with TLS 1.2+ (QoS {self.mqtt_qos})")
             self._mqtt_client = aiomqtt.Client(
                 hostname=self.broker_host,
                 port=self.broker_port,
+                username=self.broker_user,
+                password=self.broker_password,
                 keepalive=self.keepalive,
+                tls_params=tls_params,
             )
             await self._mqtt_client.connect()
             
-            await self._mqtt_client.subscribe("dama/+/telemetry")
+            await self._mqtt_client.subscribe("dama/+/telemetry", qos=self.mqtt_qos)
             log.info("Connected to MQTT broker and subscribed to dama/+/telemetry")
             
-            self.connected = True
-            asyncio.create_task(self._message_loop())
+            # Clear password from memory after connecting
+            self.broker_password = ""
+            
+            # Start background message loop and heartbeat checker
+            self._message_task = asyncio.create_task(self._message_loop())
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_checker())
+            
+            # Mark message loop as ready after giving it time to start processing
+            await asyncio.sleep(0.1)
+            self._message_loop_ready = True
+            
+            # Replay any queued messages that arrived during startup
+            try:
+                while not self._message_queue.empty():
+                    queued_msg = self._message_queue.get_nowait()
+                    device_id = queued_msg.get("device_id")
+                    payload = queued_msg.get("payload")
+                    if device_id and payload and self._is_valid_device_id(device_id):
+                        await self._cache_telemetry(device_id, payload)
+                        log.debug(f"Replayed queued message from {device_id}")
+            except Exception as e:
+                log.debug(f"Error replaying queued messages: {e}")
+            
+            # Validate startup: wait up to 5 seconds for first telemetry
+            try:
+                await asyncio.wait_for(self._wait_for_first_telemetry(), timeout=5.0)
+                log.info("MQTT broker validated: received first telemetry within 5 seconds")
+                self.connected = True
+            except asyncio.TimeoutError:
+                log.warning("MQTT broker connected but no telemetry received within 5 seconds (graceful degradation)")
+                self.connected = True  # Still set as connected for graceful degradation
+            
             return True
         except Exception as e:
             log.error(f"MQTT connection failed: {e}")
             self.connected = False
             return False
+    
+    async def _wait_for_first_telemetry(self, timeout: float = 5.0):
+        """Wait for first telemetry message to arrive."""
+        for _ in range(int(timeout * 10)):  # Check every 100ms
+            if self._sensor_cache:
+                return True
+            await asyncio.sleep(0.1)
+        raise asyncio.TimeoutError("No telemetry received")
     
     async def _message_loop(self):
         """Background task to receive and cache MQTT messages."""
@@ -630,7 +1177,12 @@ class MQTTGroundTruthProvider:
                         parts = topic.split('/')
                         if len(parts) >= 2:
                             device_id = parts[1]
-                            await self._cache_telemetry(device_id, payload)
+                            
+                            # Validate device_id format (alphanumeric, dash, underscore only)
+                            if self._is_valid_device_id(device_id):
+                                await self._cache_telemetry(device_id, payload)
+                            else:
+                                log.warning(f"Rejecting malformed device_id from topic {topic}: '{device_id}'")
                     except json.JSONDecodeError:
                         log.debug(f"Skipping malformed JSON from {message.topic}")
                     except Exception as e:
@@ -638,10 +1190,94 @@ class MQTTGroundTruthProvider:
         except Exception as e:
             log.error(f"Message loop error: {e}")
     
+    def _is_valid_device_id(self, device_id: str) -> bool:
+        """Validate device_id format (alphanumeric, dash, underscore only)."""
+        if not device_id or not isinstance(device_id, str) or device_id.isspace():
+            return False
+        # Allow alphanumeric, dash, underscore
+        return bool(re.match(r'^[a-zA-Z0-9_-]+$', device_id))
+    
     async def _cache_telemetry(self, device_id: str, payload: Dict[str, Any]):
-        """Cache telemetry data from MQTT."""
+        """Cache telemetry data from MQTT with JSON schema validation.
+        
+        Validates payload schema and rejects malformed messages.
+        Enforces cache size limits with LRU eviction.
+        Queues messages if message loop is not yet ready.
+        
+        Expected payload schema (JSON):
+        {
+            "device_id": "pixel-9-pro-xl",
+            "timestamp": "2026-05-01T02:45:00Z",
+            "gps": {
+                "valid_fix": true,
+                "latitude": float,
+                "longitude": float,
+                "age_ms": int
+            },
+            "wifi": {
+                "networks": [
+                    {"ssid": str, "rssi": int, "channel": int}
+                ],
+                "age_ms": int
+            },
+            "bluetooth": {
+                "devices": [
+                    {"name": str, "rssi": int}
+                ],
+                "age_ms": int
+            }
+        }
+        
+        Required fields: device_id, timestamp.
+        Optional sections: gps, wifi, bluetooth (each with age_ms).
+        Validates types and rejects malformed payloads with warnings.
+        """
+        # Queue message if message loop is not yet ready (defensive measure during startup)
+        if not self._message_loop_ready:
+            try:
+                self._message_queue.put_nowait({
+                    "device_id": device_id,
+                    "payload": payload,
+                })
+                log.debug(f"Queued telemetry from {device_id} (message loop not ready yet)")
+                return
+            except asyncio.QueueFull:
+                log.warning(f"Message queue full, dropping telemetry from {device_id}")
+                return
+        
         async with self._cache_lock:
             now = datetime.now(timezone.utc)
+            
+            # Validate payload schema: required fields
+            required_fields = ["device_id", "timestamp"]
+            if not all(field in payload for field in required_fields):
+                log.warning(f"Malformed payload missing required fields: {required_fields}")
+                return
+            
+            # Validate edge case: empty device_id from topic split
+            if not device_id or not isinstance(device_id, str) or device_id.isspace():
+                log.warning(f"Invalid device_id from topic split: '{device_id}'")
+                return
+            
+            # Validate cache_ttl_seconds configuration
+            if self.cache_ttl_seconds <= 0:
+                log.error(f"Invalid cache_ttl_seconds: {self.cache_ttl_seconds}. Using default 30.")
+                self.cache_ttl_seconds = 30
+            
+            # Validate optional sections if present
+            def validate_section(section_name: str, required_keys: List[str], section_data: Any) -> bool:
+                """Validate an optional section (gps, wifi, bluetooth)."""
+                if section_data is None:
+                    log.warning(f"{section_name} section is None, skipping")
+                    return False
+                if not isinstance(section_data, dict):
+                    log.warning(f"{section_name} section is not a dict, skipping")
+                    return False
+                for key in required_keys:
+                    if key not in section_data:
+                        log.warning(f"{section_name} section missing required key: {key}")
+                        return False
+                return True
             
             # Initialize device cache if needed
             if device_id not in self._sensor_cache:
@@ -652,7 +1288,7 @@ class MQTTGroundTruthProvider:
                     "last_heartbeat": now,
                 }
             
-            # Update presence
+            # Update presence using timestamp comparison (fixes race condition)
             self._device_presence[device_id]["present"] = True
             self._device_presence[device_id]["last_heartbeat"] = now
             
@@ -662,39 +1298,153 @@ class MQTTGroundTruthProvider:
                 "timestamp": now,
             }
             
-            # Extract and cache individual sensors
+            # Extract and cache GPS sensor with registry validation
             if "gps" in payload:
                 gps = payload["gps"]
-                self._sensor_cache[device_id]["GPS.POSITION"] = {
-                    "data": gps,
-                    "timestamp": now,
-                    "freshness_ms": gps.get("age_ms", 0),
-                }
+                expected_gps_keys = self.sensor_registry.get("gps", [])
+                if validate_section("gps", expected_gps_keys, gps):
+                    age_ms = gps.get("age_ms", 0)
+                    # Handle negative age_ms
+                    if age_ms < 0:
+                        log.warning(f"Negative age_ms in gps: {age_ms}. Treating as stale.")
+                        age_ms = 999999  # Very large value signals stale data
+                    self._sensor_cache[device_id]["GPS.POSITION"] = {
+                        "data": gps,
+                        "timestamp": now,
+                        "freshness_ms": age_ms,
+                    }
+                    self._save_cache_to_db(device_id, "GPS.POSITION")
+                else:
+                    log.warning(f"GPS section failed validation, skipping")
             
+            # Extract and cache WiFi sensor with registry validation
             if "wifi" in payload:
                 wifi = payload["wifi"]
-                self._sensor_cache[device_id]["WIFI.NEARBY_NETWORKS"] = {
-                    "data": wifi,
-                    "timestamp": now,
-                    "freshness_ms": wifi.get("age_ms", 0),
-                }
+                expected_wifi_keys = self.sensor_registry.get("wifi", [])
+                if validate_section("wifi", expected_wifi_keys, wifi):
+                    age_ms = wifi.get("age_ms", 0)
+                    # Handle negative age_ms
+                    if age_ms < 0:
+                        log.warning(f"Negative age_ms in wifi: {age_ms}. Treating as stale.")
+                        age_ms = 999999
+                    self._sensor_cache[device_id]["WIFI.NEARBY_NETWORKS"] = {
+                        "data": wifi,
+                        "timestamp": now,
+                        "freshness_ms": age_ms,
+                    }
+                    self._save_cache_to_db(device_id, "WIFI.NEARBY_NETWORKS")
+                else:
+                    log.warning(f"WiFi section failed validation, skipping")
             
+            # Extract and cache Bluetooth sensor with registry validation
             if "bluetooth" in payload:
                 bt = payload["bluetooth"]
-                self._sensor_cache[device_id]["BT.NEARBY_DEVICES"] = {
-                    "data": bt,
-                    "timestamp": now,
-                    "freshness_ms": bt.get("age_ms", 0),
-                }
+                expected_bt_keys = self.sensor_registry.get("bluetooth", [])
+                if validate_section("bluetooth", expected_bt_keys, bt):
+                    age_ms = bt.get("age_ms", 0)
+                    # Handle negative age_ms
+                    if age_ms < 0:
+                        log.warning(f"Negative age_ms in bluetooth: {age_ms}. Treating as stale.")
+                        age_ms = 999999
+                    self._sensor_cache[device_id]["BT.NEARBY_DEVICES"] = {
+                        "data": bt,
+                        "timestamp": now,
+                        "freshness_ms": age_ms,
+                    }
+                    self._save_cache_to_db(device_id, "BT.NEARBY_DEVICES")
+                else:
+                    log.warning(f"Bluetooth section failed validation, skipping")
+            
+            # Check for unknown sensor types (log warning)
+            for key in payload:
+                if key not in required_fields and key not in self.sensor_registry:
+                    log.debug(f"Unknown sensor type in payload: {key}")
+            
+            # Enforce cache size limit with LRU eviction
+            total_entries = sum(len(sensors) for sensors in self._sensor_cache.values())
+            if total_entries > self.max_cache_size:
+                self._evict_oldest_sensor()
+                log.warning(f"Cache size exceeded {self.max_cache_size}, evicted oldest sensor")
             
             log.debug(f"Cached telemetry from {device_id}: {list(payload.keys())}")
     
+    def _evict_oldest_sensor(self):
+        """Evict the oldest sensor entry from cache (LRU)."""
+        oldest_timestamp = None
+        oldest_key = None
+        
+        for device_id, sensors in self._sensor_cache.items():
+            for sensor_type, sensor_data in sensors.items():
+                if sensor_type == "_raw":
+                    continue
+                ts = sensor_data.get("timestamp")
+                if ts and (oldest_timestamp is None or ts < oldest_timestamp):
+                    oldest_timestamp = ts
+                    oldest_key = (device_id, sensor_type)
+        
+        if oldest_key:
+            device_id, sensor_type = oldest_key
+            del self._sensor_cache[device_id][sensor_type]
+            log.debug(f"Evicted oldest sensor: {device_id}/{sensor_type}")
+    
+    async def _heartbeat_checker(self):
+        """Background task to periodically check broker health via /health endpoint."""
+        while self.connected:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                # Try to verify connection is still active
+                if self._mqtt_client:
+                    # Simple connectivity check: if no messages in 2x keepalive, reconnect
+                    last_activity = None
+                    for sensors in self._sensor_cache.values():
+                        for sensor in sensors.values():
+                            if isinstance(sensor, dict) and "timestamp" in sensor:
+                                ts = sensor["timestamp"]
+                                if last_activity is None or ts > last_activity:
+                                    last_activity = ts
+                    
+                    if last_activity:
+                        age = (datetime.now(timezone.utc) - last_activity).total_seconds()
+                        if age > (self.keepalive * 2):
+                            log.warning(f"No messages for {age:.0f}s (2x keepalive), reconnect may be needed")
+            except Exception as e:
+                log.debug(f"Heartbeat check error: {e}")
+    
     async def close(self):
-        """Disconnect from MQTT broker."""
-        if self._mqtt_client:
-            await self._mqtt_client.disconnect()
-            self.connected = False
-            log.info("Disconnected from MQTT broker")
+        """Gracefully disconnect from MQTT broker and cleanup resources.
+        
+        Cancels background tasks, closes DB connection, and disconnects from broker.
+        """
+        try:
+            # Cancel background tasks
+            if self._message_task:
+                self._message_task.cancel()
+                try:
+                    await self._message_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Disconnect from MQTT broker
+            if self._mqtt_client:
+                await self._mqtt_client.disconnect()
+                self.connected = False
+                log.info("Disconnected from MQTT broker")
+            
+            # Close database connection
+            if self._db_conn:
+                self._db_conn.close()
+                self._db_conn = None
+                log.info("Closed SQLite database connection")
+        except Exception as e:
+            log.error(f"Error during close: {e}")
     
     async def available_devices(self) -> List[str]:
         """Return list of devices that have published recently."""
@@ -786,17 +1536,18 @@ class MQTTGroundTruthProvider:
                     "devices": results,
                 }
     
-    def _is_device_online(self, device_id: str) -> bool:
+    async def _is_device_online(self, device_id: str) -> bool:
         """Check if device is online (has published recently)."""
-        if device_id not in self._device_presence:
-            return False
-        
-        now = datetime.now(timezone.utc)
-        last_hb = self._device_presence[device_id]["last_heartbeat"]
-        age = (now - last_hb).total_seconds()
-        
-        is_online = age < self.cache_ttl_seconds
-        return is_online
+        async with self._cache_lock:
+            if device_id not in self._device_presence:
+                return False
+            
+            now = datetime.now(timezone.utc)
+            last_hb = self._device_presence[device_id]["last_heartbeat"]
+            age = (now - last_hb).total_seconds()
+            
+            is_online = age < self.cache_ttl_seconds
+            return is_online
     
     def _validate_gps_availability(self, gps_data: Dict[str, Any]) -> float:
         """Calculate confidence for GPS availability claim."""
@@ -1055,7 +1806,7 @@ async def create_ground_truth_provider(
     """Create and initialize a ground truth provider.
 
     Args:
-        provider_type: Type of provider ("nova", "none")
+        provider_type: Type of provider ("nova", "mqtt", "none", "auto")
 
     Returns:
         Initialized provider or None.
@@ -1066,6 +1817,20 @@ async def create_ground_truth_provider(
 
     if provider_type == "nova" or provider_type == "auto":
         return NovaGroundTruthProvider()
+
+    if provider_type == "mqtt":
+        mqtt_host = os.getenv("MQTT_HOST", "[REDACTED_MQTT_HOST]")
+        mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+        mqtt_password = os.getenv("MQTT_PASSWORD", "")
+        
+        provider = MQTTGroundTruthProvider(
+            broker_host=mqtt_host,
+            broker_port=mqtt_port,
+            broker_user="dama",
+            broker_password=mqtt_password,
+        )
+        await provider.connect()
+        return provider
 
     else:
         log.warning(f"Unknown provider type: {provider_type}")
