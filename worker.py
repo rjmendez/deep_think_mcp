@@ -25,12 +25,13 @@ async def _run_job(job: dict) -> None:
     job_id = job["job_id"]
     try:
         provider_config = json.loads(job.get("provider_config_json") or "{}")
-        task_class = provider_config.pop("task_class", "general")
-        data_policy = provider_config.pop("data_policy", "any")
-        device_id = provider_config.pop("device_id", "")
-        force_local_models = provider_config.pop("force_local_models", False)
-        cfg = engine.build_provider_config(provider_config)
-
+        
+        # Extract job control params (don't pop from provider_config)
+        task_class = job.get("task_class", "general")
+        data_policy = job.get("data_policy", "any")
+        device_id = job.get("device_id", "")
+        force_local_models = job.get("force_local_models", False)
+        
         # Auto-enable local-only for MQTT operations
         if device_id or force_local_models:
             force_local_models = True
@@ -39,45 +40,35 @@ async def _run_job(job: dict) -> None:
         if provider_config.pop("fan_out", False):
             width = int(provider_config.pop("width", 3))
             height = int(provider_config.pop("height", 2))
-            max_parallel = int(provider_config.pop("max_parallel", 2))
-            max_width = int(provider_config.pop("max_width", 6))
-            confidence_threshold = int(provider_config.pop("confidence_threshold", 50))
-            extract_claims = bool(provider_config.pop("extract_claims", False))
             result = await engine.run_fan_out(
                 question=job["question"],
                 width=width,
                 height=height,
-                provider_cfg=cfg,
+                provider_config=provider_config,
                 task_class=task_class,
                 data_policy=data_policy,
-                max_parallel=max_parallel,
-                job_id=job_id,
-                max_width=max_width,
-                confidence_threshold=confidence_threshold,
-                extract_claims=extract_claims,
                 force_local_models=force_local_models,
                 device_id=device_id,
             )
+            cfg = engine.build_provider_config(provider_config)
             log.info(
                 "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
                 job_id, width, height, task_class, cfg.provider,
             )
         else:
-            verify = bool(provider_config.pop("verify", False))
             result = await engine.deep_think_passes(
                 question=job["question"],
                 passes=int(job["passes"]),
-                provider_cfg=cfg,
+                provider_config=provider_config,
                 task_class=task_class,
                 data_policy=data_policy,
-                verify=verify,
-                job_id=job_id,
                 force_local_models=force_local_models,
                 device_id=device_id,
             )
+            cfg = engine.build_provider_config(provider_config)
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 
-        await asyncio.to_thread(store.complete_job, job_id, result)
+        await asyncio.to_thread(store.complete_job, job_id, json.dumps(result))
     except Exception as exc:
         error_msg = str(exc) or type(exc).__qualname__
         await asyncio.to_thread(store.fail_job, job_id, error_msg)

@@ -374,11 +374,16 @@ Output ONLY the task class name (one word), or "general" if uncertain. Do not ex
 _AUTO_CONFIDENCE_THRESHOLD = 0.75
 
 
-async def classify_task(question: str, override: Optional[str] = None) -> str:
+async def classify_task(question: str, override: Optional[str] = None, provider: str = "") -> str:
     """Auto-classify task to a task class.
     
     If override is provided and is a valid task class, return it without calling LLM.
     Otherwise, use a lightweight LLM call to classify.
+    
+    Args:
+        question: The question to classify
+        override: Optional task class override (skips LLM if valid)
+        provider: Provider to use for classification. If empty, defaults to any available.
     """
     from .directives import TASK_CLASS_NAMES
     
@@ -387,28 +392,35 @@ async def classify_task(question: str, override: Optional[str] = None) -> str:
             return override
         log.warning(f"Override task class '{override}' not recognized; auto-classifying instead")
     
-    # Use a lightweight model for classification
-    try:
-        result = await _call_provider(
-            provider="ollama",
-            model="phi4-mini:latest",
-            system="You are a task classification oracle. Respond with ONLY the task class name.",
-            user_prompt=_TASK_CLASSIFIER_PROMPT.format(question=question),
-            tier="light",
-        )
-        
-        # Extract first word from response
-        task_class = result.strip().split()[0].lower()
-        
-        if task_class in TASK_CLASS_NAMES:
-            return task_class
-        
-        log.warning(f"Classifier returned unknown task class '{task_class}'; defaulting to 'general'")
-        return "general"
+    # Try requested provider first, then fall back to others
+    providers_to_try = [provider] if provider else ["anthropic", "copilot", "ollama"]
     
-    except Exception as e:
-        log.warning(f"Classification failed: {e}; defaulting to 'general'")
-        return "general"
+    for prov in providers_to_try:
+        if not prov:
+            continue
+        try:
+            result = await _call_provider(
+                provider=prov,
+                model="phi4-mini:latest",
+                system="You are a task classification oracle. Respond with ONLY the task class name.",
+                user_prompt=_TASK_CLASSIFIER_PROMPT.format(question=question),
+                tier="light",
+            )
+            
+            # Extract first word from response
+            task_class = result.strip().split()[0].lower()
+            
+            if task_class in TASK_CLASS_NAMES:
+                return task_class
+            
+            log.warning(f"Classifier returned unknown task class '{task_class}'; trying next provider")
+        
+        except Exception as e:
+            log.debug(f"Classification with {prov} failed: {e}; trying next provider")
+            continue
+    
+    log.warning("All classification providers exhausted; defaulting to 'general'")
+    return "general"
 
 
 # ---------------------------------------------------------------------------
@@ -437,29 +449,36 @@ Output JSON ONLY:
 If safe=false, the request violates policy. If requires_review=true, escalate for human review."""
 
 
-async def _run_safety_precheck(question: str) -> tuple[bool, str]:
-    """Run safety precheck using granite3-guardian if available, else use fallback.
+async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool, str]:
+    """Run safety precheck using available providers with fallback.
     
     Returns:
         (safe, reason) tuple. safe=True if request passed checks.
     """
-    try:
-        # Try granite3-guardian first (if available in ollama)
-        result = await _call_provider(
-            provider="ollama",
-            model="granite3-guardian:8b",
-            system="You are a safety classifier. Respond with ONLY JSON.",
-            user_prompt=_SAFETY_PRECHECK_PROMPT.format(question=question),
-            tier="light",
-        )
-        
-        import json
-        verdict = json.loads(result)
-        return (verdict.get("safe", True), verdict.get("reason", ""))
+    providers_to_try = [provider] if provider else ["anthropic", "copilot", "ollama"]
     
-    except Exception as e:
-        log.debug(f"granite3-guardian not available; skipping precheck: {e}")
-        return (True, "precheck_skipped")
+    for prov in providers_to_try:
+        if not prov:
+            continue
+        try:
+            result = await _call_provider(
+                provider=prov,
+                model="granite3-guardian:8b",
+                system="You are a safety classifier. Respond with ONLY JSON.",
+                user_prompt=_SAFETY_PRECHECK_PROMPT.format(question=question),
+                tier="light",
+            )
+            
+            import json
+            verdict = json.loads(result)
+            return (verdict.get("safe", True), verdict.get("reason", ""))
+        
+        except Exception as e:
+            log.debug(f"Safety check with {prov} failed: {e}; trying next provider")
+            continue
+    
+    log.debug("All safety check providers exhausted; skipping precheck")
+    return (True, "precheck_skipped")
 
 
 # ---------------------------------------------------------------------------
@@ -490,9 +509,9 @@ def _tier_provider(cfg: ProviderConfig, tier: str) -> str:
         return "ollama"
     override = getattr(cfg, f"{tier}_provider", "")
     effective = override if override else cfg.provider
-    # data_policy="cloud": force light tier to ollama if no explicit override
+    # data_policy="cloud": force light tier to provider specified at call time if no explicit override
     if cfg.data_policy == "cloud" and tier == "light" and not override:
-        return "ollama"
+        return cfg.provider
     return effective
 
 
@@ -606,14 +625,6 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
         heavy_provider=ov.get("heavy_provider", os.getenv("DEEP_THINK_HEAVY_PROVIDER", "")),
         data_policy=ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any")),
     )
-    if not cfg.provider:
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        if anthropic_key and anthropic_key not in ("not-set", ""):
-            cfg.provider = "anthropic"
-        elif _read_copilot_token():
-            cfg.provider = "copilot"
-        else:
-            cfg.provider = "ollama"
     return cfg
 
 

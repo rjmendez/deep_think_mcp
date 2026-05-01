@@ -172,3 +172,81 @@ class Confirmation:
     def from_dict(cls, data: Dict[str, Any]) -> "Confirmation":
         """Create Confirmation from dictionary."""
         return cls(**data)
+
+
+@dataclass
+class CorrelationFinding:
+    """Multi-sensor environment fingerprint with fleet-wide novelty scoring.
+    
+    Represents a correlation between sensor readings from multiple devices 
+    in a 5-10 second time window at overlapping locations. Scored for novelty
+    to identify unique environment signatures no other fleet members have seen.
+    
+    Attributes:
+        id: UUID of this correlation (hex format, 32 chars)
+        timestamp: ISO 8601, center of aggregation window
+        location_hash: Rounded GPS or WiFi-based location (~10m precision)
+        observing_devices: Which devices detected this correlation
+        sensor_snapshot: Dict of actual sensor readings (not hashed)
+        novelty_score: 0-1, entropy-weighted across all sensors
+        fleet_prevalence: % of fleet's history that saw this fingerprint
+        entropy_breakdown: Per-sensor entropy contributions
+        is_anomalous_cluster: True if co-located devices diverge significantly
+        anomaly_details: Explanation of anomaly (if flagged)
+        confidence: How certain is this correlation? (0-1)
+        expires_at: ISO 8601, TTL for this correlation
+    """
+    id: str
+    timestamp: str
+    location_hash: str
+    observing_devices: List[str]
+    sensor_snapshot: Dict[str, Any]
+    novelty_score: float
+    fleet_prevalence: float
+    entropy_breakdown: Dict[str, float]
+    is_anomalous_cluster: bool
+    anomaly_details: Dict[str, Any] = field(default_factory=dict)
+    confidence: float = 0.8
+    expires_at: str = field(default_factory=lambda: (
+        datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    ))
+    
+    def __post_init__(self) -> None:
+        """Validate correlation finding after initialization."""
+        # Normalize UUID
+        try:
+            self.id = normalize_uuid(self.id)
+        except ValidationError as e:
+            raise ValidationError(f"Invalid correlation ID: {e}")
+        
+        # Validate score ranges
+        if not 0.0 <= self.novelty_score <= 1.0:
+            raise ValidationError(
+                f"novelty_score must be 0.0-1.0, got {self.novelty_score}"
+            )
+        if not 0.0 <= self.fleet_prevalence <= 1.0:
+            raise ValidationError(
+                f"fleet_prevalence must be 0.0-1.0, got {self.fleet_prevalence}"
+            )
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValidationError(
+                f"confidence must be 0.0-1.0, got {self.confidence}"
+            )
+        
+        # Validate at least one device observed
+        if not self.observing_devices:
+            raise ValidationError("At least one observing_device required")
+        
+        # Ensure entropy breakdown is dict
+        if not isinstance(self.entropy_breakdown, dict):
+            raise ValidationError("entropy_breakdown must be a dict")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        data = asdict(self)
+        return data
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CorrelationFinding":
+        """Create CorrelationFinding from dictionary."""
+        return cls(**data)

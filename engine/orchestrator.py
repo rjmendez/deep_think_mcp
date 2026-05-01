@@ -315,7 +315,10 @@ async def deep_think_passes(
     
     # Auto-classify if not provided
     if not task_class:
-        task_class = await provider_module.classify_task(question)
+        task_class = await provider_module.classify_task(
+            question,
+            provider=provider_config.get("provider", "") if provider_config else ""
+        )
     
     # Get task profile
     if task_class not in directives_module.TASK_CLASS_NAMES:
@@ -346,7 +349,7 @@ async def deep_think_passes(
     
     # Run safety precheck if required
     if task_profile.get("safety_precheck"):
-        safe, reason = await provider_module._run_safety_precheck(question)
+        safe, reason = await provider_module._run_safety_precheck(question, provider=cfg.provider)
         if not safe:
             log.warning(f"Safety precheck failed: {reason}")
             return {
@@ -497,7 +500,7 @@ async def run_fan_out(
     
     # Auto-classify if not provided
     if not task_class:
-        task_class = await provider_module.classify_task(question)
+        task_class = await provider_module.classify_task(question, provider=cfg.provider)
     
     # Get mandates for this task class
     mandates = directives_module.PERSPECTIVE_MANDATES.get(task_class, {})
