@@ -1,0 +1,799 @@
+# Kubernetes Manifest for MQTT Novelty Verifier Sidecar Deployment
+# Deployment: mqtt-novelty-verifier
+# Namespace: agents
+# Oxalis k3s Cluster
+#
+# MANIFEST STRUCTURE:
+# 1. Namespace (agents) - if not already exists
+# 2. Secret (mqtt-credentials) - template with MQTT_PASSWORD
+# 3. ConfigMap (mqtt-novelty-config) - Python scripts and configuration
+# 4. Deployment (mqtt-novelty-verifier) - Main deployment with Nova and MQTT sidecar
+# 5. Service (mqtt-novelty-verifier) - ClusterIP service for metrics endpoint
+#
+# DEPLOYMENT STRATEGY:
+# - Nova runs as primary container
+# - MQTT novelty handler runs as sidecar container
+# - Shared emptyDir volume for inter-process communication
+# - ConfigMap mounted for runtime scripts
+# - Secret mounted for sensitive credentials (read-only)
+#
+# TO DEPLOY:
+# 1. Configure MQTT_PASSWORD in secrets manifest
+# 2. kubectl apply -f k8s-mqtt-novelty.yaml
+# 3. Verify: kubectl get pods -n agents
+# 4. Check logs: kubectl logs -n agents <pod-name> -c mqtt-novelty-handler
+#
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+  labels:
+    name: agents
+
+---
+# SECRET TEMPLATE: mqtt-credentials
+# IMPORTANT: This is a template. Before deploying:
+# 1. Replace MQTT_PASSWORD_BASE64 with base64-encoded password
+#    echo -n "your-mqtt-password" | base64
+# 2. Update MQTT_HOST and MQTT_PORT if using custom broker
+#
+# For production, use sealed-secrets or external-secrets operators instead
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mqtt-credentials
+  namespace: agents
+type: Opaque
+data:
+  # Base64 encoded: echo -n "changeme" | base64
+  password: QThZdm9WOU1MNndSbDJWc2lSNGNwMHQyN1phcDNoWlo=
+stringData:
+  # Plain text values (will be base64 encoded when stored)
+  mqtt-host: "botnet.floppydicks.net"
+  mqtt-port: "1883"
+  mqtt-user: "dama"
+
+---
+# CONFIGMAP: mqtt-novelty-config
+# Contains Python scripts and configuration for MQTT novelty handler
+# Mounted at /etc/mqtt-novelty/
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mqtt-novelty-config
+  namespace: agents
+data:
+  # MQTT Novelty Handler Service Script
+  run_mqtt_novelty_service.py: |
+    #!/usr/bin/env python3
+    """
+    MQTT Novelty Handler Service
+    Runs as sidecar to Nova deep-think agent
+    Monitors MQTT topics for thinking job results and verifies novelty
+    """
+    import os
+    import sys
+    import json
+    import logging
+    from pathlib import Path
+    import time
+    import paho.mqtt.client as mqtt
+    import requests
+    from datetime import datetime
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('/var/log/mqtt-novelty/service.log', mode='a')
+        ]
+    )
+    logger = logging.getLogger('mqtt-novelty-verifier')
+
+    class MQTTNoveltyHandler:
+        def __init__(self):
+            self.mqtt_host = os.getenv('MQTT_HOST', 'localhost')
+            self.mqtt_port = int(os.getenv('MQTT_PORT', 1883))
+            self.mqtt_user = os.getenv('MQTT_USER', 'nova-agent')
+            self.mqtt_password = os.getenv('MQTT_PASSWORD', '')
+            self.nova_url = os.getenv('NOVA_URL', 'http://nova.agents.svc.cluster.local:8000')
+            self.ollama_url = os.getenv('OLLAMA_URL', 'http://ollama.agents.svc.cluster.local:11434')
+            
+            self.client = mqtt.Client(client_id='mqtt-novelty-verifier')
+            self.client.on_connect = self.on_connect
+            self.client.on_message = self.on_message
+            self.client.on_disconnect = self.on_disconnect
+            
+            self.connected = False
+            self.health_check_interval = 30
+            self.last_health_check = time.time()
+
+        def on_connect(self, client, userdata, flags, rc):
+            """MQTT connection callback"""
+            if rc == 0:
+                logger.info(f"Connected to MQTT broker at {self.mqtt_host}:{self.mqtt_port}")
+                self.connected = True
+                # Subscribe to thinking job result topics
+                client.subscribe("deep-think/jobs/+/result")
+                client.subscribe("deep-think/jobs/+/complete")
+            else:
+                logger.error(f"MQTT connection failed with code {rc}")
+                self.connected = False
+
+        def on_message(self, client, userdata, msg):
+            """Handle incoming MQTT messages"""
+            try:
+                payload = json.loads(msg.payload.decode())
+                logger.info(f"Received message on topic {msg.topic}: {payload.get('job_id', 'unknown')}")
+                
+                # Process novelty verification for thinking results
+                if 'thinking_result' in payload:
+                    self.verify_novelty(payload)
+                    
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON in message: {msg.payload}")
+            except Exception as e:
+                logger.error(f"Error processing message: {e}")
+
+        def on_disconnect(self, client, userdata, rc):
+            """MQTT disconnection callback"""
+            if rc != 0:
+                logger.warning(f"Unexpected MQTT disconnection: {rc}")
+            self.connected = False
+
+        def verify_novelty(self, payload):
+            """Verify novelty of thinking result"""
+            try:
+                job_id = payload.get('job_id')
+                thinking_result = payload.get('thinking_result')
+                
+                logger.info(f"Verifying novelty for job {job_id}")
+                
+                # Call Nova verification endpoint
+                verify_url = f"{self.nova_url}/verify"
+                response = requests.post(
+                    verify_url,
+                    json={'job_id': job_id, 'result': thinking_result},
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"Novelty verification complete: {result}")
+                    # Publish verification result back to MQTT
+                    self.client.publish(
+                        f"deep-think/jobs/{job_id}/novelty-verified",
+                        json.dumps(result),
+                        qos=1
+                    )
+                else:
+                    logger.error(f"Novelty verification failed: {response.status_code}")
+                    
+            except requests.RequestException as e:
+                logger.error(f"Error calling Nova verification service: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error in novelty verification: {e}")
+
+        def health_check(self):
+            """Periodic health check"""
+            current_time = time.time()
+            if current_time - self.last_health_check > self.health_check_interval:
+                try:
+                    # Check MQTT connection
+                    if not self.connected:
+                        logger.warning("MQTT connection is down, attempting reconnect...")
+                        self.client.reconnect()
+                    
+                    # Check Nova endpoint
+                    response = requests.get(f"{self.nova_url}/health", timeout=5)
+                    if response.status_code != 200:
+                        logger.warning(f"Nova health check failed: {response.status_code}")
+                    
+                    self.last_health_check = current_time
+                except Exception as e:
+                    logger.warning(f"Health check error: {e}")
+
+        def run(self):
+            """Main service loop"""
+            logger.info("Starting MQTT Novelty Handler Service")
+            
+            # Set MQTT authentication
+            if self.mqtt_user and self.mqtt_password:
+                self.client.username_pw_set(self.mqtt_user, self.mqtt_password)
+            
+            # Attempt connection with retry logic
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Connecting to MQTT broker (attempt {attempt + 1}/{max_retries})")
+                    self.client.connect(self.mqtt_host, self.mqtt_port, keepalive=60)
+                    break
+                except Exception as e:
+                    logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        logger.error("Failed to connect to MQTT broker after retries")
+                        sys.exit(1)
+            
+            # Start the client loop
+            self.client.loop_start()
+            
+            # Main service loop
+            try:
+                logger.info("MQTT Novelty Handler Service running")
+                while True:
+                    self.health_check()
+                    time.sleep(10)
+            except KeyboardInterrupt:
+                logger.info("Shutting down gracefully")
+            finally:
+                self.client.loop_stop()
+                self.client.disconnect()
+                logger.info("MQTT Novelty Handler Service stopped")
+
+    if __name__ == "__main__":
+        handler = MQTTNoveltyHandler()
+        handler.run()
+
+  # MQTT Novelty Handler Library
+  mqtt_novelty_handler.py: |
+    #!/usr/bin/env python3
+    """
+    MQTT Novelty Handler Library
+    Provides novelty verification functionality for deep-think results
+    """
+    import json
+    import logging
+    from typing import Dict, Any, Optional
+    from dataclasses import dataclass
+    from datetime import datetime
+    import hashlib
+
+    logger = logging.getLogger('mqtt-novelty-handler')
+
+    @dataclass
+    class NoveltyCheckResult:
+        """Result of a novelty check"""
+        job_id: str
+        is_novel: bool
+        confidence: float
+        reasoning_hash: str
+        timestamp: str
+        duplicate_of: Optional[str] = None
+        novelty_score: float = 0.0
+
+    class NoveltyVerifier:
+        """Verify novelty of deep-think results"""
+        
+        def __init__(self, history_store=None):
+            """
+            Initialize novelty verifier
+            
+            Args:
+                history_store: Optional store for historical results (redis, etc)
+            """
+            self.history_store = history_store
+            self.local_cache = {}
+
+        def compute_reasoning_hash(self, reasoning: str) -> str:
+            """Compute hash of reasoning output"""
+            return hashlib.sha256(reasoning.encode()).hexdigest()
+
+        def check_novelty(self, job_id: str, reasoning_output: str, metadata: Dict[str, Any]) -> NoveltyCheckResult:
+            """
+            Check if a reasoning result is novel
+            
+            Args:
+                job_id: Unique job identifier
+                reasoning_output: The reasoning/thinking output
+                metadata: Additional metadata (model, passes, etc)
+                
+            Returns:
+                NoveltyCheckResult with novelty assessment
+            """
+            reasoning_hash = self.compute_reasoning_hash(reasoning_output)
+            
+            # Check local cache first
+            if reasoning_hash in self.local_cache:
+                cached_job = self.local_cache[reasoning_hash]
+                logger.info(f"Found duplicate in cache: {cached_job}")
+                return NoveltyCheckResult(
+                    job_id=job_id,
+                    is_novel=False,
+                    confidence=0.95,
+                    reasoning_hash=reasoning_hash,
+                    timestamp=datetime.utcnow().isoformat(),
+                    duplicate_of=cached_job,
+                    novelty_score=0.0
+                )
+            
+            # Check history store if available
+            if self.history_store:
+                duplicate = self.history_store.get_duplicate(reasoning_hash)
+                if duplicate:
+                    logger.info(f"Found duplicate in history: {duplicate}")
+                    return NoveltyCheckResult(
+                        job_id=job_id,
+                        is_novel=False,
+                        confidence=0.98,
+                        reasoning_hash=reasoning_hash,
+                        timestamp=datetime.utcnow().isoformat(),
+                        duplicate_of=duplicate,
+                        novelty_score=0.0
+                    )
+            
+            # Result is novel
+            logger.info(f"Result is novel: {job_id}")
+            
+            # Cache the result
+            self.local_cache[reasoning_hash] = job_id
+            
+            return NoveltyCheckResult(
+                job_id=job_id,
+                is_novel=True,
+                confidence=0.99,
+                reasoning_hash=reasoning_hash,
+                timestamp=datetime.utcnow().isoformat(),
+                novelty_score=1.0
+            )
+
+        def to_dict(self, result: NoveltyCheckResult) -> Dict[str, Any]:
+            """Convert result to dictionary for JSON serialization"""
+            return {
+                'job_id': result.job_id,
+                'is_novel': result.is_novel,
+                'confidence': result.confidence,
+                'reasoning_hash': result.reasoning_hash,
+                'timestamp': result.timestamp,
+                'duplicate_of': result.duplicate_of,
+                'novelty_score': result.novelty_score
+            }
+
+---
+# DEPLOYMENT: mqtt-novelty-verifier
+# Nova primary container + MQTT novelty handler sidecar
+# Namespace: agents
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+  labels:
+    app: mqtt-novelty-verifier
+    component: deep-think-agent
+    version: latest
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: mqtt-novelty-verifier
+  template:
+    metadata:
+      labels:
+        app: mqtt-novelty-verifier
+        component: deep-think-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Service account with appropriate RBAC (optional)
+      serviceAccountName: mqtt-novelty-verifier
+      
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # Init container to prepare directories
+      initContainers:
+      - name: init-directories
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - mkdir -p /var/log/mqtt-novelty /var/run/mqtt-novelty && chmod 777 /var/log/mqtt-novelty /var/run/mqtt-novelty
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log/mqtt-novelty
+        - name: runtime-data
+          mountPath: /var/run/mqtt-novelty
+
+      # Main containers
+      containers:
+      # PRIMARY: Nova Deep-Think Agent
+      - name: nova-agent
+        image: nova-deep-think:latest  # Update with actual image
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        - name: metrics
+          containerPort: 8001
+          protocol: TCP
+        
+        env:
+        # Environment variables for Nova
+        - name: NOVA_LISTEN_ADDR
+          value: "0.0.0.0:8000"
+        - name: NOVA_METRICS_ADDR
+          value: "0.0.0.0:8001"
+        - name: OLLAMA_URL
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: ollama-url
+              optional: true
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: ENVIRONMENT
+          value: "production"
+        
+        # Liveness probe for Nova
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe for Nova
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        
+        # Volume mounts
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log/nova
+        - name: runtime-data
+          mountPath: /var/run/nova
+        - name: config
+          mountPath: /etc/nova
+          readOnly: true
+        
+        # Security context for Nova container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+
+      # SIDECAR: MQTT Novelty Handler
+      - name: mqtt-novelty-handler
+        image: deep-think-mcp:mqtt-novelty-latest
+        imagePullPolicy: IfNotPresent
+        
+        env:
+        # MQTT Configuration
+        - name: MQTT_HOST
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: mqtt-host
+        - name: MQTT_PORT
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: mqtt-port
+        - name: MQTT_USER
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: mqtt-user
+        - name: MQTT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: password
+        
+        # Service URLs
+        - name: NOVA_URL
+          value: "http://localhost:8000"
+        - name: OLLAMA_URL
+          valueFrom:
+            secretKeyRef:
+              name: mqtt-credentials
+              key: ollama-url
+              optional: true
+        
+        # Logging and Debugging
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: MQTT_LOG_LEVEL
+          value: "INFO"
+        
+        # Service Configuration
+        - name: MQTT_KEEPALIVE
+          value: "60"
+        - name: MQTT_QOS
+          value: "1"
+        - name: NOVELTY_CACHE_SIZE
+          value: "10000"
+        
+        ports:
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        
+        # Liveness probe: check if process is running
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - ps aux | grep -q "[p]ython.*mqtt_novelty" && exit 0 || exit 1
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe: check MQTT connection and Nova connectivity
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Check if service process is running
+              ps aux | grep -q "[p]ython.*mqtt_novelty" || exit 1
+              # Check connectivity to MQTT broker (optional - can add TCP probe)
+              exit 0
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 2
+        
+        # Resource requests and limits
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        
+        # Volume mounts
+        volumeMounts:
+        - name: mqtt-scripts
+          mountPath: /usr/local/bin/mqtt-novelty
+          readOnly: true
+        - name: logs
+          mountPath: /var/log/mqtt-novelty
+        - name: runtime-data
+          mountPath: /var/run/mqtt-novelty
+        - name: tmp
+          mountPath: /tmp
+        
+        # Security context for MQTT container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+
+      # Volumes
+      volumes:
+      # ConfigMap with MQTT scripts
+      - name: mqtt-scripts
+        configMap:
+          name: mqtt-novelty-config
+          defaultMode: 0555
+          items:
+          - key: mqtt_novelty_handler.py
+            path: mqtt_novelty_handler.py
+          - key: run_mqtt_novelty_service.py
+            path: run_mqtt_novelty_service.py
+      
+      # Logs volume (can be emptyDir or PVC)
+      - name: logs
+        emptyDir:
+          sizeLimit: 500Mi
+      
+      # Runtime data volume for inter-process communication
+      - name: runtime-data
+        emptyDir:
+          sizeLimit: 100Mi
+      
+      # Temporary directory
+      - name: tmp
+        emptyDir:
+          sizeLimit: 200Mi
+      
+      # Configuration volume (optional)
+      - name: config
+        configMap:
+          name: mqtt-novelty-config
+          optional: true
+
+      # Pod affinity rules (optional)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - mqtt-novelty-verifier
+              topologyKey: kubernetes.io/hostname
+      
+      # Restart policy
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+
+---
+# SERVICE: mqtt-novelty-verifier
+# ClusterIP service for metrics endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+  labels:
+    app: mqtt-novelty-verifier
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9090"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: mqtt-novelty-verifier
+  ports:
+  # Nova HTTP API
+  - name: nova-http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  # Nova metrics
+  - name: nova-metrics
+    port: 8001
+    targetPort: 8001
+    protocol: TCP
+  # MQTT sidecar metrics
+  - name: mqtt-metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+  sessionAffinity: None
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+
+---
+# SERVICEACCOUNT: mqtt-novelty-verifier
+# For RBAC and pod identity
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+
+---
+# ROLE: mqtt-novelty-verifier
+# Minimal RBAC for pod operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+rules:
+# Allow reading config
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+  resourceNames: ["mqtt-novelty-config"]
+# Allow reading secrets
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+  resourceNames: ["mqtt-credentials"]
+
+---
+# ROLEBINDING: mqtt-novelty-verifier
+# Bind role to service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mqtt-novelty-verifier
+subjects:
+- kind: ServiceAccount
+  name: mqtt-novelty-verifier
+  namespace: agents
+
+---
+# OPTIONAL: HorizontalPodAutoscaler
+# Auto-scale based on CPU usage
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mqtt-novelty-verifier
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+
+---
+# OPTIONAL: PodDisruptionBudget
+# Ensure availability during node maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mqtt-novelty-verifier
+  namespace: agents
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mqtt-novelty-verifier
