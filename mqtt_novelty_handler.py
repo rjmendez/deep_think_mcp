@@ -106,15 +106,20 @@ class NoveltyScorer:
         """Query Nova for historical matches of this sensor reading."""
         try:
             async with aiohttp.ClientSession() as session:
-                # Call nova_search endpoint (simpler, doesn't need TOTP)
+                # Call nova_search endpoint with Bearer token auth
                 payload = {
                     "query": claim_text,
                     "top": 3,  # Get top 3 similar readings
                 }
+                
+                headers = {}
+                if self.nova_token:
+                    headers["Authorization"] = f"Bearer {self.nova_token}"
 
                 async with session.post(
                     f"{self.nova_url}/search",
                     json=payload,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     if resp.status == 200:
