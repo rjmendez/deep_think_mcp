@@ -329,14 +329,14 @@ async def discover_models(force: bool = False, benchmark: bool = True) -> dict:
 @mcp.tool()
 async def deep_think_fan_out(
     question: str,
-    width: int = 3,
-    height: int = 2,
-    task_class: str = "general",
-    data_policy: str = "any",
-    max_parallel: int = 2,
-    max_width: int = 6,
-    confidence_threshold: int = 50,
-    extract_claims: bool = False,
+    width: int | None = None,
+    height: int | None = None,
+    task_class: str | None = None,
+    data_policy: str | None = None,
+    max_parallel: int | None = None,
+    max_width: int | None = None,
+    confidence_threshold: int | None = None,
+    extract_claims: bool | None = None,
     provider_config: Optional[dict] = None,
 ) -> dict:
     """Queue a perspective fan-out reasoning job and return a job_id immediately.
@@ -380,6 +380,16 @@ async def deep_think_fan_out(
     Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
     Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
     """
+    # Apply defaults
+    width = width if width is not None else 3
+    height = height if height is not None else 2
+    task_class = task_class if task_class is not None else "general"
+    data_policy = data_policy if data_policy is not None else "any"
+    max_parallel = max_parallel if max_parallel is not None else 2
+    max_width = max_width if max_width is not None else 6
+    confidence_threshold = confidence_threshold if confidence_threshold is not None else 50
+    extract_claims = extract_claims if extract_claims is not None else False
+    
     pc: dict = dict(provider_config or {})
     if data_policy and data_policy != "any":
         pc["data_policy"] = data_policy
