@@ -83,9 +83,18 @@ def init_db() -> None:
                 claimed_at           TEXT,
                 completed_at         TEXT,
                 result               TEXT,
-                error                TEXT
+                error                TEXT,
+                CHECK (status IN ('queued', 'running', 'complete', 'failed'))
             )
             """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_status "
+            "ON thinking_jobs(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_created "
+            "ON thinking_jobs(created_at)"
         )
         conn.execute(
             """
@@ -152,6 +161,10 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pass_cache_expires "
             "ON pass_cache(expires_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pass_cache_lookup "
+            "ON pass_cache(job_id, perspective, run_sig)"
         )
         conn.execute(
             """
