@@ -248,6 +248,8 @@ async def _call_anthropic(
     """Call Anthropic Claude API."""
     timeout = _timeout_for(tier)
     
+    log.debug(f"_call_anthropic: model={model}, key_len={len(api_key) if api_key else 0}")
+    
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -263,6 +265,8 @@ async def _call_anthropic(
                 "messages": [{"role": "user", "content": user_prompt}],
             },
         )
+        if response.status_code != 200:
+            log.error(f"Anthropic API returned {response.status_code}: {response.text[:200]}")
         response.raise_for_status()
         result = response.json()
         return result["content"][0]["text"]
