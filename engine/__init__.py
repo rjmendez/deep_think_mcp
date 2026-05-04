@@ -38,6 +38,18 @@ from .provider import (
     _validate_and_enforce_local_models,
 )
 from .directives import TASK_CLASS_PROFILES, PERSPECTIVE_MANDATES
+from .creative import (
+    CreativeReasoningEngine,
+    CreativePassResult,
+    CreativeJobResult,
+    CreativeMetricsLog,
+    CREATIVE_MODES,
+    CREATIVE_TEMPLATES,
+    get_temperature,
+    get_pass_template,
+    extract_quality_metrics,
+    get_metrics_snapshot,
+)
 
 __all__ = [
     # Types
@@ -60,4 +72,15 @@ __all__ = [
     # Constants
     "TASK_CLASS_PROFILES",
     "PERSPECTIVE_MANDATES",
+    # Creative reasoning
+    "CreativeReasoningEngine",
+    "CreativePassResult",
+    "CreativeJobResult",
+    "CreativeMetricsLog",
+    "CREATIVE_MODES",
+    "CREATIVE_TEMPLATES",
+    "get_temperature",
+    "get_pass_template",
+    "extract_quality_metrics",
+    "get_metrics_snapshot",
 ]

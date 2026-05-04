@@ -15,6 +15,11 @@ import logging
 import os
 
 from . import engine, store
+from .engine.creative import CreativeReasoningEngine
+from .nova_factcheck.pipeline import VerificationPipeline
+
+_NOVA_VERIFY_ENABLED = os.getenv("DEEP_THINK_NOVA_VERIFY", "true").lower() not in ("0", "false", "no")
+_verification_pipeline = VerificationPipeline(enabled=_NOVA_VERIFY_ENABLED)
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +60,25 @@ async def _run_job(job: dict) -> None:
                 "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
                 job_id, width, height, task_class, cfg.provider,
             )
+        elif provider_config.pop("creative", False):
+            creative_mode = provider_config.pop("creative_mode", "lateral-thinking")
+            creative_passes = int(provider_config.pop("creative_passes", job.get("passes", 4)))
+            verify_with_nova = provider_config.pop("verify_with_nova", False)
+            creative_engine = CreativeReasoningEngine()
+            creative_result = await creative_engine.run(
+                question=job["question"],
+                mode=creative_mode,
+                passes=creative_passes,
+                provider_config=provider_config,
+                verify_with_nova=verify_with_nova,
+                job_id=job_id,
+            )
+            result = creative_result.to_dict()
+            cfg = engine.build_provider_config(provider_config)
+            log.info(
+                "Creative job %s complete (mode=%s passes=%d provider=%s)",
+                job_id, creative_mode, creative_passes, cfg.provider,
+            )
         else:
             result = await engine.deep_think_passes(
                 question=job["question"],
@@ -67,6 +91,12 @@ async def _run_job(job: dict) -> None:
             )
             cfg = engine.build_provider_config(provider_config)
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
+
+        # Nova fact-check: enrich result with verification_results and adjusted confidence
+        try:
+            result = await _verification_pipeline.run(result, job_id=job_id)
+        except Exception as vexc:
+            log.warning("Nova verification pipeline failed for job %s (non-fatal): %s", job_id, vexc)
 
         await asyncio.to_thread(store.complete_job, job_id, json.dumps(result))
     except Exception as exc:

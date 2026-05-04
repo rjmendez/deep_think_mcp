@@ -49,6 +49,8 @@ from .engine import (
     model_summary,
     PERSPECTIVE_MANDATES,
     deep_think_passes,
+    CREATIVE_MODES,
+    get_metrics_snapshot,
 )
 from .engine.provider import _tier_provider
 from . import store, worker, discover as _discover
@@ -267,6 +269,16 @@ async def get_thinking_result(job_id: str, include_reasoning_chain: bool = False
             # Surface verification_pass at the top level for deep_think jobs
             if isinstance(result, dict) and result.get("verification_pass") is not None:
                 response["verification_pass"] = result["verification_pass"]
+            # Surface Nova fact-check fields
+            if isinstance(result, dict):
+                if result.get("verification_results") is not None:
+                    response["verification_results"] = result["verification_results"]
+                if result.get("adjusted_final_confidence") is not None:
+                    response["adjusted_final_confidence"] = result["adjusted_final_confidence"]
+                if result.get("verification_summary") is not None:
+                    response["verification_summary"] = result["verification_summary"]
+                if result.get("escalated_claim_ids"):
+                    response["escalated_claim_ids"] = result["escalated_claim_ids"]
         except (json.JSONDecodeError, TypeError):
             response["result"] = job["result"]
     elif job["status"] == "failed":
@@ -491,6 +503,110 @@ async def mqtt_metrics() -> dict:
         "metrics": health["metrics"],
         "connections": health["connections"],
     }
+
+
+@mcp.tool()
+async def deep_think_creative(
+    question: str,
+    mode: str = "lateral-thinking",
+    passes: int = 4,
+    data_policy: str = "any",
+    model: str = "",
+    provider_config: Optional[dict] = None,
+    verify_with_nova: bool = False,
+) -> dict:
+    """Queue a high-temperature creative reasoning job and return a job_id immediately.
+
+    Runs multi-pass creative reasoning with dynamic temperature scheduling and
+    mode-specific prompt templates that evolve progressively across passes.
+
+    Poll with get_thinking_result(job_id) to check status and retrieve results.
+
+    Args:
+        question:         The problem or question to explore creatively.
+        mode:             Creative reasoning mode:
+            "lateral-thinking"  Sideways problem solving, constraint-violation exploration.
+            "blue-sky"          Unconstrained ideation, "what if" scenarios.
+            "socratic"          Questioning assumptions, dialectical exploration.
+            "evolutionary"      Iterative idea building; temperature decreases across passes.
+        passes:           Number of reasoning passes (2–6, default 4).
+        data_policy:      "any" | "local" | "cloud"
+        model:            Override all tiers with a single model ID (shorthand).
+        provider_config:  Optional per-call overrides (no secrets — use env vars for those).
+        verify_with_nova: If True, verify the best-scoring pass against Nova's /pre_action.
+
+    Temperature schedule (automatic):
+        Passes 1-2:  0.8–1.0  (high exploration)
+        Passes 3-4:  0.6–0.7  (medium refinement)
+        Final pass:  0.3–0.5  (validation / convergence)
+        Dynamic adjustment ±0.05 based on novelty score feedback.
+
+    Quality metrics returned per pass:
+        novelty_score    (0-1): divergence from conventional reasoning
+        feasibility_score (0-1): implementability / realism
+        impact_score      (0-1): potential significance
+        combined_score    = novelty × feasibility × impact
+    """
+    if mode not in CREATIVE_MODES:
+        return {
+            "error": f"Unknown creative mode '{mode}'. Valid modes: {list(CREATIVE_MODES)}",
+        }
+
+    pc: dict = dict(provider_config or {})
+    if model:
+        pc.setdefault("model", model)
+    if data_policy and data_policy != "any":
+        pc["data_policy"] = data_policy
+
+    cfg = build_provider_config(pc)
+    summary = model_summary(cfg, "general")
+    passes = max(2, min(passes, 6))
+
+    job_id = store.create_job(
+        question=question,
+        passes=passes,
+        provider=cfg.provider,
+        model_summary=summary,
+        provider_config_json=json.dumps({
+            **pc,
+            "creative":        True,
+            "creative_mode":   mode,
+            "creative_passes": passes,
+            "data_policy":     data_policy,
+            "verify_with_nova": verify_with_nova,
+        }),
+    )
+
+    return {
+        "job_id":        job_id,
+        "status":        "queued",
+        "mode":          mode,
+        "passes":        passes,
+        "data_policy":   data_policy,
+        "provider":      cfg.provider,
+        "model_summary": summary,
+        "temperature_schedule": {
+            "passes_1_2": "0.8–1.0 (high exploration)",
+            "passes_3_4": "0.6–0.7 (medium refinement)",
+            "final_pass": "0.3–0.5 (validation)",
+        },
+        "message": f"Call get_thinking_result('{job_id}') to poll for results.",
+    }
+
+
+@mcp.tool()
+async def get_creative_metrics() -> dict:
+    """Return accumulated creativity metrics for trend analysis.
+
+    Metrics are tracked in-process across all creative reasoning jobs run
+    in this server session. Useful for understanding which modes and ideas
+    tend to score highest on novelty, feasibility, and impact.
+
+    Returns:
+        total_jobs, total_passes, verified_passes, rolling averages per dimension,
+        per-mode job counts, and per-mode average combined scores.
+    """
+    return get_metrics_snapshot()
 
 
 def main():
