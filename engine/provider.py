@@ -572,8 +572,8 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     1. Explicit cfg.model override
     2. Per-tier call override
     3. Environment variables
-    4. **Dynamically-discovered** assignments (from discovery service)
-    5. Task class profile recommendations (fallback)
+    4. Task class profile recommendations
+    5. Dynamically-discovered assignments (if available from startup discovery)
     6. Built-in provider defaults
     """
     # 1. Single override
@@ -602,16 +602,16 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
         if env_val:
             log.info(f"_model_for_tier: Using env var for {provider}/{tier}={env_val}")
             return env_val
-    # 4. Dynamically-discovered assignment (discovery service is source of truth)
-    discovered = _discovered_tier_model(provider, tier)
-    if discovered:
-        log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={discovered}")
-        return discovered
-    # 5. Task class profile recommendation (fallback only)
+    # 4. Task class profile recommendation
     profile_model = _profile_model(task_class, provider, tier)
     if profile_model:
         log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
         return profile_model
+    # 5. Dynamically-discovered assignment (from startup discovery if available)
+    discovered = _discovered_tier_model(provider, tier)
+    if discovered:
+        log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={discovered}")
+        return discovered
     # 6. Built-in provider default
     default = _default_for_provider(provider, tier)
     log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")
