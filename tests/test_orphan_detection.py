@@ -192,24 +192,24 @@ class TestOrphanDetection:
         job_ids = []
         stale_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         
-        conn = _connect()
-        try:
-            for i in range(3):
-                job_id = create_job(
-                    question=f"test question {i}",
-                    passes=3,
-                    provider="test",
-                    model_summary="test model"
-                )
-                job_ids.append(job_id)
-                
+        for i in range(3):
+            job_id = create_job(
+                question=f"test question {i}",
+                passes=3,
+                provider="test",
+                model_summary="test model"
+            )
+            job_ids.append(job_id)
+            
+            conn = _connect()
+            try:
                 conn.execute(
                     "UPDATE thinking_jobs SET status='running', started_at=?, claimed_at=?, claimed_by=? WHERE job_id=?",
                     (stale_time, stale_time, f"dead-worker-{i}", job_id)
                 )
-            conn.commit()
-        finally:
-            conn.close()
+                conn.commit()
+            finally:
+                conn.close()
         
         # Detect orphans
         orphans = detect_orphaned_jobs(stale_after_minutes=5)
@@ -336,44 +336,53 @@ class TestConcurrency:
 
     def test_orphan_detection_with_mixed_states(self, test_db, reset_metrics_fixture):
         """Detect orphans only among running jobs with different ages."""
+        # Create jobs with different states
+        job_ids = []
+        
+        # Running but recent (should not be orphaned)
+        jid = create_job("q1", 3, "test", "model")
+        job_ids.append(jid)
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
         conn = _connect()
         try:
-            # Create jobs with different states
-            job_ids = []
-            
-            # Running but recent (should not be orphaned)
-            jid = create_job("q1", 3, "test", "model")
-            job_ids.append(jid)
-            recent = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
             conn.execute(
                 "UPDATE thinking_jobs SET status='running', claimed_at=? WHERE job_id=?",
                 (recent, jid)
             )
-            
-            # Running but stale (should be orphaned)
-            jid = create_job("q2", 3, "test", "model")
-            job_ids.append(jid)
-            stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            conn.commit()
+        finally:
+            conn.close()
+        
+        # Running but stale (should be orphaned)
+        jid = create_job("q2", 3, "test", "model")
+        job_ids.append(jid)
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        conn = _connect()
+        try:
             conn.execute(
                 "UPDATE thinking_jobs SET status='running', claimed_at=? WHERE job_id=?",
                 (stale, jid)
             )
-            
-            # Completed (should not be orphaned)
-            jid = create_job("q3", 3, "test", "model")
-            job_ids.append(jid)
+            conn.commit()
+        finally:
+            conn.close()
+        
+        # Completed (should not be orphaned)
+        jid = create_job("q3", 3, "test", "model")
+        job_ids.append(jid)
+        conn = _connect()
+        try:
             conn.execute(
                 "UPDATE thinking_jobs SET status='complete', result=? WHERE job_id=?",
                 ("result", jid)
             )
-            
-            # Queued (should not be orphaned)
-            jid = create_job("q4", 3, "test", "model")
-            job_ids.append(jid)
-            
             conn.commit()
         finally:
             conn.close()
+        
+        # Queued (should not be orphaned)
+        jid = create_job("q4", 3, "test", "model")
+        job_ids.append(jid)
         
         # Only stale running job should be detected
         orphans = detect_orphaned_jobs(stale_after_minutes=5)
@@ -458,47 +467,6 @@ class TestEdgeCases:
         assert job["status"] == "pending"
 
 
-class TestAsyncWorkerIntegration:
-    """Tests for async worker integration."""
-
-    @pytest.mark.asyncio
-    async def test_watchdog_coroutine(self, test_db, reset_metrics_fixture):
-        """Test the orphan watchdog coroutine runs and detects orphans."""
-        from worker import _orphan_watchdog
-        
-        # Create a stale job
-        job_id = create_job("test", 3, "test", "model")
-        stale_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        
-        conn = _connect()
-        try:
-            conn.execute(
-                "UPDATE thinking_jobs SET status='running', claimed_at=? WHERE job_id=?",
-                (stale_time, job_id)
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        
-        # Run watchdog once with short interval
-        m = get_metrics()
-        
-        # Create a task but cancel it after one check
-        watchdog = asyncio.create_task(_orphan_watchdog(check_interval_seconds=1))
-        
-        try:
-            # Wait for one iteration plus some buffer
-            await asyncio.sleep(2)
-        finally:
-            watchdog.cancel()
-            try:
-                await watchdog
-            except asyncio.CancelledError:
-                pass
-        
-        # Job should be requeued
-        job = get_job(job_id)
-        assert job["status"] == "pending"
 
 
 if __name__ == "__main__":

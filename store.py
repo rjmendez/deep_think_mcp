@@ -10,6 +10,14 @@ Design:
   cutoff (DEEP_THINK_STALE_JOB_MINUTES, default 120) so multiple concurrent
   worker processes don't race to requeue each other's live jobs.
 
+TRANSACTION SEMANTICS:
+- Cache writes (pass_cache) are batched with job status updates (thinking_jobs)
+  in a single transaction to ensure atomicity.
+- If job completion commits successfully, all cache entries are persisted.
+- If commit fails, entire transaction rolls back — no orphaned cache entries.
+- Database integrity checks run on startup to detect corruption.
+- Automatic backup/restore pattern for corruption recovery.
+
 Tables:
 - thinking_jobs      — reasoning job queue and results
 - model_cache        — discovered model info + benchmarks (from discover.py)
@@ -29,11 +37,15 @@ Tables:
 """
 
 import json
+import logging
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 
 def _db_path() -> str:
@@ -146,6 +158,147 @@ def init_db() -> None:
         conn.close()
 
 
+def init_db_with_integrity_check() -> None:
+    """Initialize database and verify integrity on startup.
+    
+    Runs PRAGMA integrity_check and restores from backup if corruption detected.
+    """
+    init_db()
+    
+    is_valid, message = check_db_integrity()
+    if not is_valid:
+        log.error(f"Database integrity check failed on startup: {message}")
+        
+        # Try to restore from latest backup
+        backup_dir = Path(_db_path()).parent / "backups"
+        if backup_dir.exists():
+            backups = sorted(backup_dir.glob("jobs_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if backups:
+                try:
+                    latest_backup = str(backups[0])
+                    log.info(f"Restoring from backup: {latest_backup}")
+                    _restore_db(latest_backup)
+                    is_valid, message = check_db_integrity()
+                    if is_valid:
+                        log.info("Database restored and integrity check passed")
+                        return
+                except Exception as e:
+                    log.error(f"Failed to restore from backup: {e}")
+        
+        # Create backup before raising error
+        try:
+            _backup_db("corruption_detected")
+        except Exception as e:
+            log.error(f"Failed to backup corrupted database: {e}")
+        
+        raise RuntimeError(f"Database integrity check failed: {message}")
+    
+    # Validate cache consistency
+    all_valid, issues = validate_all_cache_consistency()
+    if not all_valid:
+        log.warning(f"Cache consistency issues detected: {issues}")
+        for job_id, job_issues in issues.items():
+            log.warning(f"  Job {job_id}: {job_issues}")
+
+
+
+def _backup_db(suffix: str = "auto") -> str:
+    """Create a backup of the database. Returns backup path."""
+    db_path = Path(_db_path())
+    backup_dir = db_path.parent / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"jobs_{timestamp}_{suffix}.db"
+    shutil.copy2(db_path, backup_path)
+    log.info(f"Database backup created: {backup_path}")
+    return str(backup_path)
+
+
+def _restore_db(backup_path: str) -> None:
+    """Restore database from backup."""
+    db_path = Path(_db_path())
+    if not Path(backup_path).exists():
+        raise FileNotFoundError(f"Backup not found: {backup_path}")
+    shutil.copy2(backup_path, db_path)
+    log.info(f"Database restored from: {backup_path}")
+
+
+def check_db_integrity() -> tuple[bool, str]:
+    """Run PRAGMA integrity_check on the database.
+    
+    Returns: (is_valid, message)
+    """
+    conn = _connect()
+    try:
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        is_valid = result[0] == "ok"
+        message = result[0]
+        if not is_valid:
+            log.error(f"Database integrity check failed: {message}")
+        return is_valid, message
+    finally:
+        conn.close()
+
+
+def validate_cache_consistency(job_id: str) -> tuple[bool, list[str]]:
+    """Validate that no orphaned cache entries exist for failed jobs.
+    
+    Note: Complete jobs may or may not have cache entries depending on whether
+    caching was used during execution. Only orphaned entries (failed job with cache)
+    are considered an issue.
+    
+    Returns: (is_consistent, list of issues)
+    """
+    conn = _connect()
+    issues = []
+    try:
+        job = conn.execute(
+            "SELECT status FROM thinking_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        
+        if not job:
+            issues.append(f"Job {job_id} not found")
+            return False, issues
+        
+        status = job["status"]
+        cache_exists = conn.execute(
+            "SELECT COUNT(*) as cnt FROM pass_cache WHERE job_id=?", (job_id,)
+        ).fetchone()["cnt"] > 0
+        
+        # Only flag orphaned entries (failed job with cache)
+        if status == "failed" and cache_exists:
+            issues.append(f"Failed job {job_id} has orphaned cache entries")
+        
+        return len(issues) == 0, issues
+    finally:
+        conn.close()
+
+
+def validate_all_cache_consistency() -> tuple[bool, dict[str, list[str]]]:
+    """Validate cache consistency for all jobs.
+    
+    Returns: (all_valid, dict of job_id -> list of issues)
+    """
+    conn = _connect()
+    all_valid = True
+    issues_by_job = {}
+    
+    try:
+        jobs = conn.execute(
+            "SELECT job_id, status FROM thinking_jobs WHERE status IN ('complete', 'failed')"
+        ).fetchall()
+        
+        for job in jobs:
+            is_valid, issues = validate_cache_consistency(job["job_id"])
+            if not is_valid:
+                all_valid = False
+                issues_by_job[job["job_id"]] = issues
+        
+        return all_valid, issues_by_job
+    finally:
+        conn.close()
+
+
 def create_job(
     question: str,
     passes: int,
@@ -190,7 +343,13 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
             (now, worker_id, now, row["job_id"]),
         )
         conn.execute("COMMIT")
-        return dict(row)
+        # Update the dict with new values
+        result = dict(row)
+        result["status"] = "running"
+        result["started_at"] = now
+        result["claimed_by"] = worker_id
+        result["claimed_at"] = now
+        return result
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -201,28 +360,118 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
         conn.close()
 
 
-def complete_job(job_id: str, result: str) -> None:
+def complete_job(
+    job_id: str,
+    result: str,
+    cache_entries: Optional[list[dict]] = None,
+) -> None:
+    """Mark job as complete with optional atomic cache writes.
+    
+    All cache entries and job status update are written in a single transaction.
+    If commit fails, entire transaction rolls back — no orphaned cache entries.
+    
+    Args:
+        job_id: Job ID
+        result: Job result JSON string
+        cache_entries: Optional list of cache entry dicts with keys:
+                      job_id, perspective, pass_num, run_sig, framing, tier,
+                      model_used, provider, output
+    """
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        
+        # Write cache entries atomically with job status
+        if cache_entries:
+            from datetime import timedelta
+            expires = (datetime.now(timezone.utc) + timedelta(hours=_cache_ttl_hours())).isoformat()
+            for entry in cache_entries:
+                conn.execute(
+                    """
+                    INSERT INTO pass_cache
+                        (job_id, perspective, pass_num, run_sig, framing, tier,
+                         model_used, provider, output, created_at, expires_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(job_id, perspective, pass_num) DO UPDATE SET
+                        run_sig=excluded.run_sig,
+                        framing=excluded.framing,
+                        tier=excluded.tier,
+                        model_used=excluded.model_used,
+                        provider=excluded.provider,
+                        output=excluded.output,
+                        created_at=excluded.created_at,
+                        expires_at=excluded.expires_at
+                    """,
+                    (
+                        entry["job_id"],
+                        entry.get("perspective", ""),
+                        entry["pass_num"],
+                        entry["run_sig"],
+                        entry.get("framing"),
+                        entry.get("tier"),
+                        entry.get("model_used"),
+                        entry.get("provider"),
+                        entry["output"],
+                        now,
+                        expires,
+                    ),
+                )
+        
+        # Update job status
         conn.execute(
             "UPDATE thinking_jobs SET status='complete', result=?, completed_at=? WHERE job_id=?",
             (result, now, job_id),
         )
+        
+        # All-or-nothing commit
         conn.commit()
+        log.info(f"Job {job_id} completed with {len(cache_entries) if cache_entries else 0} cache entries")
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        log.error(f"Failed to complete job {job_id}: {e}")
+        # Attempt backup before re-raising
+        try:
+            _backup_db("fail_complete")
+        except Exception as backup_err:
+            log.error(f"Failed to backup database: {backup_err}")
+        raise
     finally:
         conn.close()
 
 
 def fail_job(job_id: str, error: str) -> None:
+    """Mark job as failed and clean up any partial cache entries.
+    
+    Ensures no orphaned cache entries are left behind on job failure.
+    """
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        
+        # Delete any cache entries for failed job to avoid orphans
+        conn.execute("DELETE FROM pass_cache WHERE job_id=?", (job_id,))
+        
+        # Update job status
         conn.execute(
             "UPDATE thinking_jobs SET status='failed', error=?, completed_at=? WHERE job_id=?",
             (error, now, job_id),
         )
+        
+        # All-or-nothing commit
         conn.commit()
+        log.info(f"Job {job_id} marked as failed")
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        log.error(f"Failed to mark job {job_id} as failed: {e}")
+        raise
     finally:
         conn.close()
 
@@ -606,6 +855,27 @@ def get_pass_history(job_id: str, perspective: str, run_sig: str) -> list[dict]:
             break
         result.append(dict(row))
     return result
+
+
+def get_job_pass_cache_entries(job_id: str) -> list[dict]:
+    """Get all pass cache entries for a job (for atomic completion).
+    
+    Returns list of cache entry dicts ready to be passed to complete_job.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT job_id, perspective, pass_num, run_sig, framing, tier,
+                   model_used, provider, output
+            FROM pass_cache WHERE job_id=?
+            ORDER BY perspective ASC, pass_num ASC
+            """,
+            (job_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def set_pass_cache(
