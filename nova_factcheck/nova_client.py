@@ -6,12 +6,23 @@ to the pipeline's canonical statuses (TRUE / FALSE / UNCERTAIN).
 Auth uses Bearer token + TOTP, mirroring nova_mcp/core.py.
 All settings are read from environment variables so no secrets appear in code.
 
-Environment variables:
-    NOVA_BASE_URL      Base URL of Nova service (default: http://[REDACTED_INTERNAL_IP]:30850)
-    NOVA_TOKEN         Bearer token
-    NOVA_TOTP_SEED     TOTP seed (base32)
-    NOVA_VERIFY_TIMEOUT_S  Per-request timeout in seconds (default: 20)
-    NOVA_VERIFY_RETRIES    Number of retries on transient errors (default: 2)
+REQUIRED Environment Variables (for authentication):
+    NOVA_TOKEN         Bearer token for Nova API (required for auth)
+                       Example: "nova-7a8b9c0d1e2f3a4b5c6d7e8f"
+    NOVA_TOTP_SEED     Base32-encoded TOTP seed (required for auth)
+                       Example: "JBSWY3DPEBLW64TMMQ4A73EMUQH5CUPC"
+                       
+OPTIONAL Environment Variables:
+    NOVA_BASE_URL      Base URL of Nova service 
+                       Default: http://[REDACTED_INTERNAL_IP]:30850
+    NOVA_VERIFY_TIMEOUT_S  Per-request timeout in seconds
+                           Default: 20
+    NOVA_VERIFY_RETRIES    Number of retries on transient errors
+                           Default: 2
+
+WARNING: If NOVA_TOKEN or NOVA_TOTP_SEED are empty, all verification calls will 
+fail with 401 Unauthorized. This container must have these set in its environment 
+(ConfigMap, Secret, or .env file) before starting.
 """
 from __future__ import annotations
 
@@ -27,11 +38,25 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
+# Load and validate Nova authentication credentials from environment
 NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "http://[REDACTED_INTERNAL_IP]:30850").rstrip("/")
 NOVA_TOKEN = os.getenv("NOVA_TOKEN", "").strip()
 NOVA_TOTP_SEED = os.getenv("NOVA_TOTP_SEED", "").strip()
 NOVA_VERIFY_TIMEOUT_S = float(os.getenv("NOVA_VERIFY_TIMEOUT_S", "20"))
 NOVA_VERIFY_RETRIES = int(os.getenv("NOVA_VERIFY_RETRIES", "2"))
+
+# Validate that required auth credentials are present
+_NOVA_AUTH_VALID = bool(NOVA_TOKEN and NOVA_TOTP_SEED)
+if not _NOVA_AUTH_VALID:
+    log.warning(
+        "Nova authentication credentials missing: NOVA_TOKEN=%s, NOVA_TOTP_SEED=%s. "
+        "All verification calls will fail with 401 Unauthorized. "
+        "Please set these environment variables in the container deployment.",
+        "SET" if NOVA_TOKEN else "NOT SET",
+        "SET" if NOVA_TOTP_SEED else "NOT SET"
+    )
+else:
+    log.info("Nova authentication credentials loaded successfully (NOVA_TOKEN and NOVA_TOTP_SEED present)")
 
 
 # ---------------------------------------------------------------------------
