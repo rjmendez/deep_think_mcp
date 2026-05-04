@@ -339,3 +339,258 @@ deep_think_async()  ──→  SQLite (queued)
 - SQLite + WAL mode handles concurrent reads/writes safely
 - Stale `running` jobs are automatically requeued on startup (crash recovery)
 - Job history persists indefinitely; query with `list_thinking_jobs`
+
+---
+
+## How to Use Deep-Think Effectively: Lessons Learned
+
+After extensive use in real production scenarios (DAMA sensor ant code review, deep-think infrastructure fixes, Sprint 2 planning), the following patterns emerged as critical for success.
+
+### ❌ **ANTI-PATTERN: Embedding File Paths Instead of Code**
+
+**WRONG:**
+```json
+{
+  "question": "Fix the bugs in orchestrator.py lines 94-98, store.py lines 556-594, and engine.py lines 2113-2118. What's the right fix?",
+  "task_class": "code_review"
+}
+```
+
+**Result:** Deep-think cannot access your filesystem. Returns vague errors or incorrect suggestions because it's working blind.
+
+**CORRECT:**
+```json
+{
+  "question": "ACTUAL CODE (orchestrator.py lines 94-98): ... [full code block] ... BUG DESCRIPTION: Claim() constructor mismatch. Current call passes (text, confidence, category) but dataclass expects (id, statement, claim_type, subject, expected_value). QUESTION: What's the minimal fix?",
+  "task_class": "code_review"
+}
+```
+
+**Result:** Deep-think sees the actual code, identifies the fix precisely.
+
+### ❌ **ANTI-PATTERN: Embedding Unresolved Open Questions**
+
+**WRONG:**
+```json
+{
+  "question": "Should we refactor the registry? How do we handle backward compatibility? What about concurrency? How many collectors should we convert? What's the migration path? When should we feature flag this?",
+  "passes": 4
+}
+```
+
+**Result:** All passes return `[ERROR: ]`. Deep-think cannot reason about 10 unsolved design questions simultaneously.
+
+**CORRECT:**
+```json
+{
+  "question": "FACTS: AntModelRegistry is compile-time only (no runtime registration). Registry refactor requires: (A) full conversion of 30 collectors, (B) partial conversion of 5 collectors, or (C) deferral to Sprint 3. DEPENDENCIES: Registry unblocks inference threading and window aggregators for Sprint 3. CONSTRAINT: Metrics export (v0.6.0) must not break. QUESTION: Which option maximally unblocks Sprint 3 while maintaining v0.6.0 stability?",
+  "passes": 3
+}
+```
+
+**Result:** Deep-think weighs tradeoffs explicitly, returns actionable recommendation with confidence score.
+
+### ✅ **PATTERN: Parallelized Focused Jobs**
+
+Instead of one monolithic job with 10 open questions, queue 3-4 parallel jobs with one specific question each.
+
+**Example: 3 parallel DAMA Sprint 2 jobs**
+
+Job 1 (Priority):
+```
+FACTS: Registry refactor blocks 2 downstream items. Error handling unblocks verification triggers.
+DEPENDENCIES: [explicit] 
+QUESTION: Which two items should be in Sprint 2?
+```
+
+Job 2 (Registry staging):
+```
+FACTS: 30 collectors in switch/case. New interface pattern proposed.
+QUESTION: Should refactor be phased (interface + 5 samples) or completed (all 30)?
+```
+
+Job 3 (Error handling sequence):
+```
+FACTS: Need: metrics, budgets, logging. Integration points: [explicit].
+QUESTION: What's the safest implementation sequence?
+```
+
+**Result:** All 3 complete in 60-90 seconds with high confidence (85%+).
+**Failure mode:** One 30-question mega-job → all passes `[ERROR: ]` → nothing learned.
+
+### ✅ **PATTERN: Facts-Only Prompts**
+
+Structure every prompt as: **FACTS → QUESTION**
+
+**FACTS section:**
+- Actual source code (not file paths)
+- Confirmed values, measurements, constraints
+- Dependencies (explicit relationships)
+- Test results, benchmarks
+- Prior decisions and their rationale
+
+**QUESTION section:**
+- One solvable, specific question
+- Clear decision options (A/B/C)
+- "Why" framing invites deeper reasoning
+- Avoid "is this right?" — ask "which of these approaches..."
+
+**Example structure:**
+```
+FACTS (embedded code):
+```java
+public final class AntModelRegistry {
+    public static final int WINDOW_SIZE = 20;
+    public static final class AntSpec { ... }
+}
+```
+
+FACT (measurement):
+- Current: Hardcoded to 20 timesteps
+- Affected: All 30 collectors
+- Blocker: Window aggregators need per-ant sizes
+
+FACT (dependency):
+- Registry refactor → inference threading (runtimes map)
+- Registry refactor → window aggregators (WINDOW_SIZE)
+
+QUESTION:
+Should we do full registry refactor + error handling (Option A) or error handling only (Option B)?
+```
+
+### ✅ **PATTERN: Provider Configuration**
+
+Always include explicit provider in `provider_config` to avoid "provider is REQUIRED" errors:
+
+```python
+deep_think_async(
+  question="...",
+  provider_config={"provider": "anthropic"},
+  passes=3
+)
+```
+
+Or set globally:
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### ✅ **PATTERN: Calibrate Task Class and Passes**
+
+| Task | Class | Passes | Rationale |
+|------|-------|--------|-----------|
+| Code review audit | `code_review` | 2-3 | Quicker, code-tuned models sufficient |
+| Architecture decision | `reasoning` | 3-4 | Needs deeper tradeoff analysis |
+| Planning (complex) | `general` | 3-4 | Parallelizable into sub-questions better |
+| Writing/synthesis | `synthesis` | 2-3 | One draft pass + refine sufficient |
+
+### ✅ **PATTERN: Validate Confidence Scores**
+
+Deep-think returns `confidence` (0-100%). Interpret as:
+- **85%+** — High confidence, actionable recommendation
+- **62-85%** — Medium confidence, likely correct but check assumptions
+- **<50%** — Low confidence, surface fundamental disagreement (use fan-out to explore)
+
+On genuinely ambiguous problems (e.g., RQ41295056 security incident), 62% from fan-out is **correct** — don't tune for false confidence.
+
+### ❌ **ANTI-PATTERN: Embedding Unknowns in the Question**
+
+**WRONG:**
+```
+"We need to fix 10 bugs but I'm not sure if they're all related. 
+Also, I don't know if the root cause is X, Y, or Z. 
+And the user hasn't told me what the priority is. 
+Should we fix all 10?"
+```
+
+**CORRECT:**
+```
+FACTS:
+- 6 bugs confirmed with code examples (attach snippets)
+- Relationships: Bug 1→2→5 (serial chain), Bug 3-4 parallel
+- Priority: critical (blocking production test), high (affecting performance)
+- User needs 6 bugs fixed by Friday
+
+QUESTION: What's the minimal set to fix first?
+```
+
+### ✅ **Pattern: Parallel Implementation (Not Just Reasoning)**
+
+After deep-think recommends a plan, queue implementation agents in parallel:
+
+```python
+# Deep-think: decides which 2 items for Sprint 2
+dt_job = deep_think_async(question="...", passes=3)
+
+# Wait for decision, then:
+agent1 = task(name="registry-refactor", ...)  # Implement option A-1
+agent2 = task(name="error-handling", ...)     # Implement option B-1
+agent3 = task(name="infrastructure", ...)     # In parallel
+
+# All complete in ~400 seconds
+```
+
+### ✅ **Pattern: Streaming Output During Long Jobs**
+
+For jobs running >5 minutes, poll with `include_reasoning_chain=true` to see intermediate pass outputs:
+
+```python
+result = get_thinking_result(job_id, include_reasoning_chain=True)
+for perspective in result['reasoning_chain']:
+  for pass in perspective['passes']:
+    print(f"Pass {pass['pass_num']}: {pass['output'][:200]}...")
+```
+
+### 📊 **Real-World Results (DAMA Sprint 1-2)**
+
+| Scenario | Approach | Result |
+|----------|----------|--------|
+| Monolithic 10-question job | 1 large job, 4 passes | `[ERROR: ]` on all passes |
+| Parallelized 3-question jobs | 3 focused jobs, 2 passes each | 3/3 complete, 85% confidence, 86 seconds |
+| Code review + planning + fixes | Code review agent + deep-think + 4 implementation agents | 18 files, ~2,850 LOC, zero regressions, 4×400 seconds parallel |
+
+---
+
+## Troubleshooting
+
+### Job Returns `[ERROR: ]` on All Passes
+
+**Cause:** Unresolved open questions or unstructured facts in prompt.
+
+**Fix:**
+1. Extract explicit facts (code, measurements, constraints)
+2. Remove unanswered questions — replace with assumption + reasoning
+3. Break into 2-3 focused sub-jobs
+4. Embed actual code, not file paths
+
+### Provider Config Error: "provider is REQUIRED"
+
+**Cause:** Missing `provider` in `provider_config`.
+
+**Fix:**
+```python
+provider_config={"provider": "anthropic"}  # ✓
+provider_config={}                         # ✗
+```
+
+### "Timeout on Ollama" → Fallback to Copilot
+
+If using mixed providers with Ollama timeout fallback:
+```bash
+DEEP_THINK_LIGHT_PROVIDER=ollama
+DEEP_THINK_HEAVY_PROVIDER=copilot
+DEEP_THINK_OLLAMA_TIMEOUT_FALLBACK=true
+```
+
+Check `pass_cache.provider` after the job to see which provider actually served each pass. Ollama timeouts are rare but fatal — fallback prevents job failure.
+
+### Job Stuck in `running` State
+
+Jobs marked `running` for >10 minutes are requeued on worker restart. Check:
+```bash
+python -c "from deep_think_mcp import store; import sqlite3; 
+  db = sqlite3.connect('~/.deep_think/jobs.db'); 
+  print(db.execute('SELECT id, status, created_at FROM jobs ORDER BY created_at DESC LIMIT 5').fetchall())"
+```
+
+If a job is legitimately stuck, delete it manually and requeue.
