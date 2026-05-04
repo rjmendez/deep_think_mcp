@@ -130,6 +130,7 @@ def _read_credential(provider: str, key: str) -> Optional[str]:
     if env_key:
         value = os.environ.get(env_key)
         if value:
+            log.debug(f"Found {provider} credential in env var {env_key}")
             return value
     
     # Try credentials file
@@ -139,10 +140,15 @@ def _read_credential(provider: str, key: str) -> Optional[str]:
             with open(cred_file) as f:
                 for line in f:
                     if f"{provider}.{key}=" in line:
-                        return line.split("=", 1)[1].strip()
+                        result = line.split("=", 1)[1].strip()
+                        log.debug(f"Found {provider} credential in {cred_file}: {result[:20]}...")
+                        return result
         except Exception as e:
             log.debug(f"Error reading credentials file: {e}")
+    else:
+        log.debug(f"Credentials file not found: {cred_file}")
     
+    log.warning(f"No credential found for provider={provider}, key={key}")
     return None
 
 
