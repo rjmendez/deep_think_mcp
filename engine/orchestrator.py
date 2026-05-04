@@ -129,8 +129,8 @@ def _extract_subject_from_statement(statement: str) -> str:
     # First pass: look for known keywords (case-insensitive)
     known_keywords = {'GPS', 'API', 'CPU', 'RAM', 'USB', 'HTTP', 'SQL', 'REST', 'JSON'}
     for word in words:
-        # Strip trailing and leading punctuation for comparison
-        clean_word = word.rstrip(".,;:!?'\"").lstrip("'\"").upper()
+        # Remove possessive suffix ('s) and trailing punctuation for comparison
+        clean_word = re.sub(r"'s$", "", word).rstrip(".,;:!?\"'").upper()
         if clean_word in known_keywords:
             return clean_word
     
@@ -200,7 +200,10 @@ async def _validate_claims_against_ground_truth(
                 continue
         
         if not claim_objects:
+            log.debug("No valid claim objects after conversion")
             return None
+        
+        log.debug(f"Validating {len(claim_objects)} claims")
         
         # Validate batch with timeout to prevent hanging tasks
         try:
@@ -212,7 +215,10 @@ async def _validate_claims_against_ground_truth(
             log.warning(f"Validation batch timed out after {timeout_secs}s for {len(claim_objects)} claims")
             raise
         
+        log.debug(f"Validation returned {len(validation_results) if validation_results else 0} results")
+        
         if not validation_results:
+            log.debug("Validation results are empty")
             return None
         
         # Aggregate results
@@ -221,12 +227,15 @@ async def _validate_claims_against_ground_truth(
         contradictions = [r for r in validation_results if r.get("is_contradiction")]
         avg_confidence = sum(r.get("grounding_confidence", 0.5) for r in validation_results) / max(total, 1)
         
+        log.debug(f"Aggregated: {total} claims, {hallucinations} hallucinations, confidence {avg_confidence}")
+        
         return ValidationData(
-            total_claims=total,
+            claims=claim_objects,
+            validation_results=validation_results,
             hallucination_count=hallucinations,
             overall_confidence=avg_confidence,
             contradictions=contradictions,
-            raw_results=validation_results,
+            hallucination_details=[],
         )
     
     except asyncio.TimeoutError:
@@ -311,14 +320,14 @@ async def _run_alarm_scan(
 ) -> Optional[dict]:
     """Run alarm scan to detect high-confidence hallucinations.
     
-    Returns scan result dict with hallucination_count, overall_confidence, etc.
+    Returns scan result dict with total_claims, hallucination_count, overall_confidence, etc.
     """
     claims = _extract_claims_from_pass_output(pass_output)
     validation = await _validate_claims_against_ground_truth(claims, ground_truth_provider)
     
     if validation:
         return {
-            "total_claims": validation.total_claims,
+            "total_claims": len(validation.claims),
             "hallucination_count": validation.hallucination_count,
             "overall_confidence": validation.overall_confidence,
             "contradictions": validation.contradictions,

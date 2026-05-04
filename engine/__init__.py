@@ -29,7 +29,15 @@ Security and enforcement:
 """
 
 from .types import ProviderConfig, PassResult, ValidationData
-from .orchestrator import deep_think_passes, run_fan_out
+from .orchestrator import (
+    deep_think_passes,
+    run_fan_out,
+    _extract_claims_from_pass_output,
+    _validate_claims_against_ground_truth,
+    _build_claim_data,
+    _extract_subject_from_statement,
+    _run_alarm_scan,
+)
 from .provider import (
     build_provider_config,
     refresh_ollama_models,
@@ -74,6 +82,12 @@ __all__ = [
     # Main functions
     "deep_think_passes",
     "run_fan_out",
+    # Claim processing (internal functions for testing/advanced use)
+    "_extract_claims_from_pass_output",
+    "_validate_claims_against_ground_truth",
+    "_build_claim_data",
+    "_extract_subject_from_statement",
+    "_run_alarm_scan",
     # Provider functions
     "build_provider_config",
     "refresh_ollama_models",
