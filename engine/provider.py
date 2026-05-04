@@ -257,6 +257,13 @@ async def _call_anthropic(
         log.warning(f"API key doesn't start with sk-ant: {api_key[:20]}...")
     
     async with httpx.AsyncClient(timeout=timeout) as client:
+        payload = {
+            "model": model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        log.info(f"Calling Anthropic with model={model}")
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -264,15 +271,10 @@ async def _call_anthropic(
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": [{"role": "user", "content": user_prompt}],
-            },
+            json=payload,
         )
         if response.status_code != 200:
-            log.error(f"Anthropic API returned {response.status_code}: {response.text[:200]}")
+            log.error(f"Anthropic {response.status_code}: model={model}, response={response.text[:300]}")
         response.raise_for_status()
         result = response.json()
         return result["content"][0]["text"]
