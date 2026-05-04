@@ -136,6 +136,12 @@ async def deep_think_async(
     model: str = "",
     provider_config: Optional[dict] = None,
     verify: bool = False,
+    # Grounded reasoning parameters
+    enable_research: bool = True,
+    research_query: str = "",
+    dama_node_id: str = "",
+    dama_metric: str = "",
+    web_domain_whitelist: Optional[list] = None,
 ) -> dict:
     """Queue a multi-pass reasoning job and return a job_id immediately.
 
@@ -153,6 +159,8 @@ async def deep_think_async(
             "extraction"    Structured JSON output, entity extraction.
             "synthesis"     Writing, summarization, report drafting.
             "reasoning"     Complex logical / mathematical reasoning.
+            "adversarial"   Unconstrained challenge reasoning. Ollama-only, NO research tools.
+            "research"      Grounded research. Full research tools, no abliteration models.
         data_policy: Controls which providers are allowed.
             "any"    (default) Use any configured provider including cloud.
             "local"  Ollama ONLY — never send data to cloud providers.
@@ -170,11 +178,18 @@ async def deep_think_async(
             heavy_provider  Per-tier provider (e.g. "copilot" for synthesis)
         verify:      If True, runs an extra heavy-tier re-traversal pass after the main passes
                      to check for gaps, contradictions, and unsupported claims (RYS verification).
+        enable_research: If True and task_class permits, inject grounded research context.
+        research_query:  Override query for research tools (defaults to question).
+        dama_node_id:    DAMA device node ID for telemetry lookup (research/research_synthesis only).
+        dama_metric:     DAMA metric name for telemetry lookup.
+        web_domain_whitelist: Restrict web_search to specific domains (research only).
 
     Provider secrets via environment variables only:
         ANTHROPIC_API_KEY              Anthropic API key
         GITHUB_COPILOT_OAUTH_TOKEN     GitHub Copilot OAuth token
         OLLAMA_BASE_URL                Ollama base URL (default: http://localhost:11434)
+
+    Response includes proof_chain field when research tools were used.
     """
     pc: dict = dict(provider_config or {})
     if model:
@@ -191,7 +206,17 @@ async def deep_think_async(
         passes=max(2, min(passes, 6)),
         provider=cfg.provider,
         model_summary=summary,
-        provider_config_json=json.dumps({**pc, "task_class": task_class, "data_policy": data_policy, "verify": verify}),
+        provider_config_json=json.dumps({
+            **pc,
+            "task_class": task_class,
+            "data_policy": data_policy,
+            "verify": verify,
+            "enable_research": enable_research,
+            "research_query": research_query,
+            "dama_node_id": dama_node_id,
+            "dama_metric": dama_metric,
+            "web_domain_whitelist": web_domain_whitelist or [],
+        }),
     )
 
     return {
@@ -201,6 +226,7 @@ async def deep_think_async(
         "data_policy": data_policy,
         "provider": cfg.provider,
         "model_summary": summary,
+        "research_enabled": enable_research and resolved_class not in ("adversarial",),
         "message": f"Call get_thinking_result('{job_id}') to poll for results.",
     }
 

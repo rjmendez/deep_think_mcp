@@ -31,11 +31,18 @@ async def _run_job(job: dict) -> None:
     try:
         provider_config = json.loads(job.get("provider_config_json") or "{}")
         
-        # Extract job control params (don't pop from provider_config)
-        task_class = job.get("task_class", "general")
-        data_policy = job.get("data_policy", "any")
+        # Extract job control params (pop from provider_config where stored there)
+        task_class = provider_config.pop("task_class", job.get("task_class", "general"))
+        data_policy = provider_config.pop("data_policy", job.get("data_policy", "any"))
         device_id = job.get("device_id", "")
         force_local_models = job.get("force_local_models", False)
+
+        # Grounded reasoning parameters
+        enable_research = provider_config.pop("enable_research", True)
+        research_query = provider_config.pop("research_query", "")
+        dama_node_id = provider_config.pop("dama_node_id", "")
+        dama_metric = provider_config.pop("dama_metric", "")
+        web_domain_whitelist = provider_config.pop("web_domain_whitelist", [])
         
         # Auto-enable local-only for MQTT operations
         if device_id or force_local_models:
@@ -88,6 +95,12 @@ async def _run_job(job: dict) -> None:
                 data_policy=data_policy,
                 force_local_models=force_local_models,
                 device_id=device_id,
+                job_id=job_id,
+                enable_research=enable_research,
+                research_query=research_query or "",
+                dama_node_id=dama_node_id,
+                dama_metric=dama_metric,
+                web_domain_whitelist=web_domain_whitelist,
             )
             cfg = engine.build_provider_config(provider_config)
             log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)

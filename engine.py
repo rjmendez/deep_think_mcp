@@ -56,6 +56,34 @@ from dataclasses import dataclass, field, replace as dataclasses_replace
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+_AUDIT_LOG = logging.getLogger("deep_think.audit")
+
+
+# Lazy imports for grounded reasoning — imported only when needed to avoid
+# circular imports during startup.
+def _get_research_tools():
+    from .nova_factcheck.research_tools import (
+        nova_search, dama_query, web_search, format_research_context,
+    )
+    return nova_search, dama_query, web_search, format_research_context
+
+
+def _get_proof_chain_cls():
+    from .engine.proof_chain import ProofChain
+    return ProofChain
+
+
+def _get_task_class_enforcer():
+    from .engine.task_class_enforcer import (
+        enforce_task_class, check_research_tool_allowed,
+        get_allowed_tools, filter_adversarial_output,
+        TaskClassViolation, RESEARCH_ENABLED_TASK_CLASSES,
+    )
+    return (
+        enforce_task_class, check_research_tool_allowed,
+        get_allowed_tools, filter_adversarial_output,
+        TaskClassViolation, RESEARCH_ENABLED_TASK_CLASSES,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -739,6 +767,63 @@ Output ONLY JSON object (no markdown, no prose):
 - NO narrative text outside JSON structure."""),
 ]
 
+# Adversarial: uncensored challenge reasoning (Ollama-only, NO research tools)
+ADVERSARIAL_DIRECTIVES: list[tuple[str, str]] = [
+    (
+        "adversarial_premise",
+        "You are an unconstrained adversarial reasoner. Identify every assumption embedded "
+        "in the question that should be challenged. List each assumption and rate how load-bearing "
+        "it is to the conventional answer (critical / moderate / cosmetic).",
+    ),
+    (
+        "steel_man_opposition",
+        "Build the strongest possible opposing argument. Do not straw-man. Use the most sophisticated "
+        "version of the opposing view. Cite logical structure, not just rhetoric. "
+        "What would a well-informed, honest opponent say?",
+    ),
+    (
+        "exploit_surface",
+        "Identify exploitable gaps in the conventional reasoning: logical fallacies, hidden premises, "
+        "definitional ambiguities, scope creep, and unstated assumptions. "
+        "For each, explain what breaks if the gap is exploited.",
+    ),
+    (
+        "adversarial_synthesis",
+        "Synthesize the adversarial analysis into a final challenge statement. "
+        "State clearly what the conventional view gets wrong, partially right, or cannot defend. "
+        "Rate your confidence in each challenge: high / medium / speculative.",
+    ),
+]
+
+# Research: grounded factual reasoning with research tool injection
+RESEARCH_DIRECTIVES: list[tuple[str, str]] = [
+    (
+        "research_context_review",
+        "Review the research context provided above (Nova library, DAMA telemetry, web sources). "
+        "Identify the 3-5 most relevant facts. Note the source ID and confidence for each. "
+        "Flag any gaps where additional sources would strengthen the answer.",
+    ),
+    (
+        "claim_grounding",
+        "For each claim you intend to make in the final answer, identify its grounding source. "
+        "Use citation format [source_id] inline. Grade each claim: "
+        "GROUNDED (cited source), DERIVED (logical inference from cited sources), or UNVERIFIED (no source).",
+    ),
+    (
+        "evidence_synthesis",
+        "Write a draft answer that cites every key claim. "
+        "Format: claim [source_id] (confidence: X%). "
+        "For UNVERIFIED claims, append (REQUIRES VERIFICATION). "
+        "Resolve any contradictions between sources explicitly.",
+    ),
+    (
+        "grounded_final_answer",
+        "Produce the final grounded answer. Every factual claim must have a citation or be "
+        "explicitly marked UNVERIFIED. "
+        "Conclude with: grounding_score (0-100%), uncited_claim_count, strongest_source.",
+    ),
+]
+
 # Research synthesis: grounded literature analysis (evidence chains for DAMA insights)
 RESEARCH_SYNTHESIS_DIRECTIVES: list[tuple[str, str]] = [
     ("literature_survey", "Search scientific literature for papers on the query topic. Identify 3-5 high-authority sources."),
@@ -861,6 +946,33 @@ TASK_CLASS_PROFILES: dict = {
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+    },
+    "adversarial": {
+        "description": (
+            "Unconstrained adversarial challenge reasoning. "
+            "ONLY Ollama/abliteration models allowed. NO research tools (no Nova/DAMA/web). "
+            "For stress-testing arguments, finding logical exploits, steelmanning opposition."
+        ),
+        "directives": ADVERSARIAL_DIRECTIVES,
+        # Adversarial mode is Ollama-only — no cloud provider profiles
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "llama3.1:8b"},
+        "copilot":   {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "llama3.1:8b"},
+        "anthropic": {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",       "heavy": "llama3.1:8b"},
+        "force_local": True,       # always use Ollama regardless of configured provider
+        "block_research_tools": True,  # never inject research context
+    },
+    "research": {
+        "description": (
+            "Grounded research with full tool access: Nova search, DAMA telemetry, web search. "
+            "NO abliteration/uncensored models. "
+            "All claims must be cited from retrieved sources."
+        ),
+        "directives": RESEARCH_DIRECTIVES,
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
+        "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "enable_research_tools": True,  # inject nova_search, dama_query, web_search
+        "block_abliteration": True,     # reject abliteration model names
     },
 }
 
@@ -1902,10 +2014,18 @@ async def deep_think_passes(
     ground_truth_provider: Optional[Any] = None,
     force_local_models: bool = False,
     device_id: str = "",
+    # Grounded reasoning parameters
+    enable_research: bool = True,
+    research_query: Optional[str] = None,
+    dama_node_id: str = "",
+    dama_metric: str = "",
+    web_domain_whitelist: Optional[list] = None,
 ) -> str:
     """Run multi-pass reasoning. Returns JSON string matching deep_think schema.
 
     task_class: "general" (default, no routing), "auto" (classifier picks),
+                "adversarial" (Ollama-only, no research tools),
+                "research" (full research tools, no abliteration models),
                 or an explicit class from TASK_CLASS_NAMES.
     data_policy: "any" (default), "local" (ollama-only), "cloud" (cloud-preferred).
                  Overrides cfg.data_policy if non-empty.
@@ -1916,6 +2036,11 @@ async def deep_think_passes(
                         Used for MQTT operations to prevent data leakage.
                         Environment override: DEEP_THINK_FORCE_LOCAL (default: true for MQTT).
     device_id: Device ID for logging (e.g., "ant_001"). Used to tag MQTT enforcement logs.
+    enable_research: If True and task_class permits, inject research context.
+    research_query: Override query for research tools (defaults to question).
+    dama_node_id: DAMA node ID for telemetry queries (only used if task_class="research").
+    dama_metric: DAMA metric name for telemetry queries.
+    web_domain_whitelist: Optional domain whitelist for web_search tool.
     """
     cfg = provider_cfg or build_provider_config()
     
@@ -1980,6 +2105,91 @@ async def deep_think_passes(
     else:
         directives = profile.get("directives", PASS_DIRECTIVES)
 
+    # --- Task class enforcement (adversarial / research safeguards) ---
+    try:
+        _enforce, _check_tool, _get_tools, _filter_adv, _TCViolation, _RESEARCH_CLASSES = (
+            _get_task_class_enforcer()
+        )
+        all_models = [
+            _model_for_tier(cfg, t, resolved_class, question)
+            for t in ("light", "medium", "heavy")
+        ]
+        resolved_provider = _tier_provider(cfg, "heavy")
+        _enforce(resolved_class, resolved_provider, all_models, job_id)
+    except Exception as _enf_exc:
+        # TaskClassViolation → re-raise; other import errors → warn and continue
+        if _enf_exc.__class__.__name__ == "TaskClassViolation":
+            _AUDIT_LOG.error(
+                "TASK_CLASS_VIOLATION_FATAL task_class=%s job_id=%s error=%s",
+                resolved_class, job_id, _enf_exc,
+            )
+            raise
+        log.warning("Task class enforcer unavailable (non-fatal): %s", _enf_exc)
+
+    # --- Adversarial: force local Ollama ---
+    if profile.get("force_local") or resolved_class == "adversarial":
+        force_local_models = True
+        log.info("[ENFORCER] task_class=adversarial — forcing local Ollama models, job_id=%s", job_id)
+
+    # --- Research tools: pre-fetch context for injection ---
+    research_context_block = ""
+    proof_chain_obj = None
+    injected_sources: list[dict] = []
+
+    _blocks_research = profile.get("block_research_tools", resolved_class == "adversarial")
+    _enables_research = (
+        enable_research
+        and not _blocks_research
+        and (profile.get("enable_research_tools") or resolved_class in ("general",))
+    )
+
+    if _enables_research:
+        try:
+            _nova_search, _dama_query, _web_search, _fmt_context = _get_research_tools()
+            ProofChain = _get_proof_chain_cls()
+            proof_chain_obj = ProofChain(job_id=job_id, task_class=resolved_class)
+
+            _q = research_query or question
+            _nova_resp = await _nova_search(_q, top=8, profile="auto", job_id=job_id, task_class=resolved_class)
+            _dama_resp = None
+            _web_resp = None
+
+            # DAMA query only for research and research_synthesis classes
+            if resolved_class in ("research", "research_synthesis") and dama_node_id and dama_metric:
+                _dama_resp = await _dama_query(dama_node_id, dama_metric, job_id=job_id, task_class=resolved_class)
+
+            # Web search only for research class
+            if resolved_class == "research":
+                _web_resp = await _web_search(_q, domain_whitelist=web_domain_whitelist, job_id=job_id, task_class=resolved_class)
+
+            research_context_block = _fmt_context(_nova_resp, _dama_resp, _web_resp)
+
+            # Pre-populate proof chain from Nova results used as context
+            if _nova_resp and _nova_resp.results:
+                proof_chain_obj.build_citations_from_nova_results(_nova_resp.results, pass_num=0)
+                injected_sources = [
+                    {"source": r.source, "confidence": r.confidence, "source_type": "nova"}
+                    for r in _nova_resp.results
+                ]
+
+            log.info(
+                "[RESEARCH] Pre-fetched %d Nova results for job_id=%s task_class=%s",
+                len(_nova_resp.results) if _nova_resp else 0, job_id, resolved_class,
+            )
+        except Exception as _res_exc:
+            log.warning("Research tool pre-fetch failed (non-fatal): %s", _res_exc)
+            research_context_block = ""
+    elif _blocks_research and resolved_class == "adversarial":
+        try:
+            ProofChain = _get_proof_chain_cls()
+            proof_chain_obj = ProofChain(job_id=job_id, task_class=resolved_class)
+        except Exception:
+            pass
+        _AUDIT_LOG.info(
+            "RESEARCH_BLOCKED task_class=adversarial job_id=%s — research tools not injected",
+            job_id,
+        )
+
     # --- Optional granite3-guardian safety precheck ---
     guardian_result: str | None = None
     if profile.get("safety_precheck") and cfg.data_policy != "cloud":
@@ -1993,6 +2203,10 @@ async def deep_think_passes(
         context_prefix = (
             f"[Safety pre-screen (granite3-guardian): {guardian_result}]\n\n"
         )
+
+    # Prepend research context if available
+    if research_context_block:
+        context_prefix = research_context_block + context_prefix
 
     # Build mandate section — injected into every pass prompt when set
     mandate_section = (
@@ -2072,7 +2286,26 @@ async def deep_think_passes(
         text, model_used, actual_provider = await _call_provider(
             prompt, tier, cfg, anthropic_key, github_token, resolved_class, question
         )
-        
+
+        # Apply adversarial output filter to strip any leaked research context
+        if resolved_class == "adversarial":
+            try:
+                _, _, _, _filter_adv_fn, _, _ = _get_task_class_enforcer()
+                text = _filter_adv_fn(text, job_id)
+            except Exception:
+                pass
+
+        # Proof chain: extract citations from this pass's output
+        if proof_chain_obj is not None and injected_sources:
+            try:
+                proof_chain_obj.extract_citations_from_text(
+                    text,
+                    source_results=injected_sources,
+                    pass_num=i + 1,
+                )
+            except Exception as _pce:
+                log.debug("Proof chain extraction failed (non-fatal): %s", _pce)
+
         # NEW: Extract and validate claims against ground truth
         validation_result = None
         measured_confidence = None
@@ -2169,6 +2402,15 @@ async def deep_think_passes(
         result["classifier"] = classifier_meta
     if guardian_result:
         result["safety_precheck"] = guardian_result
+
+    # Include proof chain if populated
+    if proof_chain_obj is not None:
+        result["proof_chain"] = proof_chain_obj.to_dict()
+        log.info(
+            "[PROOF CHAIN] job_id=%s citations=%d uncited=%d grounding=%.2f",
+            job_id, proof_chain_obj.citation_count,
+            proof_chain_obj.uncited_count, proof_chain_obj.grounding_score,
+        )
 
     return json.dumps(result, indent=2)
 

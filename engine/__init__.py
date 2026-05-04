@@ -6,6 +6,8 @@ This package provides the refactored deep_think_mcp engine, broken into focused 
 - engine.directives: Framing directives and task class profiles
 - engine.provider: Provider abstraction and LLM call implementations
 - engine.orchestrator: Main pass loop (deep_think_passes) and fan-out (run_fan_out)
+- engine.proof_chain: Proof chain tracking for grounded reasoning
+- engine.task_class_enforcer: Task class enforcement (adversarial/research safeguards)
 
 Public API:
 - deep_think_passes: Main reasoning loop
@@ -20,6 +22,7 @@ Public API:
 
 Security and enforcement:
 - SecurityError: Raised when security policy is violated
+- TaskClassViolation: Raised when task_class + provider/tool combination is blocked
 - _validate_provider_is_local: Validate provider is Ollama when local-only mode
 - _check_ollama_available: Check Ollama availability at startup
 - _validate_and_enforce_local_models: Enforce local-only MQTT models
@@ -50,6 +53,18 @@ from .creative import (
     extract_quality_metrics,
     get_metrics_snapshot,
 )
+from .proof_chain import ProofChain, ProofEntry, UncitedClaim
+from .task_class_enforcer import (
+    TaskClassViolation,
+    enforce_task_class,
+    check_research_tool_allowed,
+    get_allowed_tools,
+    filter_adversarial_output,
+    is_abliteration_model,
+    ABLITERATION_MODEL_PATTERNS,
+    RESEARCH_ENABLED_TASK_CLASSES,
+    RESEARCH_BLOCKED_TASK_CLASSES,
+)
 
 __all__ = [
     # Types
@@ -66,12 +81,25 @@ __all__ = [
     "classify_task",
     # Security
     "SecurityError",
+    "TaskClassViolation",
     "_validate_provider_is_local",
     "_check_ollama_available",
     "_validate_and_enforce_local_models",
     # Constants
     "TASK_CLASS_PROFILES",
     "PERSPECTIVE_MANDATES",
+    # Grounded reasoning
+    "ProofChain",
+    "ProofEntry",
+    "UncitedClaim",
+    "enforce_task_class",
+    "check_research_tool_allowed",
+    "get_allowed_tools",
+    "filter_adversarial_output",
+    "is_abliteration_model",
+    "ABLITERATION_MODEL_PATTERNS",
+    "RESEARCH_ENABLED_TASK_CLASSES",
+    "RESEARCH_BLOCKED_TASK_CLASSES",
     # Creative reasoning
     "CreativeReasoningEngine",
     "CreativePassResult",
