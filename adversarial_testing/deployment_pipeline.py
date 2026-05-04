@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 import aiohttp
-from adversarial_testing.store import AdversarialStore
-from adversarial_testing.metrics import MetricsCollector
+from .store import AdversarialStore
+from .metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from mqtt.models import Confirmation, normalize_uuid, ValidationError
+from .models import Confirmation, normalize_uuid, ValidationError
 
 log = logging.getLogger(__name__)
 

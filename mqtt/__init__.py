@@ -12,9 +12,9 @@ Components:
     - utils: Helper functions and retry logic
 """
 
-from mqtt.config import MQTTConfig
-from mqtt.models import Finding, Confirmation
-from mqtt.subscriber import (
+from .config import MQTTConfig
+from .models import Finding, Confirmation
+from .subscriber import (
     MQTTClaimsProcessor,
     mqtt_startup,
     mqtt_shutdown,
@@ -23,9 +23,9 @@ from mqtt.subscriber import (
     get_mqtt_subscriber,
     is_mqtt_enabled,
 )
-from mqtt.publisher import MQTTFindingsPublisher, FindingsPersistenceStore
-from mqtt.feedback_store import FeedbackStore
-from mqtt.resilience import (
+from .publisher import MQTTFindingsPublisher, FindingsPersistenceStore
+from .feedback_store import FeedbackStore
+from .resilience import (
     CircuitBreakerState,
     CircuitBreaker,
     MQTTHealthMonitor,

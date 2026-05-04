@@ -13,8 +13,8 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 
-from adversarial_testing import store
-from adversarial_testing.metrics import MetricsCollector
+from . import store
+from .metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
