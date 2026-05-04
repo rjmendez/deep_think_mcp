@@ -52,6 +52,25 @@ def _validate_provider_is_local(provider: str, force_local: bool) -> None:
         raise SecurityError(msg)
 
 
+def _is_valid_anthropic_model(model_name: str) -> bool:
+    """Check if model name is valid Anthropic format: claude-{version}-{YYYYMMDD}.
+    
+    Valid examples:
+    - claude-opus-4-1-20250805
+    - claude-sonnet-4-20250514
+    - claude-haiku-3-20250805
+    
+    Invalid examples (what directives.py has):
+    - claude-sonnet-4.6 (dot notation)
+    - claude-opus-4.7 (dot notation)
+    """
+    # Must start with 'claude-' and have a date suffix like -20250514
+    if not model_name or not model_name.startswith("claude-"):
+        return False
+    # Must end with -YYYYMMDD (8-digit date)
+    return bool(re.search(r'-\d{8}$', model_name))
+
+
 async def _check_ollama_available(base_url: str = "") -> bool:
     """Check if Ollama is reachable and has models. Returns True if available and has models.
     
@@ -163,9 +182,9 @@ _ANTHROPIC_DEFAULTS = {
 }
 
 _COPILOT_DEFAULTS = {
-    "light": "claude-sonnet-4.6",
-    "medium": "claude-sonnet-4.6",
-    "heavy": "claude-opus-4.7",
+    "light": "gpt-5.4-mini",
+    "medium": "gpt-5.4",
+    "heavy": "gpt-5.5",
 }
 
 _OLLAMA_DEFAULTS = {
@@ -216,11 +235,11 @@ def _select_model(
     
     # Default tier-based selection
     if provider == "anthropic":
-        return _ANTHROPIC_DEFAULTS.get(tier, "claude-sonnet-4-6")
+        return _ANTHROPIC_DEFAULTS.get(tier, _ANTHROPIC_DEFAULTS["heavy"])
     elif provider == "copilot":
-        return _COPILOT_DEFAULTS.get(tier, "claude-sonnet-4.6")
+        return _COPILOT_DEFAULTS.get(tier, _COPILOT_DEFAULTS["heavy"])
     elif provider == "ollama":
-        return _OLLAMA_DEFAULTS.get(tier, "qwen3.5:27b")
+        return _OLLAMA_DEFAULTS.get(tier, _OLLAMA_DEFAULTS["heavy"])
     
     return "unknown"
 
@@ -600,6 +619,12 @@ def _profile_model(task_class: str, provider: str, tier: str) -> str:
     if not preferred:
         return ""
 
+    # For anthropic: validate model name format (must be claude-{version}-{YYYYMMDD})
+    if provider == "anthropic":
+        if not _is_valid_anthropic_model(preferred):
+            log.debug("Profile model %s is not valid Anthropic model format, skipping", preferred)
+            return ""
+    
     # For ollama: validate against discovery cache, or legacy _ollama_discovered set
     if provider == "ollama":
         try:
