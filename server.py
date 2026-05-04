@@ -90,11 +90,21 @@ from .adversarial_testing.validation_suite import ValidationSuite
 from .adversarial_testing.metrics import MetricsCollector
 from .adversarial_testing.deployment_pipeline import DeploymentPipeline
 from .adversarial_testing import store as adversarial_store
+from .verify.config import load_config as load_verify_config
+from .verify.provider import CloudProvider, LocalProvider
+from .verify.queue import VerifyJobQueue, VerifyWorker
 
 log = logging.getLogger(__name__)
 
 # Global planning engine instance
 _planning_engine: Optional[PlanningEngine] = None
+
+# Global verification system instance
+_verify_queue: Optional[VerifyJobQueue] = None
+_verify_worker: Optional[VerifyWorker] = None
+_cloud_provider: Optional[object] = None
+_local_provider: Optional[object] = None
+
 
 
 @asynccontextmanager
@@ -132,6 +142,57 @@ async def _lifespan(app):
     mcp.planning_engine = _planning_engine
     log.info("PlanningEngine initialized for self-improvement")
     
+    # Initialize verification system
+    global _verify_queue, _verify_worker, _cloud_provider, _local_provider
+    try:
+        verify_config = load_verify_config()
+        _verify_queue = VerifyJobQueue()
+        
+        # Initialize providers
+        _cloud_provider = None
+        _local_provider = None
+        
+        if verify_config.anthropic_api_key:
+            try:
+                _cloud_provider = CloudProvider(
+                    api_key=verify_config.anthropic_api_key,
+                    model=verify_config.anthropic_model,
+                    timeout=verify_config.verify_cloud_timeout,
+                )
+                log.info("CloudProvider initialized")
+            except Exception as e:
+                log.warning("Failed to initialize CloudProvider: %s", e)
+        else:
+            log.info("ANTHROPIC_API_KEY not set, CloudProvider disabled")
+        
+        try:
+            _local_provider = LocalProvider(
+                url=verify_config.ollama_url,
+                timeout=verify_config.verify_local_timeout,
+            )
+            log.info("LocalProvider initialized (Ollama at %s)", verify_config.ollama_url)
+        except Exception as e:
+            log.warning("Failed to initialize LocalProvider: %s", e)
+        
+        # Initialize worker
+        _verify_worker = VerifyWorker(
+            queue=_verify_queue,
+            cloud_provider=_cloud_provider,
+            local_provider=_local_provider,
+            config=verify_config,
+        )
+        
+        # Expose to mcp (only those that work)
+        mcp.verify_queue = _verify_queue
+        mcp.verify_worker = _verify_worker
+        mcp.verify_config = verify_config
+        
+        # Start worker
+        await _verify_worker.start()
+        log.info("Verification system initialized")
+    except Exception as e:
+        log.error("Failed to initialize verification system: %s", e)
+    
     discovery_task = None
     if _ollama_in_use():
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -142,6 +203,10 @@ async def _lifespan(app):
     try:
         yield
     finally:
+        # Shutdown verification worker
+        if _verify_worker:
+            await _verify_worker.stop()
+        
         # [MQTT] Shutdown — gracefully stop subscriber and processor
         if mqtt_initialized:
             log.info("[MQTT] Shutting down MQTTEngineAdapter...")
@@ -1271,6 +1336,685 @@ async def validate_implementation(request: Request) -> JSONResponse:
                 "error": f"Validation exception: {str(e)}",
                 "status": "error",
             },
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/verify", methods=["POST"])
+async def verify_sync(request: Request):
+    """Synchronous claim verification endpoint.
+    
+    Request body:
+    {
+        "claim": "string",
+        "context": "optional string",
+        "provider": "cloud|local"  # defaults to "cloud"
+    }
+    
+    Response:
+    {
+        "verdict": true/false,
+        "confidence": 0.0-1.0,
+        "reasoning": "string",
+        "latency_ms": 1234
+    }
+    """
+    try:
+        body = await request.json()
+        claim = body.get("claim", "").strip()
+        context = body.get("context", "").strip() or None
+        provider = body.get("provider", "cloud")
+
+        if not claim:
+            return JSONResponse(
+                {"error": "Missing required field: claim"},
+                status_code=400,
+            )
+
+        if provider not in ("cloud", "local"):
+            return JSONResponse(
+                {"error": "Invalid provider (must be 'cloud' or 'local')"},
+                status_code=400,
+            )
+
+        # Get the appropriate provider
+        if provider == "cloud":
+            if not _cloud_provider:
+                return JSONResponse(
+                    {
+                        "error": "Cloud provider not available (missing ANTHROPIC_API_KEY?)"
+                    },
+                    status_code=503,
+                )
+            prov = _cloud_provider
+            timeout = mcp.verify_config.verify_cloud_timeout
+        else:
+            if not _local_provider:
+                return JSONResponse(
+                    {
+                        "error": "Local provider not available (Ollama not running?)"
+                    },
+                    status_code=503,
+                )
+            prov = _local_provider
+            timeout = mcp.verify_config.verify_local_timeout
+
+        try:
+            result = await asyncio.wait_for(
+                prov.verify_claim(claim, context),
+                timeout=timeout,
+            )
+            return JSONResponse(result.to_dict(), status_code=200)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"error": f"Verification timed out after {timeout}s"},
+                status_code=504,
+            )
+
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": "Invalid JSON request"},
+            status_code=400,
+        )
+    except Exception as e:
+        log.exception("Verification failed")
+        return JSONResponse(
+            {"error": f"Verification failed: {str(e)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/verify-async", methods=["POST"])
+async def verify_async(request: Request):
+    """Queue an asynchronous claim verification job.
+    
+    Request body:
+    {
+        "claim": "string",
+        "context": "optional string",
+        "provider": "cloud|local"  # defaults to "cloud"
+    }
+    
+    Response:
+    {
+        "job_id": "uuid",
+        "status_url": "/verify-status/{job_id}"
+    }
+    """
+    try:
+        body = await request.json()
+        claim = body.get("claim", "").strip()
+        context = body.get("context", "").strip() or None
+        provider = body.get("provider", "cloud")
+
+        if not claim:
+            return JSONResponse(
+                {"error": "Missing required field: claim"},
+                status_code=400,
+            )
+
+        if provider not in ("cloud", "local"):
+            return JSONResponse(
+                {"error": "Invalid provider (must be 'cloud' or 'local')"},
+                status_code=400,
+            )
+
+        if not mcp.verify_queue:
+            return JSONResponse(
+                {"error": "Verification queue not available"},
+                status_code=503,
+            )
+
+        job_id = mcp.verify_queue.create_job(claim, provider, context)
+
+        return JSONResponse(
+            {
+                "job_id": job_id,
+                "status_url": f"/verify-status/{job_id}",
+            },
+            status_code=202,
+        )
+
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": "Invalid JSON request"},
+            status_code=400,
+        )
+    except Exception as e:
+        log.exception("Queue failed")
+        return JSONResponse(
+            {"error": f"Failed to queue verification: {str(e)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/verify-status/{job_id}", methods=["GET"])
+async def verify_status(request: Request):
+    """Get status of an asynchronous verification job.
+    
+    Response:
+    {
+        "job_id": "uuid",
+        "status": "queued|processing|done|failed",
+        "result": { /* VerifyResult */ } or null,
+        "error": "error message" or null,
+        "created_at": "ISO timestamp",
+        "started_at": "ISO timestamp" or null,
+        "completed_at": "ISO timestamp" or null
+    }
+    """
+    try:
+        job_id = request.path_params.get("job_id", "")
+
+        if not mcp.verify_queue:
+            return JSONResponse(
+                {"error": "Verification queue not available"},
+                status_code=503,
+            )
+
+        status = mcp.verify_queue.get_status(job_id)
+
+        if not status:
+            return JSONResponse(
+                {"error": f"Job not found: {job_id}"},
+                status_code=404,
+            )
+
+        return JSONResponse(status, status_code=200)
+
+    except Exception as e:
+        log.exception("Status lookup failed")
+        return JSONResponse(
+            {"error": f"Status lookup failed: {str(e)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/health/hints", methods=["GET"])
+async def health_with_hints(request: Request) -> JSONResponse:
+    """Health check endpoint with actionable hints for common issues.
+    
+    Response includes:
+    - status: "healthy" or "degraded"
+    - queue_depth: number of verification jobs queued
+    - processing: number of jobs currently processing
+    - completed: total completed jobs
+    - hints: list of actionable recommendations based on metrics
+    
+    Example response:
+    {
+        "status": "healthy",
+        "queue_depth": 5,
+        "processing": 2,
+        "completed": 150,
+        "hints": [
+            "System operating normally"
+        ]
+    }
+    """
+    try:
+        hints = []
+        
+        # Get verification queue metrics
+        verify_metrics = {}
+        if _verify_queue:
+            verify_metrics = _verify_queue.get_metrics()
+        else:
+            verify_metrics = {
+                "queue_depth": 0,
+                "processing": 0,
+                "completed": 0,
+                "failed": 0,
+                "avg_latency": None,
+                "completion_rate": 0,
+            }
+        
+        queue_depth = verify_metrics.get("queue_depth", 0)
+        processing = verify_metrics.get("processing", 0)
+        completed = verify_metrics.get("completed", 0)
+        failed = verify_metrics.get("failed", 0)
+        avg_latency = verify_metrics.get("avg_latency")
+        completion_rate = verify_metrics.get("completion_rate", 0)
+        
+        # Generate hints based on metrics
+        if queue_depth > 50:
+            hints.append("Queue depth is high (>50). Consider increasing VERIFY_MAX_CONCURRENCY.")
+        
+        if avg_latency and avg_latency > 45:
+            hints.append("Average latency is high (>45s). Consider using provider=local instead of cloud.")
+        
+        if failed > 0 and completed > 0:
+            fail_rate = (failed / (failed + completed)) * 100
+            if fail_rate > 10:
+                hints.append("Job failure rate is high (>10%). Check ANTHROPIC_API_KEY validity or Ollama connection.")
+        
+        if completion_rate < 80 and (completed + failed) > 10:
+            hints.append(f"Only {completion_rate}% of jobs completed successfully. Review verification provider configuration.")
+        
+        # Add positive hint if healthy
+        if not hints:
+            hints.append("System operating normally")
+        
+        status = "degraded" if len(hints) > 1 else "healthy"
+        http_status = 503 if status == "degraded" else 200
+        
+        return JSONResponse(
+            {
+                "status": status,
+                "queue_depth": queue_depth,
+                "processing": processing,
+                "completed": completed,
+                "failed": failed,
+                "avg_latency": avg_latency,
+                "completion_rate": completion_rate,
+                "hints": hints,
+            },
+            status_code=http_status,
+        )
+    
+    except Exception as e:
+        log.exception("Health hints endpoint error")
+        return JSONResponse(
+            {"error": f"Failed to get health status: {str(e)}", "hints": []},
+            status_code=500,
+        )
+
+
+
+@mcp.custom_route("/capabilities", methods=["GET"])
+async def get_capabilities(request: Request) -> JSONResponse:
+    """List available reasoning capabilities and configurations.
+    
+    Response includes:
+    - passes: [2, 3, 4, 5, 6] - available pass counts
+    - task_classes: available reasoning modes
+    - providers: configured providers with available models
+    - latency_estimates: estimated latency per pass count and provider
+    
+    Example response:
+    {
+        "passes": [2, 3, 4, 5, 6],
+        "task_classes": [
+            "general", "code_review", "investigation", "safety", "extraction",
+            "synthesis", "reasoning", "data_governance", "research_synthesis"
+        ],
+        "providers": {
+            "anthropic": {
+                "available": true,
+                "models": ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
+            },
+            "ollama": {
+                "available": true,
+                "url": "http://localhost:11434",
+                "models": ["phi4-mini:latest", "qwen3.5:27b", "qwen2.5-coder:7b"]
+            }
+        },
+        "latency_estimates": {
+            "2_passes_cloud": "15-30s",
+            "3_passes_cloud": "30-60s",
+            "2_passes_local": "10-20s"
+        }
+    }
+    """
+    try:
+        cfg = build_provider_config()
+        
+        # Get list of task classes from TASK_CLASS_PROFILES
+        task_classes = list(TASK_CLASS_PROFILES.keys())
+        
+        # Check provider availability
+        providers = {}
+        
+        # Check Anthropic/Copilot availability
+        if os.getenv("ANTHROPIC_API_KEY") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"):
+            providers["anthropic"] = {
+                "available": True,
+                "models": [
+                    "claude-opus-4-1-20250805",
+                    "claude-sonnet-4-20250514",
+                    "claude-opus-4-1",
+                ]
+            }
+            providers["copilot"] = {
+                "available": True,
+                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+            }
+        else:
+            providers["anthropic"] = {"available": False, "models": []}
+            providers["copilot"] = {"available": False, "models": []}
+        
+        # Check Ollama availability
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        ollama_available = False
+        ollama_models = []
+        
+        try:
+            import requests
+            health = requests.get(f"{ollama_url}/api/tags", timeout=2)
+            if health.status_code == 200:
+                ollama_available = True
+                data = health.json()
+                ollama_models = [m.get("name", "") for m in data.get("models", [])][:5]
+        except Exception:
+            pass
+        
+        providers["ollama"] = {
+            "available": ollama_available,
+            "url": ollama_url if ollama_available else None,
+            "models": ollama_models or ["phi4-mini:latest", "qwen3.5:27b", "qwen2.5-coder:7b"]
+        }
+        
+        # Latency estimates
+        latency_estimates = {
+            "2_passes_cloud": "15-30s",
+            "3_passes_cloud": "30-60s",
+            "4_passes_cloud": "60-90s",
+            "5_passes_cloud": "90-120s",
+            "6_passes_cloud": "120-180s",
+            "2_passes_local": "10-20s",
+            "3_passes_local": "20-40s",
+            "4_passes_local": "40-60s",
+            "5_passes_local": "60-80s",
+            "6_passes_local": "80-120s",
+            "fan_out_3x2": "60-120s (3 perspectives × 2 passes)",
+        }
+        
+        return JSONResponse(
+            {
+                "passes": [2, 3, 4, 5, 6],
+                "width_range": [1, 2, 3, 4, 5, 6],
+                "task_classes": task_classes,
+                "providers": providers,
+                "latency_estimates": latency_estimates,
+            },
+            status_code=200,
+        )
+    
+    except Exception as e:
+        log.exception("Capabilities endpoint error")
+        return JSONResponse(
+            {"error": f"Failed to get capabilities: {str(e)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/suggest", methods=["POST"])
+async def suggest_reasoning_config(request: Request) -> JSONResponse:
+    """Smart request routing based on query complexity.
+    
+    Request body:
+    {
+        "query": "user question here",
+        "context": "optional context" (optional),
+        "prefer_local": false (optional, default false)
+    }
+    
+    Response:
+    {
+        "recommended_passes": 3,
+        "task_class": "general",
+        "provider": "cloud",
+        "width": 1,
+        "height": 1,
+        "reasoning": "Query is moderately complex; 3 passes recommended for balanced reasoning time",
+        "estimated_latency": "30-60s"
+    }
+    
+    HTTP 200: Suggestion generated
+    HTTP 400: Invalid input
+    HTTP 500: Internal error
+    """
+    try:
+        body = await request.json()
+        query = body.get("query", "").strip()
+        context = body.get("context", "").strip()
+        prefer_local = body.get("prefer_local", False)
+        
+        if not query:
+            return JSONResponse(
+                {"error": "Missing required field: query"},
+                status_code=400,
+            )
+        
+        # Analyze query complexity
+        query_len = len(query)
+        complexity = "simple"
+        passes = 2
+        task_class = "general"
+        width = 1
+        height = 1
+        
+        # Detect task class from keywords
+        query_lower = query.lower()
+        # Check more specific task classes first
+        if any(keyword in query_lower for keyword in ["investigate", "evidence", "incident", "threat", "attack", "ioc"]):
+            task_class = "investigation"
+        elif any(keyword in query_lower for keyword in ["extract", "parse", "schema", "json", "structure", "entity"]):
+            task_class = "extraction"
+        elif any(keyword in query_lower for keyword in ["write", "summarize", "report", "narrative", "document"]):
+            task_class = "synthesis"
+        elif any(keyword in query_lower for keyword in ["reason", "logic", "math", "complex", "proof", "algorithm"]):
+            task_class = "reasoning"
+        elif any(keyword in query_lower for keyword in ["safe", "risk", "policy", "harm", "guardrail", "compliance"]):
+            task_class = "safety"
+        elif any(keyword in query_lower for keyword in ["code", "bug", "function", "error", "security", "vulnerability"]):
+            task_class = "code_review"
+        
+        # Determine pass count based on complexity
+        if query_len < 100:
+            passes = 2
+            complexity = "simple"
+        elif query_len < 300:
+            passes = 3
+            complexity = "moderate"
+        elif query_len < 800:
+            passes = 4
+            complexity = "complex"
+        else:
+            passes = 5
+            complexity = "very_complex"
+        
+        # Recommend fan-out for complex investigations
+        if task_class in ("investigation", "reasoning") and complexity in ("complex", "very_complex"):
+            width = 3
+            height = 2
+            passes = 1  # height handles pass count in fan-out
+        
+        # Determine provider
+        has_api_key = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"))
+        provider = "cloud" if (has_api_key and not prefer_local) else "local"
+        
+        if not has_api_key:
+            provider = "local"
+        
+        # Estimate latency
+        if width > 1:
+            estimated_latency = f"{60 * width * height}-{120 * width * height}s (fan-out)"
+        else:
+            min_lat = 15 * passes
+            max_lat = 30 * passes
+            estimated_latency = f"{min_lat}-{max_lat}s"
+        
+        reasoning = f"Query is {complexity}; {passes} passes recommended for {'balanced reasoning time' if passes <= 3 else 'thorough analysis'}."
+        if width > 1:
+            reasoning += f" Using {width} perspectives with {height} passes each for multi-angle analysis."
+        
+        return JSONResponse(
+            {
+                "recommended_passes": passes if width == 1 else height,
+                "width": width,
+                "height": height,
+                "task_class": task_class,
+                "provider": provider,
+                "complexity": complexity,
+                "reasoning": reasoning,
+                "estimated_latency": estimated_latency,
+            },
+            status_code=200,
+        )
+    
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": "Invalid JSON request"},
+            status_code=400,
+        )
+    except Exception as e:
+        log.exception("Suggest endpoint error")
+        return JSONResponse(
+            {"error": f"Failed to generate suggestion: {str(e)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/mcp/help/{command}", methods=["GET"])
+async def get_help(request: Request) -> JSONResponse:
+    """Interactive help for common deep-think commands.
+    
+    Supported commands:
+    - verify: Information about claim verification
+    - reason: Information about reasoning passes
+    - review: Information about code review
+    - escalate: Information about escalation mechanisms
+    
+    Response:
+    {
+        "command": "verify",
+        "description": "...",
+        "usage": "...",
+        "example": {...},
+        "common_mistakes": [...]
+    }
+    
+    HTTP 200: Help found
+    HTTP 404: Unknown command
+    HTTP 500: Internal error
+    """
+    try:
+        command = request.path_params.get("command", "").lower()
+        
+        help_docs = {
+            "verify": {
+                "description": "Verify a claim using chain-of-thought reasoning with cloud or local LLMs.",
+                "usage": "POST /verify-queue with {\"claim\": \"...\", \"provider\": \"cloud|local\", \"context\": \"...\"}",
+                "example": {
+                    "request": {
+                        "claim": "Python is a compiled language",
+                        "context": "Programming languages",
+                        "provider": "cloud"
+                    },
+                    "response": {
+                        "job_id": "uuid-string",
+                        "status_url": "/verify-status/uuid-string"
+                    }
+                },
+                "common_mistakes": [
+                    "Missing 'claim' field (required)",
+                    "Using invalid provider (must be 'cloud' or 'local')",
+                    "Not providing context for complex claims",
+                    "Polling status too frequently (recommended: 1-2s interval)"
+                ],
+                "tips": [
+                    "Provide context for grounded verification",
+                    "Use cloud provider for higher accuracy, local for privacy",
+                    "Cache results for identical claims",
+                ]
+            },
+            "reason": {
+                "description": "Run multi-pass reasoning with different framings and models.",
+                "usage": "POST /call/deep_think_async with {\"question\": \"...\", \"passes\": 2-6, \"task_class\": \"...\"}",
+                "example": {
+                    "request": {
+                        "question": "How should I optimize this database query?",
+                        "passes": 3,
+                        "task_class": "code_review"
+                    },
+                    "response": {
+                        "job_id": "uuid-string",
+                        "status": "queued"
+                    }
+                },
+                "common_mistakes": [
+                    "Using passes < 2 or > 6 (clamped to range)",
+                    "Using invalid task_class (check /capabilities for valid options)",
+                    "Not polling for results (jobs run asynchronously)",
+                    "Assuming results available immediately (typical latency: 15-180s)"
+                ],
+                "tips": [
+                    "Use 2-3 passes for quick analysis, 4-6 for deep investigation",
+                    "Match task_class to question type (code_review, investigation, etc.)",
+                    "Enable verify=True for critical decisions requiring extra validation",
+                    "Use provider_config to specify models or Ollama endpoint"
+                ]
+            },
+            "review": {
+                "description": "Perform code review using code_review task class with security focus.",
+                "usage": "POST /call/deep_think_async with {\"question\": \"<code_snippet>\", \"task_class\": \"code_review\"}",
+                "example": {
+                    "request": {
+                        "question": "def authenticate(password): return len(password) > 0",
+                        "task_class": "code_review",
+                        "passes": 3
+                    },
+                    "response": {
+                        "job_id": "uuid-string"
+                    }
+                },
+                "common_mistakes": [
+                    "Not using task_class='code_review' (this enables code specialization)",
+                    "Including too much context (keep focused on review target)",
+                    "Using too few passes (3+ recommended for thorough review)",
+                    "Not enabling verify=True for security-critical code"
+                ],
+                "tips": [
+                    "Use code_review task_class for specialized code analysis",
+                    "Enable verify=True for security review",
+                    "Provide minimal but sufficient context",
+                    "Use 4-6 passes for security-critical code",
+                    "Check /capabilities to see code-specialized models in use"
+                ]
+            },
+            "escalate": {
+                "description": "Escalate unresolved claims to manual review or higher-tier models.",
+                "usage": "Enable verify=True in deep_think_async call, or POST to /verification/escalate",
+                "example": {
+                    "request": {
+                        "claim": "Unresolved claim from reasoning",
+                        "reason": "Confidence too low"
+                    },
+                    "response": {
+                        "escalation_id": "uuid-string",
+                        "status": "escalated"
+                    }
+                },
+                "common_mistakes": [
+                    "Not enabling verify=True when certainty is critical",
+                    "Escalating without trying local reasoning first",
+                    "Assuming escalation = guaranteed correctness"
+                ],
+                "tips": [
+                    "Enable verify=True in reasoning calls for critical decisions",
+                    "Use escalation for confidence scores < 0.7",
+                    "Combine with heavy-tier models for difficult claims",
+                    "Check escalation_status for escalated items"
+                ]
+            }
+        }
+        
+        if command not in help_docs:
+            return JSONResponse(
+                {
+                    "error": f"Unknown command: {command}",
+                    "available_commands": list(help_docs.keys())
+                },
+                status_code=404,
+            )
+        
+        return JSONResponse(help_docs[command], status_code=200)
+    
+    except Exception as e:
+        log.exception("Help endpoint error")
+        return JSONResponse(
+            {"error": f"Failed to get help: {str(e)}"},
             status_code=500,
         )
 

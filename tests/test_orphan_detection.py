@@ -139,7 +139,7 @@ class TestOrphanDetection:
         assert len(orphans) == 0
 
     def test_requeue_orphaned_job(self, test_db, reset_metrics_fixture):
-        """Requeue should reset job status to pending."""
+        """Requeue should reset job status to queued."""
         # Create and claim a job
         job_id = create_job(
             question="test question",
@@ -158,7 +158,7 @@ class TestOrphanDetection:
         
         # Verify job state
         job = get_job(job_id)
-        assert job["status"] == "pending"
+        assert job["status"] == "queued"
         assert job["started_at"] is None
         assert job["claimed_by"] is None
         assert job["claimed_at"] is None
@@ -268,7 +268,7 @@ class TestOrphanRequeue:
         queued = get_job(queued_job_id)
         
         assert active["status"] == "running"  # Still running
-        assert inactive["status"] == "pending"  # Requeued
+        assert inactive["status"] == "queued"  # Requeued
         assert queued["status"] == "queued"  # Still queued
 
     def test_requeue_stale_at_startup(self, test_db, reset_metrics_fixture):
@@ -464,7 +464,7 @@ class TestEdgeCases:
         job = get_job(job_id)
         assert job["claimed_by"] is None
         assert job["claimed_at"] is None
-        assert job["status"] == "pending"
+        assert job["status"] == "queued"
 
 
 

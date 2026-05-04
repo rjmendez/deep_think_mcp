@@ -67,7 +67,7 @@ This enables:
 2. Detect orphaned jobs
 3. For each orphan:
    - Log warning with job ID, claimed_by, claimed_at
-   - Requeue by resetting status='pending'
+   - Requeue by resetting status='queued'
    - Update metrics
 4. Repeat
 
@@ -150,7 +150,7 @@ Time 5: Watchdog checks job
         - Worker 'worker-1234' not responding
         - Orphan detected! ✓
 Time 5+: Watchdog requeues job
-         - Sets status='pending' (not 'queued', preserves queue order)
+         - Sets status='queued'
          - Clears claimed_by, claimed_at, started_at
          - Job ready for next available worker ✓
 Time 6: Different worker claims requeued job and executes

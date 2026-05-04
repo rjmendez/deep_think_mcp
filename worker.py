@@ -149,7 +149,7 @@ async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
     
     Runs continuously, checking every check_interval_seconds for jobs stuck in
     'running' state beyond the orphan timeout threshold. When found, requeues
-    them by resetting status='pending' and logging the event with metrics.
+    them by resetting status='queued' and logging the event with metrics.
     """
     log.info("Orphan watchdog started (check interval=%ds)", check_interval_seconds)
     m = metrics.get_metrics()
