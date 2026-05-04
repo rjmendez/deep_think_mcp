@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 from ..adversarial_testing.implementation_pipeline import ImplementationPipeline
 from ..adversarial_testing.deployment_pipeline import DeploymentPipeline
 from ..adversarial_testing.metrics import MetricsCollector
-from .. import adversarial_store
+from .. import adversarial_testing
 
 log = logging.getLogger(__name__)
 
@@ -398,7 +398,7 @@ def register(mcp):
                 "ADVERSARIAL_DB",
                 str(__import__("pathlib").Path.home() / ".deep_think" / "adversarial.db"),
             )
-            store_instance = adversarial_store.AdversarialStore(adversarial_db)
+            store_instance = adversarial_testing.store.AdversarialStore(adversarial_db)
             
             validation_result = store_instance.execute(
                 "SELECT status FROM validation_results WHERE id = ?",

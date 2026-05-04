@@ -16,7 +16,7 @@ def register_routes(mcp):
         mcp: FastMCP application instance
     """
     # Import route modules (deferred to avoid circular imports)
-    from . import health, reasoning, verify, self_improvement, mcp_routes, mqtt
+    from . import health, reasoning, verify, self_improvement, mcp as mcp_module, mqtt
     
     log.info("Registering health routes...")
     health.register(mcp)
@@ -31,7 +31,7 @@ def register_routes(mcp):
     self_improvement.register(mcp)
     
     log.info("Registering MCP routes...")
-    mcp_routes.register(mcp)
+    mcp_module.register(mcp)
     
     log.info("Registering MQTT routes...")
     mqtt.register(mcp)
