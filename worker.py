@@ -17,6 +17,7 @@ import os
 from . import engine, store
 from .engine.creative import CreativeReasoningEngine
 from .nova_factcheck.pipeline import VerificationPipeline
+from . import metrics
 
 _NOVA_VERIFY_ENABLED = os.getenv("DEEP_THINK_NOVA_VERIFY", "true").lower() not in ("0", "false", "no")
 _verification_pipeline = VerificationPipeline(enabled=_NOVA_VERIFY_ENABLED)
@@ -118,6 +119,51 @@ async def _run_job(job: dict) -> None:
         log.error("Job %s failed: %s", job_id, error_msg)
 
 
+async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
+    """Background watchdog that detects and requeues orphaned jobs.
+    
+    Runs continuously, checking every check_interval_seconds for jobs stuck in
+    'running' state beyond the orphan timeout threshold. When found, requeues
+    them by resetting status='pending' and logging the event with metrics.
+    """
+    log.info("Orphan watchdog started (check interval=%ds)", check_interval_seconds)
+    m = metrics.get_metrics()
+    
+    while True:
+        try:
+            await asyncio.sleep(check_interval_seconds)
+            
+            orphans = await asyncio.to_thread(store.detect_orphaned_jobs)
+            if not orphans:
+                continue
+            
+            log.warning("Detected %d orphaned job(s)", len(orphans))
+            m.increment_orphaned_jobs_detected()
+            
+            for orphan in orphans:
+                job_id = orphan["job_id"]
+                claimed_by = orphan.get("claimed_by", "unknown")
+                claimed_at = orphan.get("claimed_at", "unknown")
+                
+                try:
+                    requeued = await asyncio.to_thread(
+                        store.requeue_orphaned_job,
+                        job_id,
+                        "timeout"
+                    )
+                    if requeued:
+                        log.warning(
+                            "Requeued orphaned job %s (claimed_by=%s at %s)",
+                            job_id, claimed_by, claimed_at
+                        )
+                        m.increment_orphaned_jobs_requeued()
+                except Exception as exc:
+                    log.error("Failed to requeue orphaned job %s: %s", job_id, exc)
+        
+        except Exception as exc:
+            log.error("Orphan watchdog error (will continue): %s", exc)
+
+
 async def worker_loop(max_concurrency: int = 0) -> None:
     """Continuously claim and execute queued thinking jobs."""
     if max_concurrency <= 0:
@@ -128,8 +174,13 @@ async def worker_loop(max_concurrency: int = 0) -> None:
         log.info("Requeued %d stale job(s) from prior run", stale)
 
     log.info("Worker loop started (max_concurrency=%d)", max_concurrency)
+    
+    # Start background orphan watchdog
+    watchdog_task = asyncio.create_task(_orphan_watchdog())
+    _active_tasks.add(watchdog_task)
 
     active = 0
+    worker_id = f"worker-{os.getpid()}"
 
     while True:
         if active >= max_concurrency:
@@ -137,7 +188,7 @@ async def worker_loop(max_concurrency: int = 0) -> None:
             continue
 
         try:
-            job = await asyncio.to_thread(store.claim_next_job)
+            job = await asyncio.to_thread(store.claim_next_job, worker_id)
         except Exception as exc:
             log.error("claim_next_job failed (will retry): %s", exc)
             await asyncio.sleep(2.0)
