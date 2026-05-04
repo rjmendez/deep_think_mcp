@@ -478,7 +478,7 @@ spec:
 
       # SIDECAR: MQTT Novelty Handler
       - name: mqtt-novelty-handler
-        image: deep-think-mcp:mqtt-novelty-latest
+        image: deep-think-mcp:v2.0.0
         imagePullPolicy: IfNotPresent
         
         env:
