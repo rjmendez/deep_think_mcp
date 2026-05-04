@@ -415,6 +415,13 @@ def _default_for_provider(provider: str, tier: str) -> str:
     return _OLLAMA_DEFAULTS.get(tier, _OLLAMA_DEFAULTS["heavy"])
 
 
+def _is_valid_anthropic_model(model_name: str) -> bool:
+    """Check if model name is valid Anthropic format: claude-{version}-{YYYYMMDD}."""
+    if not model_name or not model_name.startswith("claude-"):
+        return False
+    return bool(re.search(r'-\d{8}$', model_name))
+
+
 def _model_for_tier(
     cfg: ProviderConfig,
     tier: str,
@@ -494,6 +501,12 @@ def _profile_model(task_class: str, provider: str, tier: str) -> str:
     if not preferred:
         return ""
 
+    # For anthropic: validate model name format (must be claude-{version}-{YYYYMMDD})
+    if provider == "anthropic":
+        if not _is_valid_anthropic_model(preferred):
+            log.debug("Profile model %s is not valid Anthropic model format, skipping", preferred)
+            return ""
+    
     # For ollama: validate against discovery cache, or legacy _ollama_discovered set
     if provider == "ollama":
         if disc:
