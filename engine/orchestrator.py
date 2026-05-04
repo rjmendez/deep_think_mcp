@@ -563,6 +563,8 @@ Use the mandate to structure your response. Be precise and evidence-based."""
             log.info(f"Pass {pass_num} complete ({framing_name})")
         
         except Exception as e:
+            with open("/tmp/deep_think_debug.log", "a") as f:
+                f.write(f"Exception in _call_provider: {type(e).__name__}: {str(e)[:200]}\n")
             log.error(f"Pass {pass_num} failed: {e}")
             pass_outputs.append(f"[ERROR: {e}]")
             validation_results.append(None)
