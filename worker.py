@@ -133,7 +133,9 @@ async def _run_job(job: dict) -> None:
 
         # Nova fact-check: enrich result with verification_results and adjusted confidence
         try:
-            result = await _verification_pipeline.run(result, job_id=job_id)
+            result = await asyncio.wait_for(_verification_pipeline.run(result, job_id=job_id), timeout=30.0)
+        except asyncio.TimeoutError:
+            log.warning("Nova verification pipeline timed out for job %s (non-fatal)", job_id)
         except Exception as vexc:
             log.warning("Nova verification pipeline failed for job %s (non-fatal): %s", job_id, vexc)
 
@@ -192,7 +194,11 @@ async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
 async def worker_loop(max_concurrency: int = 0) -> None:
     """Continuously claim and execute queued thinking jobs."""
     if max_concurrency <= 0:
-        max_concurrency = int(os.getenv("DEEP_THINK_MAX_CONCURRENCY", "2"))
+        cpu_count = os.cpu_count() or 4
+        max_concurrency = max(
+            int(os.getenv("DEEP_THINK_MAX_CONCURRENCY", str(max(4, cpu_count)))),
+            4
+        )
 
     stale = await asyncio.to_thread(store.requeue_stale)
     if stale:

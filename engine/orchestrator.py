@@ -46,10 +46,13 @@ def _extract_claims_from_pass_output(output: str) -> list[dict]:
     claim_counter = 0
     
     # Pattern 1: "CLAIM: ... [CONFIDENCE: X%]"
-    claim_pattern = r"(?i)claim:\s*(.+?)(?:\s+\[confidence:\s*(\d+)%\])?$"
-    for match in re.finditer(claim_pattern, output):
+    # Use lookahead to avoid stopping at brackets in the claim text
+    claim_pattern = r"(?i)claim:\s*(.+?)(?=\s*\[confidence:\s*\d+%\]|$)"
+    for match in re.finditer(claim_pattern, output, re.MULTILINE):
         text = match.group(1).strip()
-        conf = int(match.group(2)) / 100 if match.group(2) else 0.5
+        # Extract confidence if present
+        conf_match = re.search(r"\[confidence:\s*(\d+)%\]", output[match.end():match.end()+100], re.IGNORECASE)
+        conf = int(conf_match.group(1)) / 100 if conf_match else 0.5
         
         claim_data = _build_claim_data(
             statement=text,
@@ -61,11 +64,14 @@ def _extract_claims_from_pass_output(output: str) -> list[dict]:
         claim_counter += 1
     
     # Pattern 2: "(✓) ... [N% confidence]" or "(✗) ... [N% confidence]"
-    checkmark_pattern = r"\(([✓✗])\)\s*(.+?)(?:\s+\[(\d+)%\s+confidence\])?$"
-    for match in re.finditer(checkmark_pattern, output):
+    # Use lookahead to handle brackets in claim text properly
+    checkmark_pattern = r"\(([✓✗])\)\s*(.+?)(?=\s*\[\d+%\s+confidence\]|$)"
+    for match in re.finditer(checkmark_pattern, output, re.MULTILINE):
         status = match.group(1)
         text = match.group(2).strip()
-        conf = int(match.group(3)) / 100 if match.group(3) else (0.7 if status == "✓" else 0.3)
+        # Extract confidence if present
+        conf_match = re.search(r"\[(\d+)%\s+confidence\]", output[match.end():match.end()+100])
+        conf = int(conf_match.group(1)) / 100 if conf_match else (0.7 if status == "✓" else 0.3)
         
         claim_data = _build_claim_data(
             statement=text,

@@ -93,6 +93,7 @@ from .adversarial_testing import store as adversarial_store
 from .verify.config import load_config as load_verify_config
 from .verify.provider import CloudProvider, LocalProvider
 from .verify.queue import VerifyJobQueue, VerifyWorker
+from . import mcp_help
 
 log = logging.getLogger(__name__)
 
@@ -1553,8 +1554,6 @@ async def health_with_hints(request: Request) -> JSONResponse:
     }
     """
     try:
-        hints = []
-        
         # Get verification queue metrics
         verify_metrics = {}
         if _verify_queue:
@@ -1576,24 +1575,8 @@ async def health_with_hints(request: Request) -> JSONResponse:
         avg_latency = verify_metrics.get("avg_latency")
         completion_rate = verify_metrics.get("completion_rate", 0)
         
-        # Generate hints based on metrics
-        if queue_depth > 50:
-            hints.append("Queue depth is high (>50). Consider increasing VERIFY_MAX_CONCURRENCY.")
-        
-        if avg_latency and avg_latency > 45:
-            hints.append("Average latency is high (>45s). Consider using provider=local instead of cloud.")
-        
-        if failed > 0 and completed > 0:
-            fail_rate = (failed / (failed + completed)) * 100
-            if fail_rate > 10:
-                hints.append("Job failure rate is high (>10%). Check ANTHROPIC_API_KEY validity or Ollama connection.")
-        
-        if completion_rate < 80 and (completed + failed) > 10:
-            hints.append(f"Only {completion_rate}% of jobs completed successfully. Review verification provider configuration.")
-        
-        # Add positive hint if healthy
-        if not hints:
-            hints.append("System operating normally")
+        # Generate hints using mcp_help module
+        hints = mcp_help.generate_hints(verify_metrics)
         
         status = "degraded" if len(hints) > 1 else "healthy"
         http_status = 503 if status == "degraded" else 200
