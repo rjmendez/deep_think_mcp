@@ -183,8 +183,11 @@ async def _lifespan(app):
     
     discovery_task = None
     if _ollama_in_use():
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        discovery_task = asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
+        base_url = os.getenv("OLLAMA_BASE_URL", "")
+        if not base_url:
+            log.error("Ollama provider configured but OLLAMA_BASE_URL not set")
+        else:
+            discovery_task = asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
     else:
         log.info("No Ollama provider in use — skipping model discovery")
     worker_task = asyncio.create_task(worker.worker_loop())
