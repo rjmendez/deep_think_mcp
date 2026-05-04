@@ -65,6 +65,7 @@ class ImplementationPipeline:
         self.git_repo_root = git_repo_root
         self.code_review_endpoint = code_review_agent_endpoint
         self.impl_agent_endpoint = impl_agent_endpoint
+        self.store = store
 
     async def start_implementation(
         self, plan_id: str, skip_approval: bool = False
@@ -77,7 +78,7 @@ class ImplementationPipeline:
         """
         try:
             # Fetch plan details
-            conn = store._connect()
+            conn = self.store._connect()
             try:
                 plan = conn.execute(
                     "SELECT * FROM self_improvement_plans WHERE id = ?",
@@ -147,32 +148,42 @@ class ImplementationPipeline:
 
             # Update plan status
             timestamp = datetime.utcnow().isoformat()
-            self.store.execute(
-                """
-                UPDATE self_improvement_plans
-                SET status = 'implementing', deployment_sha = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (commit_sha, timestamp, plan_id),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE self_improvement_plans
+                    SET status = 'implementing', deployment_sha = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (commit_sha, timestamp, plan_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             # Log in audit trail
-            self.store.execute(
-                """
-                INSERT INTO adversarial_audit_log (event, details, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    "implementation_started",
-                    json.dumps({
-                        "plan_id": plan_id,
-                        "branch": branch_name,
-                        "commit_sha": commit_sha,
-                        "task_count": len(tasks)
-                    }),
-                    timestamp,
-                ),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO layer5_audit_log (event, details, timestamp)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        "implementation_started",
+                        json.dumps({
+                            "plan_id": plan_id,
+                            "branch": branch_name,
+                            "commit_sha": commit_sha,
+                            "task_count": len(tasks)
+                        }),
+                        timestamp,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             logger.info(
                 f"Implementation started for plan {plan_id} on branch {branch_name} "
@@ -190,21 +201,25 @@ class ImplementationPipeline:
         plan_data = json.loads(plan_json)
         estimated_tokens = plan_data.get("estimated_cost_tokens", 5000)
 
-        # Query current budget usage
-        budget_row = self.store.execute(
-            """
-            SELECT daily_tokens_used, daily_token_limit, monthly_cost, monthly_budget
-            FROM adversarial_budget
-            ORDER BY timestamp DESC LIMIT 1
-            """
-        ).fetchone()
+        # Query current budget usage - use correct column names
+        conn = self.store._connect()
+        try:
+            budget_row = conn.execute(
+                """
+                SELECT tokens_used
+                FROM adversarial_budget
+                ORDER BY date DESC LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            conn.close()
 
         if not budget_row:
             # No budget tracking yet, allow with default limits
             return True, ""
 
-        daily_limit = budget_row.get("daily_token_limit", self.DEFAULT_DAILY_TOKEN_LIMIT)
-        daily_used = budget_row.get("daily_tokens_used", 0)
+        daily_used = budget_row[0] if budget_row else 0
+        daily_limit = self.DEFAULT_DAILY_TOKEN_LIMIT
 
         if daily_used + estimated_tokens > daily_limit:
             return (
@@ -255,14 +270,19 @@ class ImplementationPipeline:
             timestamp = datetime.utcnow().isoformat()
 
             # Record task in database
-            self.store.execute(
-                """
-                INSERT INTO implementation_tasks 
-                (id, plan_id, task_description, status, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (task_id, plan_id, task_description, "in_progress", timestamp),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO implementation_tasks 
+                    (id, plan_id, task_description, status, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (task_id, plan_id, task_description, "in_progress", timestamp),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             # Call implementation agent
             # This is a placeholder - in reality, would call the general-purpose agent
@@ -271,14 +291,19 @@ class ImplementationPipeline:
             logger.info(f"Implementing task {task_id}: {task_description}")
 
             # Mark task as complete
-            self.store.execute(
-                """
-                UPDATE implementation_tasks
-                SET status = 'completed', completed_at = ?
-                WHERE id = ?
-                """,
-                (datetime.utcnow().isoformat(), task_id),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE implementation_tasks
+                    SET status = 'completed', completed_at = ?
+                    WHERE id = ?
+                    """,
+                    (datetime.utcnow().isoformat(), task_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             return True, None
 
@@ -389,57 +414,65 @@ class ImplementationPipeline:
 
     async def get_implementation_status(self, plan_id: str) -> Optional[Dict[str, Any]]:
         """Get current implementation status for a plan"""
-        plan = self.store.execute(
-            "SELECT * FROM self_improvement_plans WHERE id = ?",
-            (plan_id,),
-        ).fetchone()
+        conn = self.store._connect()
+        try:
+            plan = conn.execute(
+                "SELECT * FROM self_improvement_plans WHERE id = ?",
+                (plan_id,),
+            ).fetchone()
 
-        if not plan:
-            return None
+            if not plan:
+                return None
 
-        tasks = self.store.execute(
-            """
-            SELECT id, task_description, status, completed_at
-            FROM implementation_tasks
-            WHERE plan_id = ?
-            ORDER BY created_at
-            """,
-            (plan_id,),
-        ).fetchall()
+            tasks = conn.execute(
+                """
+                SELECT id, task_description, status, completed_at
+                FROM implementation_tasks
+                WHERE plan_id = ?
+                ORDER BY created_at
+                """,
+                (plan_id,),
+            ).fetchall()
 
-        return {
-            "plan_id": plan_id,
-            "status": plan["status"],
-            "commit_sha": plan.get("deployment_sha"),
-            "tasks": tasks,
-            "created_at": plan["created_at"],
-        }
+            return {
+                "plan_id": plan_id,
+                "status": plan[1],  # status column
+                "commit_sha": plan[4] if len(plan) > 4 else None,  # deployment_sha
+                "tasks": [dict(t) for t in tasks],
+                "created_at": plan[3],
+            }
+        finally:
+            conn.close()
 
     async def pause_implementation(self, plan_id: str, reason: str) -> bool:
         """Pause implementation (e.g., due to budget limits)"""
         try:
             timestamp = datetime.utcnow().isoformat()
 
-            self.store.execute(
-                """
-                UPDATE self_improvement_plans
-                SET status = 'paused', updated_at = ?
-                WHERE id = ?
-                """,
-                (timestamp, plan_id),
-            )
-
-            self.store.execute(
-                """
-                INSERT INTO adversarial_audit_log (event, details, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    "implementation_paused",
-                    json.dumps({"plan_id": plan_id, "reason": reason}),
-                    timestamp,
-                ),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE self_improvement_plans
+                    SET status = 'paused', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, plan_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO layer5_audit_log (event, details, timestamp)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        "implementation_paused",
+                        json.dumps({"plan_id": plan_id, "reason": reason}),
+                        timestamp,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             logger.info(f"Implementation paused for plan {plan_id}: {reason}")
             return True
@@ -453,26 +486,30 @@ class ImplementationPipeline:
         try:
             timestamp = datetime.utcnow().isoformat()
 
-            self.store.execute(
-                """
-                UPDATE self_improvement_plans
-                SET status = 'approved', updated_at = ?
-                WHERE id = ? AND status = 'paused'
-                """,
-                (timestamp, plan_id),
-            )
-
-            self.store.execute(
-                """
-                INSERT INTO adversarial_audit_log (event, details, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    "implementation_resumed",
-                    json.dumps({"plan_id": plan_id}),
-                    timestamp,
-                ),
-            )
+            conn = self.store._connect()
+            try:
+                conn.execute(
+                    """
+                    UPDATE self_improvement_plans
+                    SET status = 'approved', updated_at = ?
+                    WHERE id = ? AND status = 'paused'
+                    """,
+                    (timestamp, plan_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO layer5_audit_log (event, details, timestamp)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        "implementation_resumed",
+                        json.dumps({"plan_id": plan_id}),
+                        timestamp,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
             logger.info(f"Implementation resumed for plan {plan_id}")
             return True

@@ -591,3 +591,77 @@ def get_and_increment_rate_window(window_key: str, window_duration_seconds: int)
             return 1
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# General query execution helper (for validation suite)
+# ---------------------------------------------------------------------------
+
+
+def execute_query(query: str, params: tuple = ()):
+    """Execute a query and return result or cursor for iteration.
+    
+    Args:
+        query: SQL query string
+        params: Query parameters tuple
+        
+    Returns:
+        Cursor result set
+    """
+    conn = _connect()
+    try:
+        return conn.execute(query, params)
+    finally:
+        conn.close()
+
+
+def execute_update(query: str, params: tuple = ()) -> int:
+    """Execute an update/insert/delete query.
+    
+    Args:
+        query: SQL query string
+        params: Query parameters tuple
+        
+    Returns:
+        Number of rows affected
+    """
+    conn = _connect()
+    try:
+        cursor = conn.execute(query, params)
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        conn.close()
+
+
+class AdversarialStore:
+    """Wrapper for adversarial store operations.
+    
+    Provides an execute() method for direct SQL queries needed by
+    deployment and other components.
+    """
+    
+    def __init__(self, db_path: Optional[str] = None):
+        """Initialize store with optional custom database path."""
+        if db_path:
+            import os
+            os.environ["ADVERSARIAL_DB"] = db_path
+    
+    def execute(self, query: str, params: tuple = ()):
+        """Execute a SQL query and return results.
+        
+        Args:
+            query: SQL query string
+            params: Query parameters tuple
+            
+        Returns:
+            Cursor object with fetchone(), fetchall() methods
+        """
+        conn = _connect()
+        # Note: connection is left open - caller must handle resource cleanup
+        # or use in context manager
+        return conn.execute(query, params)
+    
+    def close(self):
+        """Close any open connections - no-op for this implementation."""
+        pass

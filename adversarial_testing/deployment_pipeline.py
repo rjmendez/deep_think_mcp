@@ -131,7 +131,7 @@ class DeploymentPipeline:
                 )
 
                 event = DeploymentEvent(
-                    stage=DeploymentStage[f"CANARY_{stage_name.upper()}"],
+                    stage=self._get_deployment_stage(stage_name),
                     timestamp=datetime.utcnow(),
                     metrics_snapshot=metrics,
                     error_rate=metrics.get("error_rate", 0),
@@ -415,6 +415,15 @@ class DeploymentPipeline:
         except Exception as e:
             logger.warning(f"Exception creating tag: {e}")
             return False
+
+    def _get_deployment_stage(self, stage_name: str) -> DeploymentStage:
+        """Map stage name to DeploymentStage enum"""
+        stage_mapping = {
+            "5pct": DeploymentStage.CANARY_5PCT,
+            "25pct": DeploymentStage.GRADUAL_25PCT,
+            "100pct": DeploymentStage.FULL_100PCT,
+        }
+        return stage_mapping.get(stage_name, DeploymentStage.PENDING)
 
     async def get_deployment_status(
         self, deployment_id: str

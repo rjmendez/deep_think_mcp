@@ -10,10 +10,10 @@ import asyncio
 import logging
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass
 
-from adversarial_testing.store import AdversarialStore
+from adversarial_testing import store
 from adversarial_testing.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -47,12 +47,10 @@ class ValidationSuite:
 
     def __init__(
         self,
-        store: AdversarialStore,
         metrics: MetricsCollector,
         git_repo_root: str = "/home/USER/development/deep_think_mcp",
         test_command: str = "pytest --cov=adversarial_testing adversarial_testing/tests/",
     ):
-        self.store = store
         self.metrics = metrics
         self.git_repo_root = git_repo_root
         self.test_command = test_command
@@ -74,7 +72,7 @@ class ValidationSuite:
                 return False, "Failed to get baseline metrics", {}
 
             # Fetch plan details for severity check
-            plan = self.store.execute(
+            plan = store.execute_query(
                 "SELECT * FROM self_improvement_plans WHERE id = ?",
                 (plan_id,),
             ).fetchone()
@@ -119,7 +117,7 @@ class ValidationSuite:
             validation_id = str(uuid.uuid4())
             timestamp = datetime.utcnow().isoformat()
 
-            self.store.execute(
+            store.execute_update(
                 """
                 INSERT INTO validation_results 
                 (id, plan_id, implementation_id, test_output, before_metrics, after_metrics,
@@ -142,7 +140,7 @@ class ValidationSuite:
 
             # Update plan status
             new_status = "validating" if passed else "validation_failed"
-            self.store.execute(
+            store.execute_update(
                 """
                 UPDATE self_improvement_plans
                 SET status = ?, updated_at = ?
@@ -160,7 +158,7 @@ class ValidationSuite:
                 "passed": passed,
             }
 
-            self.store.execute(
+            store.execute_update(
                 """
                 INSERT INTO adversarial_audit_log (event, details, timestamp)
                 VALUES (?, ?, ?)
@@ -406,7 +404,7 @@ class ValidationSuite:
 
     async def get_validation_results(self, plan_id: str) -> Optional[Dict[str, Any]]:
         """Get validation results for a plan"""
-        results = self.store.execute(
+        results = store.execute_query(
             """
             SELECT * FROM validation_results
             WHERE plan_id = ?
