@@ -129,6 +129,71 @@ def init_db() -> None:
                 count               INTEGER NOT NULL DEFAULT 0,
                 reset_at            TEXT NOT NULL
             );
+
+            -- Layer 5 Self-Improvement System Tables
+            CREATE TABLE IF NOT EXISTS self_improvement_plans (
+                id                  TEXT PRIMARY KEY,
+                finding_ids         TEXT NOT NULL,  -- JSON array of finding IDs
+                plan_json           TEXT NOT NULL,  -- Full deep_think response
+                priority            REAL NOT NULL,
+                effort_estimate     INTEGER NOT NULL,
+                risk_level          TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                approved_by         TEXT,
+                deployment_sha      TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS implementation_tasks (
+                id                  TEXT PRIMARY KEY,
+                plan_id             TEXT NOT NULL,
+                task_description    TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                implementation_notes TEXT NOT NULL DEFAULT '',
+                commit_sha          TEXT,
+                created_at          TEXT NOT NULL,
+                completed_at        TEXT,
+                FOREIGN KEY (plan_id) REFERENCES self_improvement_plans(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS validation_results (
+                id                  TEXT PRIMARY KEY,
+                plan_id             TEXT NOT NULL,
+                implementation_id   TEXT NOT NULL,
+                test_output         TEXT NOT NULL,
+                before_metrics      TEXT NOT NULL,  -- JSON metrics snapshot
+                after_metrics       TEXT NOT NULL,  -- JSON metrics snapshot
+                regression_detected INTEGER NOT NULL DEFAULT 0,
+                improvement_score   REAL NOT NULL DEFAULT 0.0,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                created_at          TEXT NOT NULL,
+                FOREIGN KEY (plan_id) REFERENCES self_improvement_plans(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS deployment_events (
+                id                  TEXT PRIMARY KEY,
+                plan_id             TEXT NOT NULL,
+                commit_sha          TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                FOREIGN KEY (plan_id) REFERENCES self_improvement_plans(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS layer5_audit_log (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                event               TEXT NOT NULL,
+                plan_id             TEXT,
+                finding_id          TEXT,
+                details             TEXT NOT NULL DEFAULT '{}',
+                timestamp           TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_self_improvement_status ON self_improvement_plans(status);
+            CREATE INDEX IF NOT EXISTS idx_implementation_tasks_plan ON implementation_tasks(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_validation_results_plan ON validation_results(plan_id);
+            CREATE INDEX IF NOT EXISTS idx_deployment_events_plan ON deployment_events(plan_id);
             """
         )
         conn.commit()
