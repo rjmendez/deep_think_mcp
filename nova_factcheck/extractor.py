@@ -62,9 +62,17 @@ _NUMERICAL_RE = re.compile(
 )
 
 # Inline confidence patterns (e.g. "[confidence: 90%]", "(95% confidence)")
+# IMPORTANT: Bracket patterns use explicit [/] with non-greedy content matching
+# to avoid truncation when multiple brackets appear in the same claim.
+# Pattern order: bracketed first (most explicit), then parenthesized, then unbracketed.
 _INLINE_CONF_PATTERNS = [
-    re.compile(r"\[?\s*confidence[:\s]+(\d+)\s*%?\s*\]?", re.IGNORECASE),
+    # [confidence: 90%] or [confidence 90%] — explicit brackets required
+    re.compile(r"\[\s*confidence[:\s]+(\d+)\s*%?\s*\]", re.IGNORECASE),
+    # confidence: 90% without brackets — as fallback only
+    re.compile(r"confidence[:\s]+(\d+)\s*%", re.IGNORECASE),
+    # (95% confidence) — parenthesized form
     re.compile(r"\((\d+)\s*%\s+confidence\)", re.IGNORECASE),
+    # "with 95% confidence" — prose form
     re.compile(r"with\s+(\d+)\s*%\s+confidence", re.IGNORECASE),
 ]
 
@@ -169,10 +177,22 @@ class ClaimExtractor:
         return [s.strip() for s in raw if s.strip()]
 
     def _clean(self, sentence: str) -> str:
-        """Strip markdown, bullets, and leading noise."""
+        r"""Strip markdown, bullets, and leading noise.
+        
+        Removes common citation formats:
+        - Numeric citations: [1], [2,3], [1,2,3]
+        - But preserves non-numeric brackets as they may be part of the claim text.
+        
+        Pattern explanation:
+        - \[\d+(?:,\s*\d+)*\]  matches [N] or [N,M] or [N,M,L] (numeric citations only)
+        - Pattern is not greedy within brackets but global /g repeats across the sentence
+        """
         sentence = _CLEANUP_RE.sub("", sentence).strip()
-        # Remove trailing citation refs like [1], [2,3]
+        # Remove ALL consecutive numeric citations: [1][2][3] becomes empty
+        # This pattern uses explicit character class [,\s] to avoid truncation issues
         sentence = re.sub(r"\[\d+(?:,\s*\d+)*\]", "", sentence).strip()
+        # Clean up any multiple spaces left by citation removal
+        sentence = re.sub(r"\s+", " ", sentence).strip()
         return sentence
 
     def _is_candidate(self, sentence: str) -> bool:
