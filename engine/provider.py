@@ -539,47 +539,47 @@ def _default_for_provider(provider: str, tier: str) -> str:
 
 
 def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general") -> str:
-    """Resolve model ID with full precedence chain.
-
-    Priority:
-      1. cfg.model — single override for all tiers
-      2. cfg.light / .medium / .heavy — explicit per-tier call override
-      3. DEEP_THINK_{PROVIDER}_{TIER} env var
-      4. Task class profile recommendation (validated against discovery)
-      5. Dynamically-discovered tier assignment from run_discovery()
-      6. Built-in provider default (static fallback)
-    """
+    """Resolve model ID with full precedence chain."""
     # 1. Single override
     if cfg.model:
+        log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
         return cfg.model
     # 2. Explicit per-tier call override
     call_override = getattr(cfg, tier, "")
     if call_override:
+        log.info(f"_model_for_tier: Using call_override for {tier}={call_override}")
         return call_override
     # 3. Env var override
     provider = _tier_provider(cfg, tier)
     if provider == "anthropic":
         env_val = os.getenv(f"DEEP_THINK_ANTHROPIC_{tier.upper()}", "")
         if env_val:
+            log.info(f"_model_for_tier: Using env var for anthropic/{tier}={env_val}")
             return env_val
     elif provider == "copilot":
         env_val = os.getenv(f"DEEP_THINK_COPILOT_{tier.upper()}", "")
         if env_val:
+            log.info(f"_model_for_tier: Using env var for copilot/{tier}={env_val}")
             return env_val
     else:
         env_val = os.getenv(f"DEEP_THINK_MODEL_{tier.upper()}", "")
         if env_val:
+            log.info(f"_model_for_tier: Using env var for {provider}/{tier}={env_val}")
             return env_val
     # 4. Task class profile recommendation
     profile_model = _profile_model(task_class, provider, tier)
     if profile_model:
+        log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
         return profile_model
     # 5. Dynamically-discovered assignment
     discovered = _discovered_tier_model(provider, tier)
     if discovered:
+        log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={discovered}")
         return discovered
     # 6. Built-in provider default
-    return _default_for_provider(provider, tier)
+    default = _default_for_provider(provider, tier)
+    log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")
+    return default
 
 
 def _profile_model(task_class: str, provider: str, tier: str) -> str:
