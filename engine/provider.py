@@ -248,15 +248,7 @@ async def _call_anthropic(
     """Call Anthropic Claude API."""
     timeout = _timeout_for(tier)
     
-    import sys
-    # Verify key is valid
-    if not api_key or not api_key.startswith("sk-ant"):
-        print(f"CRITICAL: Invalid API key format! key={api_key}", file=sys.stderr)
-    
-    print(f"DEBUG _call_anthropic: key={api_key[:30]}..., model={model}, timeout={timeout}", file=sys.stderr)
-    
     async with httpx.AsyncClient(timeout=timeout) as client:
-        print(f"DEBUG: Making request to https://api.anthropic.com/v1/messages", file=sys.stderr)
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -271,7 +263,6 @@ async def _call_anthropic(
                 "messages": [{"role": "user", "content": user_prompt}],
             },
         )
-        print(f"DEBUG: Response status = {response.status_code}, headers={dict(list(response.headers.items())[:3])}", file=sys.stderr)
         response.raise_for_status()
         result = response.json()
         return result["content"][0]["text"]
@@ -347,14 +338,9 @@ async def _call_provider(
     """Route to appropriate provider call."""
     provider_config = provider_config or {}
     
-    with open("/tmp/deep_think_debug.log", "a") as f:
-        f.write(f"_call_provider: provider={provider}, config_has_key={'anthropic_api_key' in provider_config}\n")
-    
     if provider == "anthropic":
         # Try config first, then env/file
         api_key = provider_config.get("anthropic_api_key") or _read_credential("anthropic", "api_key")
-        with open("/tmp/deep_think_debug.log", "a") as f:
-            f.write(f"Got api_key of length {len(api_key) if api_key else 0}, valid={api_key and api_key.startswith('sk-ant')}\n")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
         return await _call_anthropic(api_key, model, system, user_prompt, tier)
