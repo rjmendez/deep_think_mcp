@@ -151,9 +151,9 @@ def _read_credential(provider: str, key: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _ANTHROPIC_DEFAULTS = {
-    "light": "claude-haiku-4-5",
-    "medium": "claude-sonnet-4-6",
-    "heavy": "claude-opus-4-7",
+    "light": "claude-opus-4-1-20250805",  # Using opus as haiku isn't available
+    "medium": "claude-sonnet-4-20250514",
+    "heavy": "claude-opus-4-1-20250805",
 }
 
 _COPILOT_DEFAULTS = {
