@@ -9,6 +9,7 @@ ENDPOINTS:
   POST /call/deep_think_async  Queue a reasoning job (returns job_id)
   GET  /call/get_thinking_result  Poll job status and retrieve results
   GET  /call/list_thinking_jobs    List all jobs in database
+  GET  /health               Health check with queue metrics
 
 TOOLS EXPOSED:
   deep_think_async          Multi-pass reasoning (2-6 passes with different framings)
@@ -41,6 +42,8 @@ from datetime import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # Modular imports from new structure
 from .engine import (
@@ -56,6 +59,7 @@ from .engine.provider import _tier_provider
 from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
 from .engine.mqtt_tasks import MQTTEngineAdapter
+from . import health
 
 log = logging.getLogger(__name__)
 
@@ -633,6 +637,30 @@ async def get_creative_metrics() -> dict:
         per-mode job counts, and per-mode average combined scores.
     """
     return get_metrics_snapshot()
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint with queue metrics.
+    
+    Returns HTTP 200 if healthy, 503 if degraded (too many pending jobs).
+    
+    Response includes:
+    - status: "healthy" or "degraded"
+    - pending_count: number of queued jobs
+    - avg_latency: average job duration in seconds
+    - last_success_timestamp: when the last job completed
+    - worker_count: number of active workers
+    - db_status: database connectivity status
+    - completed_count: total completed jobs
+    
+    Response time: <100ms (uses cached metrics)
+    """
+    max_pending = int(os.getenv("DEEP_THINK_HEALTH_MAX_PENDING", "100"))
+    metrics = health.get_health_metrics(store._connect, max_pending)
+    
+    http_status = metrics.pop("http_status", 200)
+    return JSONResponse(metrics, status_code=http_status)
 
 
 def main():
