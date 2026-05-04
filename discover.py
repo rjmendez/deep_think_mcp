@@ -276,8 +276,8 @@ def _detect_cloud_providers() -> list[ModelInfo]:
     if copilot_token:
         for mid, tier in [
             ("gpt-4.1",            "light"),
-            ("claude-sonnet-4.6",  "medium"),
-            ("claude-opus-4.7",    "heavy"),
+            ("gpt-5.4",            "medium"),
+            ("gpt-5.5",            "heavy"),
             ("gpt-5.2-codex",      "medium"),  # code specialist
         ]:
             models.append(ModelInfo(
