@@ -116,6 +116,7 @@ async def _run_job(job: dict) -> None:
                 question=job["question"],
                 passes=int(job["passes"]),
                 provider_config=provider_config,
+                model=provider_config.get("model"),
                 task_class=task_class,
                 data_policy=data_policy,
                 force_local_models=force_local_models,
