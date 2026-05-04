@@ -14,6 +14,30 @@ import json
 import logging
 import os
 
+# Load credentials from ~/.copilot/credentials at startup if not already in env
+def _load_credentials_at_startup():
+    """Load credentials from file into environment variables at worker startup."""
+    cred_file = os.path.expanduser("~/.copilot/credentials")
+    if os.path.exists(cred_file):
+        try:
+            with open(cred_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' not in line or line.startswith('#'):
+                        continue
+                    key, value = line.split('=', 1)
+                    # Convert anthropic.api_key -> ANTHROPIC_API_KEY
+                    if key == "anthropic.api_key" and not os.getenv("ANTHROPIC_API_KEY"):
+                        os.environ["ANTHROPIC_API_KEY"] = value
+                    elif key == "copilot.oauth_token" and not os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"):
+                        os.environ["GITHUB_COPILOT_OAUTH_TOKEN"] = value
+                    elif key == "ollama.base_url" and not os.getenv("OLLAMA_BASE_URL"):
+                        os.environ["OLLAMA_BASE_URL"] = value
+        except Exception as e:
+            logging.warning(f"Failed to load credentials from {cred_file}: {e}")
+
+_load_credentials_at_startup()
+
 from . import engine, store
 from .engine.creative import CreativeReasoningEngine
 from .nova_factcheck.pipeline import VerificationPipeline
