@@ -338,7 +338,11 @@ async def _call_provider(
     if provider == "anthropic":
         api_key = _read_credential("anthropic", "api_key")
         if not api_key:
+            import sys
+            print(f"DEBUG: ANTHROPIC_API_KEY not found!", file=sys.stderr)
+            print(f"DEBUG: ENV var = {os.environ.get('ANTHROPIC_API_KEY', 'NOT SET')}", file=sys.stderr)
             raise ValueError("ANTHROPIC_API_KEY not set")
+        print(f"DEBUG: Got API key: {api_key[:20]}...", file=sys.stderr)
         return await _call_anthropic(api_key, model, system, user_prompt, tier)
     
     elif provider == "copilot":
