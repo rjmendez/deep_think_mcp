@@ -45,7 +45,7 @@ def _extract_claims_from_pass_output(output: str) -> list[dict]:
     claim_counter = 0
     
     # Pattern 1: "CLAIM: ... [CONFIDENCE: X%]"
-    claim_pattern = r"(?i)claim:\s*([^[\n]+)(?:\[confidence:\s*(\d+)%\])?"
+    claim_pattern = r"(?i)claim:\s*(.+?)(?:\s+\[confidence:\s*(\d+)%\])?$"
     for match in re.finditer(claim_pattern, output):
         text = match.group(1).strip()
         conf = int(match.group(2)) / 100 if match.group(2) else 0.5
@@ -60,7 +60,7 @@ def _extract_claims_from_pass_output(output: str) -> list[dict]:
         claim_counter += 1
     
     # Pattern 2: "(✓) ... [N% confidence]" or "(✗) ... [N% confidence]"
-    checkmark_pattern = r"\(([✓✗])\)\s*([^[\n]+)(?:\[(\d+)%\s+confidence\])?"
+    checkmark_pattern = r"\(([✓✗])\)\s*(.+?)(?:\s+\[(\d+)%\s+confidence\])?$"
     for match in re.finditer(checkmark_pattern, output):
         status = match.group(1)
         text = match.group(2).strip()
@@ -175,6 +175,12 @@ async def _validate_claims_against_ground_truth(
         asyncio.TimeoutError: If validation takes longer than timeout_secs
         ValueError: If claim objects cannot be created
     """
+    # TEMPORARY: Disable Nova verification due to authentication failures
+    # Re-enable once Nova service is fixed
+    if os.getenv("SKIP_VALIDATION"):
+        log.info("Validation skipped (SKIP_VALIDATION=1)")
+        return None
+    
     if GroundTruthProvider is None or Claim is None or not ground_truth_provider:
         return None
     

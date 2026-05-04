@@ -383,10 +383,17 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
             conn.execute("ROLLBACK")
             return None
         now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "UPDATE thinking_jobs SET status='running', started_at=?, claimed_by=?, claimed_at=? WHERE job_id=?",
+        # Add WHERE status='queued' to prevent race condition where another worker
+        # claims the same job between our SELECT and UPDATE
+        cur = conn.execute(
+            "UPDATE thinking_jobs SET status='running', started_at=?, claimed_by=?, claimed_at=? "
+            "WHERE job_id=? AND status='queued'",
             (now, worker_id, now, row["job_id"]),
         )
+        # If no rows were updated, another worker claimed this job first - rollback and return None
+        if cur.rowcount == 0:
+            conn.execute("ROLLBACK")
+            return None
         conn.execute("COMMIT")
         # Update the dict with new values
         result = dict(row)
@@ -579,7 +586,7 @@ def detect_orphaned_jobs(stale_after_minutes: int = 0) -> list[dict]:
 
 
 def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
-    """Requeue an orphaned job by resetting its status to 'pending'.
+    """Requeue an orphaned job by resetting its status to 'queued'.
     
     Args:
         job_id: The job ID to requeue
@@ -592,7 +599,7 @@ def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
     conn = _connect()
     try:
         cur = conn.execute(
-            "UPDATE thinking_jobs SET status='pending', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
+            "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
             "WHERE job_id=? AND status='running'",
             (job_id,),
         )
@@ -940,6 +947,8 @@ def set_pass_cache(
     expires = (now + timedelta(hours=_cache_ttl_hours())).isoformat()
     conn = _connect()
     try:
+        # Use transaction to ensure atomic writes
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             INSERT INTO pass_cache
@@ -960,6 +969,12 @@ def set_pass_cache(
              model_used, provider, output, now.isoformat(), expires),
         )
         conn.commit()
+    except Exception as e:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
