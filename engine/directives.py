@@ -387,6 +387,10 @@ def _select_adaptive_framing(
     Returns:
         (framing_name, directive_text) tuple
     """
+    # Defensive: empty directives list
+    if not directives:
+        return ("generic", "Analyze systematically")
+    
     is_final = pass_number == total_passes
     
     # Final pass always uses last directive (synthesis/finalization)
@@ -396,7 +400,7 @@ def _select_adaptive_framing(
     # No validation data? Use sequential fallback
     if not validation_result:
         # Default sequential: pick from directives by pass number
-        idx = min(pass_number - 1, len(directives) - 2)
+        idx = min(pass_number - 1, len(directives) - 1)
         return directives[idx]
     
     # Extract validation metrics
@@ -465,7 +469,7 @@ def _select_adaptive_framing(
                 return (framing, directive)
     
     # Fallback: sequential selection
-    idx = min(pass_number - 1, len(directives) - 2)
+    idx = min(pass_number - 1, len(directives) - 1)
     return directives[idx]
 
 
