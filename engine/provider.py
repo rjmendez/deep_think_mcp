@@ -267,7 +267,7 @@ async def _call_anthropic(
     """Call Anthropic Claude API."""
     timeout = _timeout_for(tier)
     
-    log.debug(f"_call_anthropic: model={model}, key_len={len(api_key) if api_key else 0}")
+    log.info(f"_call_anthropic: ENTER model='{model}', tier={tier}, key_len={len(api_key) if api_key else 0}")
     
     # Validate key
     if not api_key:
@@ -282,7 +282,7 @@ async def _call_anthropic(
             "system": system,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        log.info(f"Calling Anthropic with model={model}")
+        log.warning(f"_call_anthropic: POSTING to API with model='{model}'")
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
