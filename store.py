@@ -153,6 +153,51 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pass_cache_expires "
             "ON pass_cache(expires_at)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS self_improvement_plans (
+                id                  TEXT PRIMARY KEY,
+                finding_ids         TEXT NOT NULL,
+                plan_json           TEXT NOT NULL,
+                priority            REAL NOT NULL DEFAULT 0.0,
+                effort_estimate     INTEGER DEFAULT 0,
+                risk_level          TEXT DEFAULT 'MEDIUM',
+                status              TEXT NOT NULL DEFAULT 'pending',
+                deep_think_job_id   TEXT,
+                approval_notes      TEXT,
+                approved_by         TEXT,
+                approved_at         TEXT,
+                deployment_sha      TEXT,
+                validation_score    REAL,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plans_status "
+            "ON self_improvement_plans(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plans_priority "
+            "ON self_improvement_plans(priority DESC)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plan_audit_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id         TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                details_json    TEXT,
+                created_at      TEXT NOT NULL,
+                FOREIGN KEY(plan_id) REFERENCES self_improvement_plans(id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_plan_id "
+            "ON plan_audit_log(plan_id)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -967,3 +1012,181 @@ def evict_expired_pass_cache() -> int:
     finally:
         conn.close()
 
+
+
+# ============================================================================
+# Self-Improvement Plan Management
+# ============================================================================
+
+def create_plan(
+    plan_id: str,
+    finding_ids: list[str],
+    plan_json: str,
+    priority: float,
+    effort_estimate: int,
+    risk_level: str,
+    deep_think_job_id: str = "",
+) -> str:
+    """Create a new self-improvement plan. Returns plan_id."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO self_improvement_plans
+            (id, finding_ids, plan_json, priority, effort_estimate, risk_level,
+             status, deep_think_job_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                plan_id,
+                json.dumps(finding_ids),
+                plan_json,
+                priority,
+                effort_estimate,
+                risk_level,
+                deep_think_job_id,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        
+        # Audit log
+        audit_log("plan_created", plan_id, json.dumps({
+            "finding_ids": finding_ids,
+            "priority": priority,
+            "effort_estimate": effort_estimate,
+        }))
+        
+        return plan_id
+    finally:
+        conn.close()
+
+
+def get_plan(plan_id: str) -> Optional[dict]:
+    """Fetch a single plan by ID."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM self_improvement_plans WHERE id = ?",
+            (plan_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_plans(
+    status: str = "all",
+    limit: int = 100,
+    order_by: str = "priority DESC",
+) -> list[dict]:
+    """List plans optionally filtered by status."""
+    conn = _connect()
+    try:
+        query = "SELECT * FROM self_improvement_plans"
+        params: list = []
+        
+        if status != "all":
+            query += " WHERE status = ?"
+            params.append(status)
+        
+        query += f" ORDER BY {order_by} LIMIT ?"
+        params.append(limit)
+        
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def update_plan_status(plan_id: str, status: str, approved_by: str = "") -> bool:
+    """Update plan status and record audit log."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        updates = f"status = ?, updated_at = ?"
+        params: list = [status, now]
+        
+        if approved_by and status == "approved":
+            updates += ", approved_by = ?, approved_at = ?"
+            params.extend([approved_by, now])
+        
+        params.append(plan_id)
+        
+        conn.execute(
+            f"UPDATE self_improvement_plans SET {updates} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+        
+        audit_log(f"plan_{status}", plan_id, json.dumps({
+            "approved_by": approved_by,
+        }))
+        
+        return True
+    finally:
+        conn.close()
+
+
+def update_plan_validation(
+    plan_id: str,
+    validation_score: float,
+    deployment_sha: str = "",
+) -> bool:
+    """Update plan with validation results."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            UPDATE self_improvement_plans
+            SET validation_score = ?, deployment_sha = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (validation_score, deployment_sha, now, plan_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def audit_log(
+    event_type: str,
+    plan_id: str,
+    details_json: str = "{}",
+) -> None:
+    """Log a plan audit event."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO plan_audit_log (plan_id, event_type, details_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (plan_id, event_type, details_json, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_plan_audit_trail(plan_id: str) -> list[dict]:
+    """Fetch complete audit trail for a plan."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_type, details_json, created_at
+            FROM plan_audit_log
+            WHERE plan_id = ?
+            ORDER BY created_at ASC
+            """,
+            (plan_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()

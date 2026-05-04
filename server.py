@@ -9,12 +9,16 @@ ENDPOINTS:
   POST /call/deep_think_async  Queue a reasoning job (returns job_id)
   GET  /call/get_thinking_result  Poll job status and retrieve results
   GET  /call/list_thinking_jobs    List all jobs in database
+  POST /self-improvement/implement Orchestrate code implementation from plan
+  GET  /self-improvement/status    Get implementation status for a plan
+  POST /self-improvement/deploy    Deploy validated code with canary rollout
   GET  /health               Health check with queue metrics
 
 TOOLS EXPOSED:
   deep_think_async          Multi-pass reasoning (2-6 passes with different framings)
   get_thinking_result       Poll job status and retrieve full reasoning chain
   list_thinking_jobs        List jobs by status
+  get_creative_metrics      Return creativity metrics for trend analysis
 
 JOB FLOW:
   1. Client calls deep_think_async with question + passes
@@ -24,8 +28,27 @@ JOB FLOW:
   5. Client polls get_thinking_result to check status
   6. When complete, client receives full reasoning chain + answer
 
+IMPLEMENTATION FLOW (Layer 5 Self-Improvement):
+  1. Client calls POST /self-improvement/implement with plan_id
+  2. ImplementationPipeline checks budget constraints
+  3. Approval gates check severity (CRITICAL=manual, HIGH=owner, MEDIUM/LOW=auto)
+  4. Feature branch created, code changes orchestrated through agents
+  5. Commits tracked with Layer 5 tracer
+  6. Status tracked in implementation_tasks table
+  7. Client polls /self-improvement/status for progress
+  8. POST /self-improvement/deploy triggers canary rollout if validation passes
+
+DEPLOYMENT FLOW:
+  1. Client calls POST /self-improvement/deploy with validation_id, plan_id, commit_sha
+  2. Server validates: validation passed? rollback snapshot exists?
+  3. DeploymentPipeline executes canary stages: 5% → 25% → 100%
+  4. Monitors error rate, timeout rate, latency p99 at each stage
+  5. If thresholds exceeded, automatic rollback triggered
+  6. On success, tags release; on rollback, restores previous version
+
 PERSISTENCE:
   - Jobs stored in SQLite (store.py) with status (queued/running/complete/failed)
+  - Implementation tasks stored in implementation_tasks table
   - Reasoning chains kept in memory during execution
   - Failed jobs retain error logs for debugging
 
@@ -37,6 +60,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -60,8 +84,17 @@ from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
 from .engine.mqtt_tasks import MQTTEngineAdapter
 from . import health
+from .adversarial_testing.implementation_pipeline import ImplementationPipeline
+from .planning_engine import PlanningEngine
+from .adversarial_testing.validation_suite import ValidationSuite
+from .adversarial_testing.metrics import MetricsCollector
+from .adversarial_testing.deployment_pipeline import DeploymentPipeline
+from .adversarial_testing import store as adversarial_store
 
 log = logging.getLogger(__name__)
+
+# Global planning engine instance
+_planning_engine: Optional[PlanningEngine] = None
 
 
 @asynccontextmanager
@@ -80,6 +113,24 @@ async def _lifespan(app):
     
     if mqtt_initialized:
         log.info("[MQTT] MQTTEngineAdapter initialized and running")
+    
+    # Initialize validation suite for self-improvement
+    metrics_collector = MetricsCollector()
+    validation_suite = ValidationSuite(
+        metrics=metrics_collector,
+        git_repo_root="/home/rjmendez/development/deep_think_mcp",
+        test_command="pytest --cov=adversarial_testing adversarial_testing/tests/",
+    )
+    app.validation_suite = validation_suite
+    mcp.validation_suite = validation_suite  # Expose to tools
+    log.info("ValidationSuite initialized for self-improvement")
+    
+    # Initialize planning engine
+    global _planning_engine
+    _planning_engine = PlanningEngine(deep_think_fn=deep_think_passes)
+    app.planning_engine = _planning_engine
+    mcp.planning_engine = _planning_engine
+    log.info("PlanningEngine initialized for self-improvement")
     
     discovery_task = None
     if _ollama_in_use():
@@ -639,6 +690,477 @@ async def get_creative_metrics() -> dict:
     return get_metrics_snapshot()
 
 
+@mcp.custom_route("/self-improvement/implement", methods=["POST"])
+async def implement_plan(request: Request) -> JSONResponse:
+    """Orchestrate code implementation from a planning engine output.
+    
+    Executes the full implementation pipeline:
+    - Check budget before starting
+    - Queue for human approval if severity requires it (CRITICAL, HIGH)
+    - Create feature branch
+    - Orchestrate code-review agent → planning agent → implementation agent
+    - Commit changes with Layer 5 tracer
+    - Track status in implementation_tasks table
+    - Create rollback snapshots
+    
+    Request body:
+    {
+        "plan_id": str,         # ID from planning_engine output
+        "skip_approval": bool   # (optional) bypass human review gates
+    }
+    
+    Response:
+    {
+        "success": bool,
+        "plan_id": str,
+        "branch_name": str,
+        "commit_sha": str,
+        "status": str,
+        "message": str,
+        "error": str (if failed)
+    }
+    """
+    try:
+        body = await request.json()
+        plan_id = body.get("plan_id")
+        skip_approval = body.get("skip_approval", False)
+        
+        if not plan_id:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": "Missing required field: plan_id",
+                    "status": "error",
+                },
+                status_code=400,
+            )
+        
+        # Initialize pipeline
+        pipeline = ImplementationPipeline()
+        
+        # Start implementation
+        success, error_msg = await pipeline.start_implementation(
+            plan_id=plan_id,
+            skip_approval=skip_approval,
+        )
+        
+        if not success:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "plan_id": plan_id,
+                    "status": "failed",
+                    "error": error_msg,
+                },
+                status_code=400,
+            )
+        
+        # Get updated status
+        status = await pipeline.get_implementation_status(plan_id)
+        
+        return JSONResponse(
+            {
+                "success": True,
+                "plan_id": plan_id,
+                "status": status.get("status") if status else "implementing",
+                "commit_sha": status.get("commit_sha") if status else None,
+                "message": "Implementation started successfully. Poll status endpoint for updates.",
+            },
+            status_code=200,
+        )
+    
+    except Exception as e:
+        log.exception("Implementation failed")
+        return JSONResponse(
+            {
+                "success": False,
+                "status": "error",
+                "error": f"Implementation exception: {str(e)}",
+            },
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/self-improvement/status", methods=["GET"])
+async def get_implementation_status_endpoint(request: Request) -> JSONResponse:
+    """Get current implementation status for a plan.
+    
+    Query parameters:
+    - plan_id: ID of the plan to check status for
+    
+    Response:
+    {
+        "plan_id": str,
+        "status": str,
+        "commit_sha": str,
+        "tasks": list,
+        "created_at": str
+    }
+    """
+    try:
+        plan_id = request.query_params.get("plan_id")
+        
+        if not plan_id:
+            return JSONResponse(
+                {
+                    "error": "Missing required parameter: plan_id",
+                    "status": "error",
+                },
+                status_code=400,
+            )
+        
+        pipeline = ImplementationPipeline()
+        status = await pipeline.get_implementation_status(plan_id)
+        
+        if not status:
+            return JSONResponse(
+                {
+                    "error": f"Plan {plan_id} not found",
+                    "status": "error",
+                },
+                status_code=404,
+            )
+        
+        return JSONResponse(status, status_code=200)
+    
+    except Exception as e:
+        log.exception("Status check failed")
+        return JSONResponse(
+            {
+                "error": f"Status check exception: {str(e)}",
+                "status": "error",
+            },
+            status_code=500,
+        )
+
+
+@mcp.tool()
+async def generate_self_improvement_plan(
+    findings: list[dict],
+    limit: int = 5,
+) -> dict:
+    """Generate ranked improvement plans for findings using deep_think planning.
+    
+    Analyzes findings, computes priority scores based on severity/impact/effort,
+    and generates structured improvement plans using deep_think with task_class="planning".
+    
+    Args:
+        findings: List of finding dicts with keys:
+            - id: unique finding identifier
+            - severity: CRITICAL|HIGH|MEDIUM|LOW
+            - impact: 0-10 numeric impact score
+            - reproducibility: 0-1 likelihood of reproducing
+            - category: finding category/type
+            - description: brief description
+            - details: full context/stack trace
+            - effort_estimate: estimated days (1-5)
+            - risk_level: LOW|MEDIUM|HIGH
+        limit: Max number of plans to generate (default 5)
+    
+    Returns:
+        {
+            "status": "success"|"error",
+            "plans": [
+                {
+                    "plan_id": uuid,
+                    "finding_id": str,
+                    "priority": float,
+                    "effort_estimate": int,
+                    "risk_level": str,
+                    "status": "pending",
+                    "created_at": iso8601,
+                }
+            ],
+            "error": optional error message,
+            "metrics": {
+                "total_plans": int,
+                "avg_priority": float,
+                "total_effort_days": int,
+                "generation_time_secs": float,
+            }
+        }
+    """
+    global _planning_engine
+    if not _planning_engine:
+        return {
+            "status": "error",
+            "error": "Planning engine not initialized",
+            "plans": [],
+        }
+    
+    try:
+        start_time = time.time()
+        
+        # Validate findings input
+        if not findings or not isinstance(findings, list):
+            return {
+                "status": "error",
+                "error": "findings must be a non-empty list",
+                "plans": [],
+            }
+        
+        # Limit input size
+        findings = findings[:limit * 2]
+        
+        log.info(f"Generating plans for {len(findings)} findings (limit={limit})")
+        
+        # Generate plans concurrently
+        plans = await _planning_engine.generate_plans_for_findings(
+            findings=findings,
+            limit=limit,
+        )
+        
+        # Compute metrics
+        total_effort = sum(p.get("effort_estimate", 0) for p in plans)
+        avg_priority = (
+            sum(p.get("priority", 0) for p in plans) / len(plans)
+            if plans else 0
+        )
+        
+        elapsed = time.time() - start_time
+        
+        return {
+            "status": "success",
+            "plans": plans,
+            "metrics": {
+                "total_plans": len(plans),
+                "avg_priority": round(avg_priority, 2),
+                "total_effort_days": total_effort,
+                "generation_time_secs": round(elapsed, 2),
+            },
+        }
+    
+    except Exception as e:
+        log.error(f"Failed to generate plans: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "plans": [],
+        }
+
+
+@mcp.tool()
+async def get_pending_improvement_plans() -> dict:
+    """List all pending self-improvement plans awaiting approval.
+    
+    Returns:
+        {
+            "status": "success",
+            "plans": [
+                {
+                    "plan_id": str,
+                    "finding_ids": [str],
+                    "priority": float,
+                    "effort_estimate": int,
+                    "risk_level": str,
+                    "status": str,
+                    "created_at": iso8601,
+                }
+            ]
+        }
+    """
+    global _planning_engine
+    if not _planning_engine:
+        return {
+            "status": "error",
+            "error": "Planning engine not initialized",
+            "plans": [],
+        }
+    
+    try:
+        plans = await _planning_engine.get_pending_plans()
+        return {
+            "status": "success",
+            "plans": plans,
+        }
+    except Exception as e:
+        log.error(f"Failed to fetch pending plans: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "plans": [],
+        }
+
+
+@mcp.tool()
+async def approve_improvement_plan(
+    plan_id: str,
+    approved_by: str,
+    approval_notes: str = "",
+) -> dict:
+    """Approve a pending improvement plan for implementation.
+    
+    Args:
+        plan_id: UUID of plan to approve
+        approved_by: Name/email of approver
+        approval_notes: Optional approval notes/justification
+    
+    Returns:
+        {"status": "success"|"error", "message": str}
+    """
+    global _planning_engine
+    if not _planning_engine:
+        return {
+            "status": "error",
+            "message": "Planning engine not initialized",
+        }
+    
+    try:
+        success = await _planning_engine.approve_plan(
+            plan_id=plan_id,
+            approved_by=approved_by,
+            approval_notes=approval_notes,
+        )
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Plan {plan_id} approved",
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"Failed to approve plan {plan_id}",
+            }
+    
+    except Exception as e:
+        log.error(f"Failed to approve plan {plan_id}: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+
+@mcp.custom_route("/self-improvement/deploy", methods=["POST"])
+async def deploy_validated_code(request: Request) -> JSONResponse:
+    """Deploy validated code through canary rollout with automatic rollback.
+    
+    Executes Layer 5 Self-Improvement System deployment pipeline:
+    - Stage 1: 5% traffic (1 pod replica) for 30 seconds
+    - Stage 2: 25% traffic (multi-replica) for 2 minutes  
+    - Stage 3: 100% traffic (full rollout) for 5 minutes
+    
+    Monitors metrics at each stage:
+    - Error rate spike > 2% triggers rollback
+    - Timeout rate > 1% triggers rollback
+    - Latency p99 > 5s triggers rollback
+    
+    If any threshold violated, automatically rollback to previous stable version.
+    If all stages pass, tag release and update deployment_events table.
+    
+    Request body:
+    {
+        "validation_id": str,  # validation_results.id from validation_suite
+        "plan_id": str,        # self_improvement_plans.id
+        "commit_sha": str      # git commit SHA to deploy
+    }
+    
+    Response:
+    {
+        "success": bool,
+        "deployment_id": str,
+        "status": str,  # "completed" or "rolled_back"
+        "details": dict
+    }
+    """
+    try:
+        body = await request.json()
+        validation_id = body.get("validation_id")
+        plan_id = body.get("plan_id")
+        commit_sha = body.get("commit_sha")
+        
+        if not all([validation_id, plan_id, commit_sha]):
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": "Missing required fields: validation_id, plan_id, commit_sha"
+                },
+                status_code=400
+            )
+        
+        # Initialize adversarial store with custom db path if provided
+        adversarial_db = os.getenv(
+            "ADVERSARIAL_DB",
+            str(__import__("pathlib").Path.home() / ".deep_think" / "adversarial.db"),
+        )
+        store_instance = adversarial_store.AdversarialStore(adversarial_db)
+        
+        # Pre-flight checks
+        # 1. Verify validation passed
+        validation_result = store_instance.execute(
+            "SELECT status FROM validation_results WHERE id = ?",
+            (validation_id,)
+        ).fetchone()
+        
+        if not validation_result or validation_result["status"] != "passed":
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": f"Validation {validation_id} did not pass or does not exist"
+                },
+                status_code=400
+            )
+        
+        # 2. Verify plan exists and has deployment info
+        plan_result = store_instance.execute(
+            "SELECT deployment_sha FROM self_improvement_plans WHERE id = ?",
+            (plan_id,)
+        ).fetchone()
+        
+        if not plan_result:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": f"Plan {plan_id} not found"
+                },
+                status_code=404
+            )
+        
+        # Initialize deployment pipeline
+        metrics = MetricsCollector()
+        prometheus_endpoint = os.getenv(
+            "PROMETHEUS_ENDPOINT", "http://localhost:9090"
+        )
+        
+        pipeline = DeploymentPipeline(
+            store=store_instance,
+            metrics=metrics,
+            prometheus_endpoint=prometheus_endpoint,
+            k3s_namespace=os.getenv("K3S_NAMESPACE", "agents"),
+            deployment_name=os.getenv("DEPLOYMENT_NAME", "deep-think"),
+        )
+        
+        # Execute deployment
+        success, error_msg, details = await pipeline.deploy_validated_fix(
+            plan_id=plan_id,
+            commit_sha=commit_sha,
+        )
+        
+        return JSONResponse(
+            {
+                "success": success,
+                "error": error_msg,
+                "deployment_id": details.get("deployment_id"),
+                "status": details.get("status"),
+                "details": details,
+            },
+            status_code=200 if success else 400
+        )
+    
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"success": False, "error": "Invalid JSON in request body"},
+            status_code=400
+        )
+    except Exception as e:
+        log.error(f"Deployment endpoint error: {e}", exc_info=True)
+        return JSONResponse(
+            {"success": False, "error": f"Internal server error: {str(e)}"},
+            status_code=500
+        )
+
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> JSONResponse:
     """Health check endpoint with queue metrics.
@@ -661,6 +1183,74 @@ async def health_check(request: Request) -> JSONResponse:
     
     http_status = metrics.pop("http_status", 200)
     return JSONResponse(metrics, status_code=http_status)
+
+
+@mcp.custom_route("/self-improvement/validate", methods=["POST"])
+async def validate_implementation(request: Request) -> JSONResponse:
+    """Validate implementation with before/after metric comparison and regression detection.
+    
+    Accepts:
+        implementation_id: ID from implementation_pipeline output (commit SHA)
+        plan_id: ID of the self-improvement plan
+    
+    Returns:
+        - passed: bool indicating if validation passed
+        - improvement_score: 0-1 scale
+        - before_metrics: snapshot before implementation
+        - after_metrics: snapshot after implementation  
+        - regressions: list of detected regressions
+        - test_output: pytest output
+        - validation_id: ID of validation record
+    
+    HTTP 200: Validation completed (check 'passed' field)
+    HTTP 400: Missing required fields
+    HTTP 500: Validation error
+    """
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Invalid JSON: {str(e)}", "status": "error"},
+            status_code=400,
+        )
+    
+    implementation_id = data.get("implementation_id")
+    plan_id = data.get("plan_id")
+    
+    if not implementation_id or not plan_id:
+        return JSONResponse(
+            {
+                "error": "Missing required fields: implementation_id, plan_id",
+                "status": "error",
+            },
+            status_code=400,
+        )
+    
+    try:
+        validation_suite = mcp.validation_suite
+        passed, error_msg, validation_details = await validation_suite.validate_implementation(
+            plan_id=plan_id,
+            commit_sha=implementation_id,
+        )
+        
+        return JSONResponse(
+            {
+                "status": "completed",
+                "passed": passed,
+                "error": error_msg,
+                **validation_details,
+            },
+            status_code=200,
+        )
+    except Exception as e:
+        log.exception("Validation failed")
+        return JSONResponse(
+            {
+                "error": f"Validation exception: {str(e)}",
+                "status": "error",
+            },
+            status_code=500,
+        )
 
 
 def main():
