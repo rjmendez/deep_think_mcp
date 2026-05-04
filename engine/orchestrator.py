@@ -480,6 +480,10 @@ async def deep_think_passes(
     if provider_config is None:
         provider_config = {}
     
+    # REQUIRED: provider must be explicitly specified (no defaults!)
+    if not provider_config.get("provider"):
+        raise ValueError("provider is REQUIRED in provider_config. Must be 'anthropic', 'ollama', or other valid provider.")
+    
     # Create provider config object
     cfg = provider_module.build_provider_config(provider_config)
     
@@ -535,7 +539,7 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         
         # Select provider and model
         tier = directives_module._FRAMING_TIER.get(framing_name, "medium")
-        provider_name = provider_config.get("provider", "ollama")
+        provider_name = provider_config["provider"]  # Already validated as required above
         model_name = model or provider_module._model_for_tier(cfg, tier, task_class)
         
         try:
@@ -631,6 +635,10 @@ async def run_fan_out(
     if provider_config is None:
         provider_config = {}
     
+    # REQUIRED: provider must be explicitly specified (no defaults!)
+    if not provider_config.get("provider"):
+        raise ValueError("provider is REQUIRED in provider_config. Must be 'anthropic', 'ollama', or other valid provider.")
+    
     cfg = provider_module.build_provider_config(provider_config)
     
     if force_local_models:
@@ -680,7 +688,7 @@ Use this perspective to analyze the question. Be consistent with your assigned v
             
             try:
                 output = await provider_module._call_provider(
-                    provider=provider_config.get("provider", "ollama") if provider_config else "ollama",
+                    provider=provider_config["provider"],  # Already validated as required above
                     model=model or "qwen3.5:27b",
                     system=system_prompt,
                     user_prompt=user_prompt,
@@ -715,7 +723,7 @@ Use this perspective to analyze the question. Be consistent with your assigned v
     
     try:
         final_answer = await provider_module._call_provider(
-            provider=provider_config.get("provider", "ollama") if provider_config else "ollama",
+            provider=provider_config["provider"],  # Already validated as required above
             model=model or "llama3.1:8b",
             system="You are a synthesis expert. Integrate all perspectives into a coherent answer.",
             user_prompt=synthesis_prompt,
