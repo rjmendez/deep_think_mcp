@@ -53,22 +53,28 @@ def _validate_provider_is_local(provider: str, force_local: bool) -> None:
 
 
 def _is_valid_anthropic_model(model_name: str) -> bool:
-    """Check if model name is valid Anthropic format: claude-{version}-{YYYYMMDD}.
+    """Check if model name is OFFICIAL Anthropic model ID (not dated snapshots).
+    
+    RULE: Never use date-coded models (expensive, less efficient).
+    Only accept official Anthropic model IDs without date suffixes.
     
     Valid examples:
-    - claude-opus-4-1-20250805
-    - claude-sonnet-4-20250514
-    - claude-haiku-3-20250805
+    - claude-opus-4-7 (current Opus)
+    - claude-sonnet-4-6 (current Sonnet)
+    - claude-haiku-4-5 (current Haiku)
     
-    Invalid examples (what directives.py has):
+    Invalid examples (rejected):
+    - claude-opus-4-1-20250805 (dated snapshot — expensive)
+    - claude-sonnet-4-20250514 (dated snapshot — expensive)
     - claude-sonnet-4.6 (dot notation)
-    - claude-opus-4.7 (dot notation)
+    
+    Reference: User rule "NEVER use date-coded models because expensive and not efficient"
     """
-    # Must start with 'claude-' and have a date suffix like -20250514
     if not model_name or not model_name.startswith("claude-"):
         return False
-    # Must end with -YYYYMMDD (8-digit date)
-    return bool(re.search(r'-\d{8}$', model_name))
+    # Accept only official IDs: must end with -N where N is single digit (4, 5, 6, 7)
+    # Reject anything with date suffix (-YYYYMMDD) or dot notation (.X)
+    return bool(re.search(r'-[0-9]$', model_name))
 
 
 async def _check_ollama_available(base_url: str = "") -> bool:
