@@ -250,6 +250,12 @@ async def _call_anthropic(
     
     log.debug(f"_call_anthropic: model={model}, key_len={len(api_key) if api_key else 0}")
     
+    # Validate key
+    if not api_key:
+        raise ValueError(f"API key is empty! Cannot call Anthropic.")
+    if not api_key.startswith("sk-ant"):
+        log.warning(f"API key doesn't start with sk-ant: {api_key[:20]}...")
+    
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
