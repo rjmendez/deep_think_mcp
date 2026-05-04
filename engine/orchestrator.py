@@ -541,9 +541,11 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         tier = directives_module._FRAMING_TIER.get(framing_name, "medium")
         provider_name = provider_config["provider"]  # Already validated as required above
         model_name = model or provider_module._model_for_tier(cfg, tier, task_class)
+        log.info(f"deep_think_passes: selected model_name='{model_name}' for tier={tier}, task_class={task_class}, provider={provider_name}")
         
         # Fallback: ensure we have a valid Anthropic model
         if provider_name == "anthropic" and (not model_name or not model_name.startswith("claude")):
+            log.warning(f"deep_think_passes: Invalid Anthropic model '{model_name}', falling back to claude-opus-4-1-20250805")
             model_name = "claude-opus-4-1-20250805"
         
         try:

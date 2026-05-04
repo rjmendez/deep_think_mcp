@@ -566,7 +566,16 @@ def _default_for_provider(provider: str, tier: str) -> str:
 
 
 def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general") -> str:
-    """Resolve model ID with full precedence chain."""
+    """Resolve model ID with full precedence chain.
+    
+    Precedence:
+    1. Explicit cfg.model override
+    2. Per-tier call override
+    3. Environment variables
+    4. **Dynamically-discovered** assignments (from discovery service)
+    5. Task class profile recommendations (fallback)
+    6. Built-in provider defaults
+    """
     # 1. Single override
     if cfg.model:
         log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
@@ -593,16 +602,16 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
         if env_val:
             log.info(f"_model_for_tier: Using env var for {provider}/{tier}={env_val}")
             return env_val
-    # 4. Task class profile recommendation
-    profile_model = _profile_model(task_class, provider, tier)
-    if profile_model:
-        log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
-        return profile_model
-    # 5. Dynamically-discovered assignment
+    # 4. Dynamically-discovered assignment (discovery service is source of truth)
     discovered = _discovered_tier_model(provider, tier)
     if discovered:
         log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={discovered}")
         return discovered
+    # 5. Task class profile recommendation (fallback only)
+    profile_model = _profile_model(task_class, provider, tier)
+    if profile_model:
+        log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
+        return profile_model
     # 6. Built-in provider default
     default = _default_for_provider(provider, tier)
     log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")
