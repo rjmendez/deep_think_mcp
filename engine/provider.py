@@ -333,10 +333,14 @@ async def _call_provider(
     system: str,
     user_prompt: str,
     tier: str = "medium",
+    provider_config: dict | None = None,
 ) -> str:
     """Route to appropriate provider call."""
+    provider_config = provider_config or {}
+    
     if provider == "anthropic":
-        api_key = _read_credential("anthropic", "api_key")
+        # Try config first, then env/file
+        api_key = provider_config.get("anthropic_api_key") or _read_credential("anthropic", "api_key")
         if not api_key:
             import sys
             print(f"DEBUG: ANTHROPIC_API_KEY not found!", file=sys.stderr)

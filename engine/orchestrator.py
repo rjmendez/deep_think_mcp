@@ -550,6 +550,7 @@ Use the mandate to structure your response. Be precise and evidence-based."""
                 system=system_prompt,
                 user_prompt=user_prompt,
                 tier=tier,
+                provider_config=provider_config,
             )
             
             pass_outputs.append(output)
@@ -693,6 +694,7 @@ Use this perspective to analyze the question. Be consistent with your assigned v
                     system=system_prompt,
                     user_prompt=user_prompt,
                     tier="medium",
+                    provider_config=provider_config,
                 )
                 outputs.append(output)
             except Exception as e:
@@ -728,6 +730,7 @@ Use this perspective to analyze the question. Be consistent with your assigned v
             system="You are a synthesis expert. Integrate all perspectives into a coherent answer.",
             user_prompt=synthesis_prompt,
             tier="heavy",
+            provider_config=provider_config,
         )
     except Exception as e:
         log.error(f"Synthesis failed: {e}")
