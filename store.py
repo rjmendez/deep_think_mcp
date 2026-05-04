@@ -372,9 +372,16 @@ def create_job(
 
 
 def claim_next_job(worker_id: str = "default") -> Optional[dict]:
-    """Atomically claim the oldest queued job. Returns the job dict or None."""
+    """Atomically claim the oldest queued job. Returns the job dict or None.
+    
+    BUG FIX #3: Uses BEGIN IMMEDIATE + WHERE status='queued' condition in UPDATE
+    to prevent double-claiming by concurrent workers. This makes the SELECT-UPDATE
+    sequence atomic: if another worker claims the job first, the WHERE condition
+    fails and we rollback with no harm done.
+    """
     conn = _connect()
     try:
+        # BUG FIX #3: BEGIN IMMEDIATE provides exclusive transaction lock
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM thinking_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
@@ -383,8 +390,8 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
             conn.execute("ROLLBACK")
             return None
         now = datetime.now(timezone.utc).isoformat()
-        # Add WHERE status='queued' to prevent race condition where another worker
-        # claims the same job between our SELECT and UPDATE
+        # BUG FIX #3: WHERE status='queued' ensures only queued jobs can transition to running.
+        # If another worker updated this job first, the WHERE fails and rowcount is 0.
         cur = conn.execute(
             "UPDATE thinking_jobs SET status='running', started_at=?, claimed_by=?, claimed_at=? "
             "WHERE job_id=? AND status='queued'",
@@ -588,6 +595,11 @@ def detect_orphaned_jobs(stale_after_minutes: int = 0) -> list[dict]:
 def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
     """Requeue an orphaned job by resetting its status to 'queued'.
     
+    BUG FIX #2: Explicitly sets status='queued' (not invalid 'pending').
+    This ensures requeued jobs can be claimed by claim_next_job() which
+    only looks for status='queued'. The UPDATE also includes WHERE status='running'
+    to ensure we only requeue actually abandoned jobs, not ones claimed by active workers.
+    
     Args:
         job_id: The job ID to requeue
         reason: The reason for requeue (for logging purposes)
@@ -598,6 +610,7 @@ def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:
+        # BUG FIX #2: status='queued' is the correct status for jobs awaiting processing
         cur = conn.execute(
             "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
             "WHERE job_id=? AND status='running'",
