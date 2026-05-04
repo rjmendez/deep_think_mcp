@@ -191,6 +191,10 @@ async def deep_think_async(
     model: str = "",
     provider_config: Optional[dict] = None,
     verify: bool = False,
+    # Fan-out (multi-perspective) reasoning
+    width: int = 1,
+    height: int = 1,
+    extract_claims: bool = False,
     # Grounded reasoning parameters
     enable_research: bool = True,
     research_query: str = "",
@@ -252,13 +256,22 @@ async def deep_think_async(
     if data_policy and data_policy != "any":
         pc["data_policy"] = data_policy
 
+    # If width > 1, enable fan-out mode
+    fan_out_enabled = width > 1
+    if fan_out_enabled:
+        # For fan-out, use height for passes per perspective, width for # perspectives
+        total_passes = width * height + 1  # perspectives × passes + synthesis
+    else:
+        # Standard mode: passes param is the number of sequential passes
+        total_passes = max(2, min(passes, 6))
+
     cfg = build_provider_config(pc)
     resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
     summary = model_summary(cfg, resolved_class)
 
     job_id = store.create_job(
         question=question,
-        passes=max(2, min(passes, 6)),
+        passes=total_passes,
         provider=cfg.provider,
         model_summary=summary,
         provider_config_json=json.dumps({
@@ -271,10 +284,15 @@ async def deep_think_async(
             "dama_node_id": dama_node_id,
             "dama_metric": dama_metric,
             "web_domain_whitelist": web_domain_whitelist or [],
+            # Fan-out config (if width > 1)
+            "fan_out": fan_out_enabled,
+            "width": width if fan_out_enabled else 1,
+            "height": height if fan_out_enabled else 1,
+            "extract_claims": extract_claims,
         }),
     )
 
-    return {
+    response = {
         "job_id": job_id,
         "status": "queued",
         "task_class": resolved_class,
@@ -282,8 +300,17 @@ async def deep_think_async(
         "provider": cfg.provider,
         "model_summary": summary,
         "research_enabled": enable_research and resolved_class not in ("adversarial",),
-        "message": f"Call get_thinking_result('{job_id}') to poll for results.",
     }
+    
+    if fan_out_enabled:
+        response["fan_out"] = True
+        response["width"] = width
+        response["height"] = height
+        response["message"] = f"Fan-out job with {width} perspectives × {height} passes. Call get_thinking_result('{job_id}') to poll."
+    else:
+        response["message"] = f"Call get_thinking_result('{job_id}') to poll for results."
+    
+    return response
 
 
 @mcp.tool()
@@ -422,14 +449,14 @@ async def discover_models(force: bool = False, benchmark: bool = True) -> dict:
 @mcp.tool()
 async def deep_think_fan_out(
     question: str,
-    width: Optional[int] = None,
-    height: Optional[int] = None,
-    task_class: Optional[str] = None,
-    data_policy: Optional[str] = None,
+    width: int = 3,
+    height: int = 2,
+    task_class: str = "general",
+    data_policy: str = "any",
     max_parallel: Optional[int] = None,
     max_width: Optional[int] = None,
     confidence_threshold: Optional[int] = None,
-    extract_claims: Optional[bool] = None,
+    extract_claims: bool = False,
     provider_config: Optional[dict] = None,
 ) -> dict:
     """Queue a perspective fan-out reasoning job and return a job_id immediately.
@@ -473,15 +500,10 @@ async def deep_think_fan_out(
     Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
     Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
     """
-    # Apply defaults
-    width = width if width is not None else 3
-    height = height if height is not None else 2
-    task_class = task_class if task_class is not None else "general"
-    data_policy = data_policy if data_policy is not None else "any"
+    # Apply defaults for optional params only
     max_parallel = max_parallel if max_parallel is not None else 2
     max_width = max_width if max_width is not None else 6
     confidence_threshold = confidence_threshold if confidence_threshold is not None else 50
-    extract_claims = extract_claims if extract_claims is not None else False
     
     pc: dict = dict(provider_config or {})
     if data_policy and data_policy != "any":
