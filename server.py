@@ -422,14 +422,14 @@ async def discover_models(force: bool = False, benchmark: bool = True) -> dict:
 @mcp.tool()
 async def deep_think_fan_out(
     question: str,
-    width: int | None = None,
-    height: int | None = None,
-    task_class: str | None = None,
-    data_policy: str | None = None,
-    max_parallel: int | None = None,
-    max_width: int | None = None,
-    confidence_threshold: int | None = None,
-    extract_claims: bool | None = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    task_class: Optional[str] = None,
+    data_policy: Optional[str] = None,
+    max_parallel: Optional[int] = None,
+    max_width: Optional[int] = None,
+    confidence_threshold: Optional[int] = None,
+    extract_claims: Optional[bool] = None,
     provider_config: Optional[dict] = None,
 ) -> dict:
     """Queue a perspective fan-out reasoning job and return a job_id immediately.
