@@ -1875,124 +1875,18 @@ async def get_help(request: Request) -> JSONResponse:
     try:
         command = request.path_params.get("command", "").lower()
         
-        help_docs = {
-            "verify": {
-                "description": "Verify a claim using chain-of-thought reasoning with cloud or local LLMs.",
-                "usage": "POST /verify-queue with {\"claim\": \"...\", \"provider\": \"cloud|local\", \"context\": \"...\"}",
-                "example": {
-                    "request": {
-                        "claim": "Python is a compiled language",
-                        "context": "Programming languages",
-                        "provider": "cloud"
-                    },
-                    "response": {
-                        "job_id": "uuid-string",
-                        "status_url": "/verify-status/uuid-string"
-                    }
-                },
-                "common_mistakes": [
-                    "Missing 'claim' field (required)",
-                    "Using invalid provider (must be 'cloud' or 'local')",
-                    "Not providing context for complex claims",
-                    "Polling status too frequently (recommended: 1-2s interval)"
-                ],
-                "tips": [
-                    "Provide context for grounded verification",
-                    "Use cloud provider for higher accuracy, local for privacy",
-                    "Cache results for identical claims",
-                ]
-            },
-            "reason": {
-                "description": "Run multi-pass reasoning with different framings and models.",
-                "usage": "POST /call/deep_think_async with {\"question\": \"...\", \"passes\": 2-6, \"task_class\": \"...\"}",
-                "example": {
-                    "request": {
-                        "question": "How should I optimize this database query?",
-                        "passes": 3,
-                        "task_class": "code_review"
-                    },
-                    "response": {
-                        "job_id": "uuid-string",
-                        "status": "queued"
-                    }
-                },
-                "common_mistakes": [
-                    "Using passes < 2 or > 6 (clamped to range)",
-                    "Using invalid task_class (check /capabilities for valid options)",
-                    "Not polling for results (jobs run asynchronously)",
-                    "Assuming results available immediately (typical latency: 15-180s)"
-                ],
-                "tips": [
-                    "Use 2-3 passes for quick analysis, 4-6 for deep investigation",
-                    "Match task_class to question type (code_review, investigation, etc.)",
-                    "Enable verify=True for critical decisions requiring extra validation",
-                    "Use provider_config to specify models or Ollama endpoint"
-                ]
-            },
-            "review": {
-                "description": "Perform code review using code_review task class with security focus.",
-                "usage": "POST /call/deep_think_async with {\"question\": \"<code_snippet>\", \"task_class\": \"code_review\"}",
-                "example": {
-                    "request": {
-                        "question": "def authenticate(password): return len(password) > 0",
-                        "task_class": "code_review",
-                        "passes": 3
-                    },
-                    "response": {
-                        "job_id": "uuid-string"
-                    }
-                },
-                "common_mistakes": [
-                    "Not using task_class='code_review' (this enables code specialization)",
-                    "Including too much context (keep focused on review target)",
-                    "Using too few passes (3+ recommended for thorough review)",
-                    "Not enabling verify=True for security-critical code"
-                ],
-                "tips": [
-                    "Use code_review task_class for specialized code analysis",
-                    "Enable verify=True for security review",
-                    "Provide minimal but sufficient context",
-                    "Use 4-6 passes for security-critical code",
-                    "Check /capabilities to see code-specialized models in use"
-                ]
-            },
-            "escalate": {
-                "description": "Escalate unresolved claims to manual review or higher-tier models.",
-                "usage": "Enable verify=True in deep_think_async call, or POST to /verification/escalate",
-                "example": {
-                    "request": {
-                        "claim": "Unresolved claim from reasoning",
-                        "reason": "Confidence too low"
-                    },
-                    "response": {
-                        "escalation_id": "uuid-string",
-                        "status": "escalated"
-                    }
-                },
-                "common_mistakes": [
-                    "Not enabling verify=True when certainty is critical",
-                    "Escalating without trying local reasoning first",
-                    "Assuming escalation = guaranteed correctness"
-                ],
-                "tips": [
-                    "Enable verify=True in reasoning calls for critical decisions",
-                    "Use escalation for confidence scores < 0.7",
-                    "Combine with heavy-tier models for difficult claims",
-                    "Check escalation_status for escalated items"
-                ]
-            }
-        }
-        
-        if command not in help_docs:
+        # Try to get help from mcp_help module
+        try:
+            help_doc = mcp_help.get_help(command)
+            return JSONResponse(help_doc, status_code=200)
+        except KeyError:
             return JSONResponse(
                 {
                     "error": f"Unknown command: {command}",
-                    "available_commands": list(help_docs.keys())
+                    "available_commands": mcp_help.get_all_commands()
                 },
                 status_code=404,
             )
-        
-        return JSONResponse(help_docs[command], status_code=200)
     
     except Exception as e:
         log.exception("Help endpoint error")
