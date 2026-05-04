@@ -199,6 +199,12 @@ _OLLAMA_DEFAULTS = {
     "heavy": "llama3.1:8b",
 }
 
+_ABLITERATION_DEFAULTS = {
+    "light": "gpt-4o-mini",
+    "medium": "gpt-4-turbo",
+    "heavy": "gpt-4o",
+}
+
 
 def _resolve_tier(
     tier: Optional[str],
@@ -246,6 +252,8 @@ def _select_model(
         return _COPILOT_DEFAULTS.get(tier, _COPILOT_DEFAULTS["heavy"])
     elif provider == "ollama":
         return _OLLAMA_DEFAULTS.get(tier, _OLLAMA_DEFAULTS["heavy"])
+    elif provider == "abliteration":
+        return _ABLITERATION_DEFAULTS.get(tier, _ABLITERATION_DEFAULTS["heavy"])
     
     return "unknown"
 
@@ -364,6 +372,39 @@ async def _call_ollama(
         return result["message"]["content"]
 
 
+async def _call_abliteration(
+    api_key: str,
+    model: str,
+    system: str,
+    user_prompt: str,
+    tier: str = "medium",
+) -> str:
+    """Call abliteration.ai OpenAI-compatible API."""
+    timeout = _timeout_for(tier)
+    base_url = os.getenv("ABLITERATION_BASE_URL", "https://api.abliteration.ai/v1")
+    
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 4096,
+                "temperature": 1.0,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+
+
 async def _call_provider(
     provider: str,
     model: str,
@@ -391,6 +432,12 @@ async def _call_provider(
     elif provider == "ollama":
         base_url = _read_credential("ollama", "base_url")
         return await _call_ollama(base_url or "http://localhost:11434", model, system, user_prompt, tier)
+    
+    elif provider == "abliteration":
+        api_key = provider_config.get("abliteration_api_key") or _read_credential("abliteration", "api_key")
+        if not api_key:
+            raise ValueError("ABLITERATION_API_KEY not set")
+        return await _call_abliteration(api_key, model, system, user_prompt, tier)
     
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -568,6 +615,8 @@ def _default_for_provider(provider: str, tier: str) -> str:
         return _ANTHROPIC_DEFAULTS.get(tier, _ANTHROPIC_DEFAULTS["heavy"])
     if provider == "copilot":
         return _COPILOT_DEFAULTS.get(tier, _COPILOT_DEFAULTS["heavy"])
+    if provider == "abliteration":
+        return _ABLITERATION_DEFAULTS.get(tier, _ABLITERATION_DEFAULTS["heavy"])
     return _OLLAMA_DEFAULTS.get(tier, _OLLAMA_DEFAULTS["heavy"])
 
 
@@ -602,6 +651,11 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
         env_val = os.getenv(f"DEEP_THINK_COPILOT_{tier.upper()}", "")
         if env_val:
             log.info(f"_model_for_tier: Using env var for copilot/{tier}={env_val}")
+            return env_val
+    elif provider == "abliteration":
+        env_val = os.getenv(f"DEEP_THINK_ABLITERATION_{tier.upper()}", "")
+        if env_val:
+            log.info(f"_model_for_tier: Using env var for abliteration/{tier}={env_val}")
             return env_val
     else:
         env_val = os.getenv(f"DEEP_THINK_MODEL_{tier.upper()}", "")
