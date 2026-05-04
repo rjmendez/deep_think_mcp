@@ -292,7 +292,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": PASS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "code_review": {
         "description": "Code analysis, bug detection, security review, code quality.",
@@ -300,14 +300,14 @@ TASK_CLASS_PROFILES: dict = {
         # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
         "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "safety": {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
@@ -315,7 +315,7 @@ TASK_CLASS_PROFILES: dict = {
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "extraction": {
         "description": "Structured data extraction, entity recognition, schema-constrained JSON output.",
@@ -323,14 +323,14 @@ TASK_CLASS_PROFILES: dict = {
         # Code-tuned models excel at structured JSON; extraction is pattern-matching over deep reasoning
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4",   "heavy": "claude-sonnet-4.6"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-haiku-4-5",  "heavy": "claude-sonnet-4-6"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-opus-4-1-20250805",  "heavy": "claude-sonnet-4-20250514"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
@@ -338,21 +338,21 @@ TASK_CLASS_PROFILES: dict = {
         # deepseek-r1:8b is the pure reasoning specialist; ideal for all challenge and synthesis passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",    "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "data_governance": {
         "description": "Telemetry integrity analysis for sensor networks. Data quality issues, root cause attribution, remediation synthesis.",
         "directives": DATA_GOVERNANCE_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
     "research_synthesis": {
         "description": "Grounded research synthesis with evidence chains. Literature survey, claim grounding, citations with confidence scores.",
         "directives": RESEARCH_SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
         "copilot":   {"light": "claude-sonnet-4.6", "medium": "claude-sonnet-4.6", "heavy": "claude-opus-4.7"},
-        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
     },
 }
 
