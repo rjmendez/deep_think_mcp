@@ -67,6 +67,8 @@ def init_db() -> None:
                 provider_config_json TEXT DEFAULT '{}',
                 created_at           TEXT NOT NULL,
                 started_at           TEXT,
+                claimed_by           TEXT,
+                claimed_at           TEXT,
                 completed_at         TEXT,
                 result               TEXT,
                 error                TEXT
@@ -171,7 +173,7 @@ def create_job(
     return job_id
 
 
-def claim_next_job() -> Optional[dict]:
+def claim_next_job(worker_id: str = "default") -> Optional[dict]:
     """Atomically claim the oldest queued job. Returns the job dict or None."""
     conn = _connect()
     try:
@@ -184,8 +186,8 @@ def claim_next_job() -> Optional[dict]:
             return None
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "UPDATE thinking_jobs SET status='running', started_at=? WHERE job_id=?",
-            (now, row["job_id"]),
+            "UPDATE thinking_jobs SET status='running', started_at=?, claimed_by=?, claimed_at=? WHERE job_id=?",
+            (now, worker_id, now, row["job_id"]),
         )
         conn.execute("COMMIT")
         return dict(row)
@@ -242,13 +244,66 @@ def requeue_stale(stale_after_minutes: int = 0) -> int:
     conn = _connect()
     try:
         cur = conn.execute(
-            "UPDATE thinking_jobs SET status='queued', started_at=NULL "
+            "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
             "WHERE status='running' AND started_at < ?",
             (cutoff,),
         )
         count = cur.rowcount
         conn.commit()
         return count
+    finally:
+        conn.close()
+
+
+def detect_orphaned_jobs(stale_after_minutes: int = 0) -> list[dict]:
+    """Detect jobs stuck in 'running' state for longer than threshold.
+    
+    Returns list of orphaned job dicts that should be requeued.
+    Uses DEEP_THINK_ORPHAN_TIMEOUT_MINUTES env var (default 5 min) for background
+    watchdog detection. This is separate from DEEP_THINK_STALE_JOB_MINUTES (120 min)
+    used only at startup for crash recovery.
+    """
+    import os
+    from datetime import timedelta
+    
+    if stale_after_minutes <= 0:
+        stale_after_minutes = int(os.getenv("DEEP_THINK_ORPHAN_TIMEOUT_MINUTES", "5"))
+    
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+    ).isoformat()
+    
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM thinking_jobs WHERE status='running' AND claimed_at < ?",
+            (cutoff,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
+    """Requeue an orphaned job by resetting its status to 'pending'.
+    
+    Args:
+        job_id: The job ID to requeue
+        reason: The reason for requeue (for logging purposes)
+        
+    Returns:
+        True if the job was requeued, False if not found
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE thinking_jobs SET status='pending', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
+            "WHERE job_id=? AND status='running'",
+            (job_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 

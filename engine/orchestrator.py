@@ -10,12 +10,14 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from typing import Optional, Any
 
 try:
-    from ground_truth import GroundTruthProvider
+    from ground_truth import GroundTruthProvider, Claim
 except ImportError:
     GroundTruthProvider = None
+    Claim = None
 
 from .types import ProviderConfig, PassResult, ValidationData
 from . import provider as provider_module
@@ -33,25 +35,29 @@ log = logging.getLogger(__name__)
 def _extract_claims_from_pass_output(output: str) -> list[dict]:
     """Extract structured claims from pass output using pattern matching.
     
-    Returns list of claim dicts with: claim_text, confidence, category
+    Returns list of claim dicts with all Claim dataclass fields:
+    id, statement, claim_type, subject, expected_value, confidence_model
     """
-    from ground_truth import Claim
-    
-    if GroundTruthProvider is None:
+    if GroundTruthProvider is None or Claim is None:
         return []
     
     claims = []
+    claim_counter = 0
     
     # Pattern 1: "CLAIM: ... [CONFIDENCE: X%]"
     claim_pattern = r"(?i)claim:\s*([^[\n]+)(?:\[confidence:\s*(\d+)%\])?"
     for match in re.finditer(claim_pattern, output):
         text = match.group(1).strip()
         conf = int(match.group(2)) / 100 if match.group(2) else 0.5
-        claims.append({
-            "claim_text": text,
-            "confidence": conf,
-            "category": "inferred",
-        })
+        
+        claim_data = _build_claim_data(
+            statement=text,
+            confidence_model=conf,
+            claim_type="inferred",
+            claim_id=claim_counter,
+        )
+        claims.append(claim_data)
+        claim_counter += 1
     
     # Pattern 2: "(✓) ... [N% confidence]" or "(✗) ... [N% confidence]"
     checkmark_pattern = r"\(([✓✗])\)\s*([^[\n]+)(?:\[(\d+)%\s+confidence\])?"
@@ -59,48 +65,155 @@ def _extract_claims_from_pass_output(output: str) -> list[dict]:
         status = match.group(1)
         text = match.group(2).strip()
         conf = int(match.group(3)) / 100 if match.group(3) else (0.7 if status == "✓" else 0.3)
-        claims.append({
-            "claim_text": text,
-            "confidence": conf,
-            "category": "verified" if status == "✓" else "refuted",
-        })
+        
+        claim_data = _build_claim_data(
+            statement=text,
+            confidence_model=conf,
+            claim_type="verified" if status == "✓" else "refuted",
+            claim_id=claim_counter,
+        )
+        claims.append(claim_data)
+        claim_counter += 1
     
     return claims
+
+
+def _build_claim_data(
+    statement: str,
+    confidence_model: float,
+    claim_type: str,
+    claim_id: int,
+) -> dict:
+    """Build complete claim data dict from extracted components.
+    
+    Generates all required Claim dataclass fields:
+    - id: unique identifier
+    - statement: the claim text
+    - claim_type: inferred from context or provided
+    - subject: extracted from statement
+    - expected_value: dict with metadata
+    - confidence_model: confidence score from output or defaults
+    """
+    # Generate unique claim ID
+    claim_id_str = f"claim_{uuid.uuid4().hex[:8]}"
+    
+    # Extract subject (first capitalized noun or first significant word)
+    subject = _extract_subject_from_statement(statement)
+    
+    # Build expected_value as metadata
+    expected_value = {
+        "inferred": True,
+        "type": claim_type,
+    }
+    
+    return {
+        "id": claim_id_str,
+        "statement": statement,
+        "claim_type": claim_type,
+        "subject": subject,
+        "expected_value": expected_value,
+        "confidence_model": max(0.0, min(1.0, confidence_model)),
+    }
+
+
+def _extract_subject_from_statement(statement: str) -> str:
+    """Extract a subject identifier from the statement.
+    
+    Looks for:
+    1. Known keywords (case-insensitive, ignoring apostrophes and trailing punctuation)
+    2. Capitalized words (likely entities)
+    3. First significant word
+    """
+    words = statement.split()
+    
+    # First pass: look for known keywords (case-insensitive)
+    known_keywords = {'GPS', 'API', 'CPU', 'RAM', 'USB', 'HTTP', 'SQL', 'REST', 'JSON'}
+    for word in words:
+        # Strip trailing and leading punctuation for comparison
+        clean_word = word.rstrip(".,;:!?'\"").lstrip("'\"").upper()
+        if clean_word in known_keywords:
+            return clean_word
+    
+    # Second pass: look for capitalized words (but skip common words)
+    common_words = {'The', 'A', 'An', 'And', 'Or', 'But', 'This', 'That', 'Is'}
+    for word in words:
+        clean_word = word.rstrip(".,;:!?'\"")
+        if clean_word not in common_words and clean_word and clean_word[0].isupper() and len(clean_word) > 2:
+            return clean_word
+    
+    # Fallback: first significant word (at least 3 chars)
+    for word in words:
+        clean_word = word.rstrip(".,;:!?'\"")
+        if len(clean_word) > 2:
+            return clean_word
+    
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
 # Ground truth validation (from engine.py lines 1432-1523)
 # ---------------------------------------------------------------------------
 
-def _validate_claims_against_ground_truth(
+async def _validate_claims_against_ground_truth(
     claims: list[dict],
     ground_truth_provider: Optional[Any] = None,
+    timeout_secs: float = 10.0,
 ) -> Optional[ValidationData]:
     """Validate extracted claims against ground truth.
     
+    Converts claim dicts to Claim objects and validates them.
+    
     Returns ValidationData if ground_truth_provider is available, else None.
+    
+    Args:
+        claims: List of claim dicts with 'id', 'statement', 'claim_type', 'subject', 
+                'expected_value', 'confidence_model' fields
+        ground_truth_provider: Provider instance with async validate_batch method
+        timeout_secs: Timeout for validation batch operation (default 10.0 seconds)
+    
+    Raises:
+        asyncio.TimeoutError: If validation takes longer than timeout_secs
+        ValueError: If claim objects cannot be created
     """
-    if GroundTruthProvider is None or not ground_truth_provider:
+    if GroundTruthProvider is None or Claim is None or not ground_truth_provider:
         return None
     
     if not claims:
         return None
     
     try:
-        from ground_truth import Claim
+        # Convert claim dicts to Claim objects using dataclass constructor
+        claim_objects = []
+        for claim_data in claims:
+            try:
+                claim_obj = Claim(
+                    id=claim_data.get("id", f"claim_{uuid.uuid4().hex[:8]}"),
+                    statement=claim_data.get("statement", ""),
+                    claim_type=claim_data.get("claim_type", "inferred"),
+                    subject=claim_data.get("subject", "unknown"),
+                    expected_value=claim_data.get("expected_value", {}),
+                    confidence_model=float(claim_data.get("confidence_model", 0.5)),
+                )
+                claim_objects.append(claim_obj)
+            except (TypeError, ValueError, KeyError) as e:
+                log.warning(f"Failed to create Claim from data {claim_data}: {e}")
+                continue
         
-        # Convert claim dicts to Claim objects
-        claim_objects = [
-            Claim(
-                text=c.get("claim_text", ""),
-                confidence=c.get("confidence", 0.5),
-                category=c.get("category", "inferred"),
+        if not claim_objects:
+            return None
+        
+        # Validate batch with timeout to prevent hanging tasks
+        try:
+            validation_results = await asyncio.wait_for(
+                ground_truth_provider.validate_batch(claim_objects),
+                timeout=timeout_secs,
             )
-            for c in claims
-        ]
+        except asyncio.TimeoutError:
+            log.warning(f"Validation batch timed out after {timeout_secs}s for {len(claim_objects)} claims")
+            raise
         
-        # Validate batch
-        validation_results = ground_truth_provider.validate_batch(claim_objects)
+        if not validation_results:
+            return None
         
         # Aggregate results
         total = len(validation_results)
@@ -116,6 +229,12 @@ def _validate_claims_against_ground_truth(
             raw_results=validation_results,
         )
     
+    except asyncio.TimeoutError:
+        log.warning("Ground truth validation timed out")
+        return None
+    except ValueError as e:
+        log.error(f"Failed to create claim objects: {e}")
+        return None
     except Exception as e:
         log.debug(f"Ground truth validation failed: {e}")
         return None
@@ -195,7 +314,7 @@ async def _run_alarm_scan(
     Returns scan result dict with hallucination_count, overall_confidence, etc.
     """
     claims = _extract_claims_from_pass_output(pass_output)
-    validation = _validate_claims_against_ground_truth(claims, ground_truth_provider)
+    validation = await _validate_claims_against_ground_truth(claims, ground_truth_provider)
     
     if validation:
         return {
@@ -388,7 +507,7 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         # Select provider and model
         tier = directives_module._FRAMING_TIER.get(framing_name, "medium")
         provider_name = provider_config.get("provider", "ollama")
-        model_name = model or directives_module._FRAMING_TIER.get(framing_name, "medium")
+        model_name = model or provider_module._model_for_tier(cfg, tier, task_class)
         
         try:
             # Call provider
@@ -404,7 +523,7 @@ Use the mandate to structure your response. Be precise and evidence-based."""
             
             # Extract and validate claims
             claims = _extract_claims_from_pass_output(output)
-            validation = _validate_claims_against_ground_truth(claims, ground_truth_provider)
+            validation = await _validate_claims_against_ground_truth(claims, ground_truth_provider)
             validation_results.append(validation)
             
             log.info(f"Pass {pass_num} complete ({framing_name})")

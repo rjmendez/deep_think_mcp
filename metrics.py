@@ -78,6 +78,10 @@ class Metrics:
     timeout_count: int = 0
     timeout_by_component: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     
+    # Orphaned job metrics
+    orphaned_jobs_detected: int = 0
+    orphaned_jobs_requeued: int = 0
+    
     # Timestamps
     start_time_utc: datetime = field(default_factory=lambda: datetime.utcnow())
     last_reset_utc: datetime = field(default_factory=lambda: datetime.utcnow())
@@ -155,6 +159,16 @@ class Metrics:
         with self._lock:
             self.timeout_count += 1
             self.timeout_by_component[component] += 1
+
+    def increment_orphaned_jobs_detected(self) -> None:
+        """Record detection of an orphaned job."""
+        with self._lock:
+            self.orphaned_jobs_detected += 1
+
+    def increment_orphaned_jobs_requeued(self) -> None:
+        """Record successful requeue of an orphaned job."""
+        with self._lock:
+            self.orphaned_jobs_requeued += 1
 
     def _update_cache_hit_rate(self) -> None:
         """Update cache hit rate (call with lock held)."""
@@ -261,6 +275,14 @@ class Metrics:
             lines.append(f"# HELP ground_truth_timeouts_total Timeouts by component")
             lines.append(f"# TYPE ground_truth_timeouts_total counter")
             lines.append(f"ground_truth_timeouts_total {self.timeout_count}")
+            
+            lines.append(f"# HELP ground_truth_orphaned_jobs_detected_total Orphaned jobs detected")
+            lines.append(f"# TYPE ground_truth_orphaned_jobs_detected_total counter")
+            lines.append(f"ground_truth_orphaned_jobs_detected_total {self.orphaned_jobs_detected}")
+            
+            lines.append(f"# HELP ground_truth_orphaned_jobs_requeued_total Orphaned jobs requeued")
+            lines.append(f"# TYPE ground_truth_orphaned_jobs_requeued_total counter")
+            lines.append(f"ground_truth_orphaned_jobs_requeued_total {self.orphaned_jobs_requeued}")
             
             lines.append(f"# HELP ground_truth_uptime_seconds Process uptime")
             lines.append(f"# TYPE ground_truth_uptime_seconds gauge")
