@@ -16,6 +16,18 @@ from .nova_client import (
 )
 from .pipeline import VerificationPipeline
 from .recalculator import ConfidenceRecalculator, RecalculationResult
+from .research_tools import (
+    NovaSearchResponse,
+    DAMAQueryResponse,
+    WebSearchResponse,
+    SearchResult,
+    DAMAReading,
+    WebResult,
+    nova_search,
+    dama_query,
+    web_search,
+    format_research_context,
+)
 
 __all__ = [
     "ClaimExtractor",
@@ -29,4 +41,15 @@ __all__ = [
     "HumanEscalationQueue",
     "EscalationItem",
     "get_escalation_queue",
+    # Research tools
+    "nova_search",
+    "dama_query",
+    "web_search",
+    "format_research_context",
+    "NovaSearchResponse",
+    "DAMAQueryResponse",
+    "WebSearchResponse",
+    "SearchResult",
+    "DAMAReading",
+    "WebResult",
 ]
