@@ -542,6 +542,10 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         provider_name = provider_config["provider"]  # Already validated as required above
         model_name = model or provider_module._model_for_tier(cfg, tier, task_class)
         
+        # Fallback: ensure we have a valid Anthropic model
+        if provider_name == "anthropic" and (not model_name or not model_name.startswith("claude")):
+            model_name = "claude-opus-4-1-20250805"
+        
         try:
             # Call provider
             output = await provider_module._call_provider(
