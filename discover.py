@@ -248,9 +248,9 @@ def _detect_cloud_providers() -> list[ModelInfo]:
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if anthropic_key and anthropic_key not in ("not-set", ""):
         for mid, tier in [
-            ("claude-haiku-4-5",  "light"),
-            ("claude-sonnet-4-6", "medium"),
-            ("claude-opus-4-7",   "heavy"),
+            ("claude-opus-4-1-20250805",  "light"),
+            ("claude-sonnet-4-20250514", "medium"),
+            ("claude-opus-4-1-20250805",   "heavy"),
         ]:
             models.append(ModelInfo(
                 model_id=mid, provider="anthropic",
