@@ -249,9 +249,14 @@ async def _call_anthropic(
     timeout = _timeout_for(tier)
     
     import sys
-    print(f"DEBUG _call_anthropic: key={api_key[:30]}..., model={model}", file=sys.stderr)
+    # Verify key is valid
+    if not api_key or not api_key.startswith("sk-ant"):
+        print(f"CRITICAL: Invalid API key format! key={api_key}", file=sys.stderr)
+    
+    print(f"DEBUG _call_anthropic: key={api_key[:30]}..., model={model}, timeout={timeout}", file=sys.stderr)
     
     async with httpx.AsyncClient(timeout=timeout) as client:
+        print(f"DEBUG: Making request to https://api.anthropic.com/v1/messages", file=sys.stderr)
         response = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -266,7 +271,7 @@ async def _call_anthropic(
                 "messages": [{"role": "user", "content": user_prompt}],
             },
         )
-        print(f"DEBUG: Response status = {response.status_code}", file=sys.stderr)
+        print(f"DEBUG: Response status = {response.status_code}, headers={dict(list(response.headers.items())[:3])}", file=sys.stderr)
         response.raise_for_status()
         result = response.json()
         return result["content"][0]["text"]
