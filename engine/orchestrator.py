@@ -407,6 +407,16 @@ async def deep_think_passes(
     ground_truth_provider: Optional[Any] = None,
     force_local_models: bool = False,
     device_id: str = "",
+    job_id: str = "",
+    pass_overrides: Optional[list] = None,
+    mandate_prefix: str = "",
+    verify: bool = False,
+    perspective_name: str = "",
+    enable_research: bool = True,
+    research_query: Optional[str] = None,
+    dama_node_id: str = "",
+    dama_metric: str = "",
+    web_domain_whitelist: Optional[list] = None,
 ) -> dict:
     """Main multi-pass reasoning loop.
     
@@ -421,6 +431,16 @@ async def deep_think_passes(
         force_local_models: When True, enforce local-only Ollama, block cloud providers.
                             Used for MQTT operations to prevent data leakage.
         device_id: Device ID for logging (e.g., "ant_001"). Used to tag MQTT enforcement logs.
+        job_id: Optional job ID for tracking (from async job queue)
+        pass_overrides: Per-pass overrides
+        mandate_prefix: Mandate prefix for fan-out perspectives
+        verify: Enable verification pass
+        perspective_name: Perspective name for fan-out jobs
+        enable_research: Enable research tools (Nova search, web search)
+        research_query: Optional custom research query
+        dama_node_id: DAMA device node ID for telemetry
+        dama_metric: DAMA metric name
+        web_domain_whitelist: Whitelist domains for web search
     
     Returns:
         Dict with keys: final_answer, pass_outputs, confidence, duration_secs

@@ -15,8 +15,8 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from adversarial_testing import store
-from adversarial_testing.governance import requires_human_review
+from . import store
+from .governance import requires_human_review
 
 logger = logging.getLogger(__name__)
 
