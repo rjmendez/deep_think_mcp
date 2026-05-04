@@ -144,12 +144,13 @@ async def _validate_and_enforce_local_models(
 # ---------------------------------------------------------------------------
 
 def _read_credential(provider: str, key: str) -> Optional[str]:
-    """Read credential from env var or from ~/.copilot/credentials."""
+    """Read credential from env var or from ~/.copilot/credentials or ~/.abliteration/credentials."""
     # Try env var first
     env_key = {
         "anthropic": "ANTHROPIC_API_KEY",
         "copilot": "GITHUB_COPILOT_OAUTH_TOKEN",
         "ollama": "OLLAMA_BASE_URL",
+        "abliteration": "ABLITERATION_API_KEY",
     }.get(provider)
     
     if env_key:
@@ -158,7 +159,23 @@ def _read_credential(provider: str, key: str) -> Optional[str]:
             log.debug(f"Found {provider} credential in env var {env_key}")
             return value
     
-    # Try credentials file
+    # Special handling for abliteration: check ~/.abliteration/credentials with hostname as key
+    if provider == "abliteration" and key == "api_key":
+        try:
+            import socket
+            hostname = socket.gethostname()
+            cred_file = os.path.expanduser("~/.abliteration/credentials")
+            if os.path.exists(cred_file):
+                with open(cred_file) as f:
+                    for line in f:
+                        if line.startswith(f"{hostname}="):
+                            result = line.split("=", 1)[1].strip()
+                            log.debug(f"Found abliteration credential for {hostname}: {result[:20]}...")
+                            return result
+        except Exception as e:
+            log.debug(f"Error reading abliteration credentials: {e}")
+    
+    # Try standard credentials file
     cred_file = os.path.expanduser("~/.copilot/credentials")
     if os.path.exists(cred_file):
         try:
