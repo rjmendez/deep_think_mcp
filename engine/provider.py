@@ -626,7 +626,7 @@ def _discovered_tier_model(provider: str, tier: str) -> str:
         assignment = disc.tier_assignments.get(provider)
         if not assignment:
             return ""
-        return assignment.get(tier, "")
+        return getattr(assignment, tier, "")
     except Exception as e:
         log.debug(f"Could not get discovered tier model: {e}")
         return ""
