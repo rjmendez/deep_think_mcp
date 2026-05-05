@@ -324,9 +324,19 @@ async def _call_anthropic(
             json=payload,
         )
         if response.status_code != 200:
-            log.error(f"Anthropic {response.status_code}: model={model}, response={response.text[:300]}")
+            error_detail = response.text[:500]
+            raise ValueError(f"Anthropic API error {response.status_code}: {error_detail}")
         response.raise_for_status()
         result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "content" not in result:
+            raise ValueError(f"Invalid Anthropic response structure: {result}")
+        if not result.get("content") or len(result["content"]) == 0:
+            raise ValueError("Empty content in Anthropic response")
+        if "text" not in result["content"][0]:
+            raise ValueError(f"Missing 'text' field in Anthropic response content: {result['content'][0]}")
+        
         return result["content"][0]["text"]
 
 
@@ -354,8 +364,22 @@ async def _call_copilot(
                 "messages": [{"role": "user", "content": user_prompt}],
             },
         )
+        if response.status_code != 200:
+            error_detail = response.text[:500]
+            raise ValueError(f"Copilot API error {response.status_code}: {error_detail}")
         response.raise_for_status()
         result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "choices" not in result:
+            raise ValueError(f"Invalid Copilot response structure: {result}")
+        if not result.get("choices") or len(result["choices"]) == 0:
+            raise ValueError("Empty choices in Copilot response")
+        if "message" not in result["choices"][0]:
+            raise ValueError(f"Missing 'message' field in Copilot response choices: {result['choices'][0]}")
+        if "content" not in result["choices"][0]["message"]:
+            raise ValueError(f"Missing 'content' field in Copilot response message: {result['choices'][0]['message']}")
+        
         return result["choices"][0]["message"]["content"]
 
 
@@ -384,8 +408,18 @@ async def _call_ollama(
                 "stream": False,
             },
         )
+        if response.status_code != 200:
+            error_detail = response.text[:500]
+            raise ValueError(f"Ollama API error {response.status_code}: {error_detail}")
         response.raise_for_status()
         result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "message" not in result:
+            raise ValueError(f"Invalid Ollama response structure: {result}")
+        if "content" not in result["message"]:
+            raise ValueError(f"Missing 'content' field in Ollama response message: {result['message']}")
+        
         return result["message"]["content"]
 
 
@@ -432,10 +466,22 @@ async def _call_abliteration(
         )
         
         if response.status_code != 200:
-            log.error(f"Abliteration API error {response.status_code}: {response.text[:500]}")
+            error_detail = response.text[:500]
+            raise ValueError(f"Abliteration API error {response.status_code}: {error_detail}")
         
         response.raise_for_status()
         result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "choices" not in result:
+            raise ValueError(f"Invalid Abliteration response structure: {result}")
+        if not result.get("choices") or len(result["choices"]) == 0:
+            raise ValueError("Empty choices in Abliteration response")
+        if "message" not in result["choices"][0]:
+            raise ValueError(f"Missing 'message' field in Abliteration response choices: {result['choices'][0]}")
+        if "content" not in result["choices"][0]["message"]:
+            raise ValueError(f"Missing 'content' field in Abliteration response message: {result['choices'][0]['message']}")
+        
         return result["choices"][0]["message"]["content"]
 
 
