@@ -509,10 +509,6 @@ async def deep_think_passes(
     if provider_config is None:
         provider_config = {}
     
-    # REQUIRED: provider must be explicitly specified (no defaults!)
-    if not provider_config.get("provider"):
-        raise ValueError("provider is REQUIRED in provider_config. Must be 'anthropic', 'ollama', or other valid provider.")
-    
     # Create provider config object
     cfg = provider_module.build_provider_config(provider_config)
     
@@ -703,10 +699,6 @@ async def run_fan_out(
     # Enforce local-only models on all configs
     if provider_config is None:
         provider_config = {}
-    
-    # REQUIRED: provider must be explicitly specified (no defaults!)
-    if not provider_config.get("provider"):
-        raise ValueError("provider is REQUIRED in provider_config. Must be 'anthropic', 'ollama', or other valid provider.")
     
     cfg = provider_module.build_provider_config(provider_config)
     

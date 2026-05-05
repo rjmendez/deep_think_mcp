@@ -82,7 +82,10 @@ async def _check_ollama_available(base_url: str = "") -> bool:
     
     Used for startup validation when force_local_models=True.
     """
-    base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    base_url = base_url or os.getenv("OLLAMA_BASE_URL")
+    if not base_url:
+        log.error("[OLLAMA] OLLAMA_BASE_URL environment variable not set. Cannot check Ollama availability.")
+        return False
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{base_url}/api/tags")
@@ -396,7 +399,7 @@ async def _call_ollama(
     log.info(f"_call_ollama: ENTER model='{model}', tier={tier}, timeout={timeout}s, base_url={base_url}")
     
     if not base_url:
-        base_url = "http://localhost:11434"
+        raise ValueError("OLLAMA_BASE_URL not configured. Cannot call Ollama. Set OLLAMA_BASE_URL environment variable.")
     
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -529,8 +532,10 @@ async def _call_provider(
         return await _call_copilot(oauth_token, model, system, user_prompt, tier)
     
     elif provider == "ollama":
-        base_url = _read_credential("ollama", "base_url")
-        return await _call_ollama(base_url or "http://localhost:11434", model, system, user_prompt, tier)
+        base_url = _read_credential("ollama", "base_url") or os.getenv("OLLAMA_BASE_URL")
+        if not base_url:
+            raise ValueError("OLLAMA_BASE_URL not configured. Cannot use Ollama provider. Set OLLAMA_BASE_URL environment variable.")
+        return await _call_ollama(base_url, model, system, user_prompt, tier)
     
     elif provider == "abliteration":
         api_key = provider_config.get("abliteration_api_key") or _read_credential("abliteration", "api_key")

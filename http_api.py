@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from uvicorn import run
 
-from engine import orchestrator, TASK_CLASS_PROFILES
+from engine import orchestrator, TASK_CLASS_PROFILES, build_provider_config
 from engine.store import create_job, get_job, list_jobs, update_job
 from engine.validator import validate_passes, validate_width, validate_height, ValidationError
 
@@ -88,13 +88,30 @@ async def deep_think_async(
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Ensure provider_config is a dict
+    provider_config = provider_config or {}
+    
+    # Store control params in provider_config so worker can retrieve them
+    provider_config_for_job = provider_config.copy()
+    provider_config_for_job["data_policy"] = data_policy
+    provider_config_for_job["task_class"] = task_class
+    provider_config_for_job["enable_research"] = enable_research
+    provider_config_for_job["research_query"] = research_query
+    provider_config_for_job["dama_node_id"] = dama_node_id
+    provider_config_for_job["dama_metric"] = dama_metric
+    if web_domain_whitelist:
+        provider_config_for_job["web_domain_whitelist"] = web_domain_whitelist
+    
+    # Build provider config to apply data_policy-based defaults
+    cfg = build_provider_config(provider_config_for_job)
+    
     # Create job
     job_id = create_job(
         question=question,
         passes=passes,
-        provider=provider_config.get("provider", "anthropic") if provider_config else "anthropic",
+        provider=cfg.provider,
         model_summary="",
-        provider_config_json=json.dumps(provider_config or {}),
+        provider_config_json=json.dumps(provider_config_for_job),
     )
 
     # Queue async work
@@ -105,7 +122,7 @@ async def deep_think_async(
             task_class=task_class,
             data_policy=data_policy,
             model=model,
-            provider_config=provider_config,
+            provider_config=provider_config_for_job,
             verify=verify,
             job_id=job_id,
         )
@@ -147,13 +164,28 @@ async def deep_think_fan_out(
 
     total_calls = width * height + 1
 
+    # Ensure provider_config is a dict
+    provider_config = provider_config or {}
+    
+    # Store control params in provider_config so worker can retrieve them
+    provider_config_for_job = provider_config.copy()
+    provider_config_for_job["data_policy"] = data_policy
+    provider_config_for_job["task_class"] = task_class
+    provider_config_for_job["extract_claims"] = extract_claims
+    provider_config_for_job["fan_out"] = True
+    provider_config_for_job["width"] = width
+    provider_config_for_job["height"] = height
+    
+    # Build provider config to apply data_policy-based defaults
+    cfg = build_provider_config(provider_config_for_job)
+    
     # Create job
     job_id = create_job(
         question=question,
         passes=total_calls,
-        provider=provider_config.get("provider", "anthropic") if provider_config else "anthropic",
+        provider=cfg.provider,
         model_summary="",
-        provider_config_json=json.dumps(provider_config or {}),
+        provider_config_json=json.dumps(provider_config_for_job),
     )
 
     # Queue async work
@@ -168,7 +200,7 @@ async def deep_think_fan_out(
             max_width=max_width,
             confidence_threshold=confidence_threshold,
             extract_claims=extract_claims,
-            provider_config=provider_config,
+            provider_config=provider_config_for_job,
             job_id=job_id,
         )
     )
