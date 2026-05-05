@@ -217,9 +217,9 @@ _OLLAMA_DEFAULTS = {
 }
 
 _ABLITERATION_DEFAULTS = {
-    "light": "gpt-4o-mini",
-    "medium": "gpt-4-turbo",
-    "heavy": "gpt-4o",
+    "light": "abliterated-model",
+    "medium": "abliterated-model",
+    "heavy": "abliterated-model",
 }
 
 
