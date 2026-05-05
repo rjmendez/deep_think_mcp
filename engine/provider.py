@@ -395,20 +395,29 @@ async def _call_abliteration(
     system: str,
     user_prompt: str,
     tier: str = "medium",
+    custom_params: dict | None = None,
 ) -> str:
-    """Call abliteration.ai OpenAI-compatible API."""
+    """Call abliteration.ai OpenAI-compatible API with optional custom parameters."""
     timeout = _timeout_for(tier)
     base_url = os.getenv("ABLITERATION_BASE_URL", "https://api.abliteration.ai/v1")
     
+    custom_params = custom_params or {}
+    
     payload = {
         "model": model,
-        "max_tokens": 4096,
-        "temperature": 1.0,
+        "max_tokens": custom_params.get("max_tokens", 4096),
+        "temperature": custom_params.get("temperature", 1.0),
+        "top_p": custom_params.get("top_p", 1.0),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_prompt},
         ],
     }
+    
+    # Add any additional provider-specific parameters
+    for key in ["frequency_penalty", "presence_penalty", "focus"]:
+        if key in custom_params:
+            payload[key] = custom_params[key]
     
     log.debug(f"Abliteration request: model={model}, messages={len(payload['messages'])}")
     
@@ -757,9 +766,9 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
     cfg = ProviderConfig(
         provider=ov.get("provider", ""),
         base_url=ov.get("base_url", os.getenv("OLLAMA_BASE_URL", "")),
-        light=ov.get("light", ""),
-        medium=ov.get("medium", ""),
-        heavy=ov.get("heavy", ""),
+        light=ov.get("light", ov.get("light_model", "")),
+        medium=ov.get("medium", ov.get("medium_model", "")),
+        heavy=ov.get("heavy", ov.get("heavy_model", "")),
         model=ov.get("model", ""),
         light_provider=ov.get("light_provider", os.getenv("DEEP_THINK_LIGHT_PROVIDER", "")),
         medium_provider=ov.get("medium_provider", os.getenv("DEEP_THINK_MEDIUM_PROVIDER", "")),

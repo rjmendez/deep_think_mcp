@@ -23,6 +23,7 @@ except ImportError:
 from .types import ProviderConfig, PassResult, ValidationData
 from . import provider as provider_module
 from . import directives as directives_module
+from .validator import validate_passes, validate_width, validate_height, ValidationError
 from deep_think_mcp import store
 from deep_think_mcp import discover
 
@@ -463,6 +464,20 @@ async def deep_think_passes(
     
     start_time = time.time()
     
+    # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
+    try:
+        passes = validate_passes(passes)
+    except ValidationError as e:
+        log.error(f"Parameter validation failed: {e}")
+        return {
+            "error": str(e),
+            "status": "validation_error",
+            "final_answer": None,
+            "pass_outputs": [],
+            "confidence": 0,
+            "duration_secs": 0,
+        }
+    
     # Check environment override for force_local_models (security gate)
     import os
     env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
@@ -531,6 +546,11 @@ async def deep_think_passes(
     for pass_num in range(1, passes + 1):
         log.info(f"Pass {pass_num}/{passes}")
         
+        # Check if this pass has overrides
+        pass_override = None
+        if pass_overrides and pass_num <= len(pass_overrides):
+            pass_override = pass_overrides[pass_num - 1]  # 0-indexed
+        
         # Select framing
         if pass_num == passes and len(directives) > 0:
             # Last pass: use final directive
@@ -541,8 +561,11 @@ async def deep_think_passes(
                 pass_num, passes, directives, validation_data
             )
         
-        # Construct prompt
-        system_prompt = f"""You are an expert reasoner. Apply this framing strictly:
+        # Apply override system prompt if provided
+        if pass_override and "system" in pass_override:
+            system_prompt = pass_override["system"]
+        else:
+            system_prompt = f"""You are an expert reasoner. Apply this framing strictly:
 
 {framing_text}
 
@@ -550,11 +573,16 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         
         user_prompt = f"Question: {question}"
         
-        # Select provider and model
-        tier = directives_module._FRAMING_TIER.get(framing_name, "medium")
-        provider_name = provider_config["provider"]  # Already validated as required above
-        model_name = model or provider_module._model_for_tier(cfg, tier, task_class)
-        log.info(f"deep_think_passes: selected model_name='{model_name}' for tier={tier}, task_class={task_class}, provider={provider_name}")
+        # Select provider and model with overrides
+        override_tier = pass_override.get("tier") if pass_override else None
+        tier = override_tier or directives_module._FRAMING_TIER.get(framing_name, "medium")
+        
+        override_provider = pass_override.get("provider") if pass_override else None
+        provider_name = override_provider or provider_module._tier_provider(cfg, tier)
+        
+        override_model = pass_override.get("model") if pass_override else None
+        model_name = override_model or (model or provider_module._model_for_tier(cfg, tier, task_class))
+        log.info(f"deep_think_passes: pass {pass_num} model_name='{model_name}' for tier={tier}, task_class={task_class}, provider={provider_name}")
         
         # Fallback: ensure we have a valid Anthropic model
         if provider_name == "anthropic" and (not model_name or not model_name.startswith("claude")):
@@ -643,6 +671,22 @@ async def run_fan_out(
     
     start_time = time.time()
     
+    # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
+    try:
+        width = validate_width(width)
+        height = validate_height(height)
+    except ValidationError as e:
+        log.error(f"Parameter validation failed: {e}")
+        return {
+            "error": str(e),
+            "status": "validation_error",
+            "final_answer": None,
+            "perspective_outputs": {},
+            "synthesis": None,
+            "confidence": 0,
+            "duration_secs": 0,
+        }
+    
     # Check environment override for force_local_models (security gate)
     env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
     force_local_models = force_local_models or env_force_local
@@ -709,8 +753,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
             
             try:
                 output = await provider_module._call_provider(
-                    provider=provider_config["provider"],  # Already validated as required above
-                    model=model or "qwen3.5:27b",
+                    provider=provider_module._tier_provider(cfg, "medium"),
+                    model=model or provider_module._model_for_tier(cfg, "medium", task_class),
                     system=system_prompt,
                     user_prompt=user_prompt,
                     tier="medium",
@@ -745,8 +789,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
     
     try:
         final_answer = await provider_module._call_provider(
-            provider=provider_config["provider"],  # Already validated as required above
-            model=model or "llama3.1:8b",
+            provider=provider_module._tier_provider(cfg, "heavy"),
+            model=model or provider_module._model_for_tier(cfg, "heavy", task_class),
             system="You are a synthesis expert. Integrate all perspectives into a coherent answer.",
             user_prompt=synthesis_prompt,
             tier="heavy",

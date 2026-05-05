@@ -15,6 +15,7 @@ from ..engine import (
     CREATIVE_MODES,
     get_metrics_snapshot,
 )
+from ..engine.validator import validate_passes, validate_width, validate_height, ValidationError
 
 log = logging.getLogger(__name__)
 
@@ -25,19 +26,19 @@ def register(mcp):
     @mcp.tool()
     async def deep_think_async(
         question: str,
-        passes: int = 3,
-        task_class: str = "general",
-        data_policy: str = "any",
-        model: str = "",
+        passes: Optional[int] = None,
+        task_class: Optional[str] = None,
+        data_policy: Optional[str] = None,
+        model: Optional[str] = None,
         provider_config: Optional[dict] = None,
         verify: bool = False,
-        width: int = 1,
-        height: int = 1,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
         extract_claims: bool = False,
         enable_research: bool = True,
-        research_query: str = "",
-        dama_node_id: str = "",
-        dama_metric: str = "",
+        research_query: Optional[str] = None,
+        dama_node_id: Optional[str] = None,
+        dama_metric: Optional[str] = None,
         web_domain_whitelist: Optional[list] = None,
     ) -> dict:
         """Queue a multi-pass reasoning job and return a job_id immediately.
@@ -88,6 +89,14 @@ def register(mcp):
 
         Response includes proof_chain field when research tools were used.
         """
+        # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
+        try:
+            passes = validate_passes(passes)
+            width = validate_width(width)
+            height = validate_height(height)
+        except ValidationError as e:
+            return {"error": str(e), "status": "validation_error"}
+        
         pc: dict = dict(provider_config or {})
         if model:
             pc.setdefault("model", model)
@@ -274,10 +283,10 @@ def register(mcp):
     @mcp.tool()
     async def deep_think_fan_out(
         question: str,
-        width: int = 3,
-        height: int = 2,
-        task_class: str = "general",
-        data_policy: str = "any",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        task_class: Optional[str] = None,
+        data_policy: Optional[str] = None,
         max_parallel: Optional[int] = None,
         max_width: Optional[int] = None,
         confidence_threshold: Optional[int] = None,
@@ -325,6 +334,19 @@ def register(mcp):
         Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
         Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
         """
+        # Apply defaults
+        width = width if width is not None else 3
+        height = height if height is not None else 2
+        task_class = task_class if task_class is not None else "general"
+        data_policy = data_policy if data_policy is not None else "any"
+        
+        # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
+        try:
+            width = validate_width(width)
+            height = validate_height(height)
+        except ValidationError as e:
+            return {"error": str(e), "status": "validation_error"}
+        
         max_parallel = max_parallel if max_parallel is not None else 2
         max_width = max_width if max_width is not None else 6
         confidence_threshold = confidence_threshold if confidence_threshold is not None else 50
@@ -361,7 +383,8 @@ def register(mcp):
         )
 
         mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
-        perspective_names = [m["name"] for m in mandates[:width]]
+        # Extract first 'width' perspective names from the mandates dict
+        perspective_names = list(mandates.keys())[:width]
 
         return {
             "job_id": job_id,
