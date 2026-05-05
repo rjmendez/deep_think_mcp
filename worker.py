@@ -142,7 +142,14 @@ async def _run_job(job: dict) -> None:
         await asyncio.to_thread(store.complete_job, job_id, json.dumps(result))
     except Exception as exc:
         error_msg = str(exc) or type(exc).__qualname__
-        await asyncio.to_thread(store.fail_job, job_id, error_msg)
+        try:
+            await asyncio.to_thread(store.fail_job, job_id, error_msg)
+        except Exception as fail_exc:
+            # Double-failure: both complete_job and fail_job failed
+            fail_error_msg = str(fail_exc) or type(fail_exc).__qualname__
+            log.error("Job %s: DOUBLE FAILURE - complete_job AND fail_job failed. complete: %s, fail: %s", 
+                     job_id, error_msg, fail_error_msg)
+            # Don't re-raise — let orphan watchdog detect and requeue
         log.error("Job %s failed: %s", job_id, error_msg)
 
 

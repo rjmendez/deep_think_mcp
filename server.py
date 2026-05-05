@@ -64,7 +64,7 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
-from .engine.provider import _tier_provider
+from .engine.provider import _tier_provider, refresh_ollama_models
 from .engine import build_provider_config
 from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
@@ -102,6 +102,16 @@ async def _lifespan(app):
     except Exception as e:
         log.error("[LIFESPAN] Database init failed: %s", e)
         raise
+    
+    # Refresh Ollama model cache for validation
+    try:
+        log.info("[LIFESPAN] Refreshing Ollama model cache...")
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        await refresh_ollama_models(ollama_url)
+        log.info("[LIFESPAN] Ollama model cache refreshed")
+    except Exception as e:
+        log.warning("[LIFESPAN] Ollama model cache refresh failed (non-fatal): %s", e)
+        # Continue without Ollama model validation — will fail at job runtime instead
     
     # [MQTT] Startup — initialize subscriber and processor
     try:

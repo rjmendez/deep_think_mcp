@@ -393,35 +393,53 @@ async def _call_ollama(
 ) -> str:
     """Call local Ollama instance."""
     timeout = _timeout_for(tier)
+    log.info(f"_call_ollama: ENTER model='{model}', tier={tier}, timeout={timeout}s, base_url={base_url}")
     
     if not base_url:
         base_url = "http://localhost:11434"
     
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-            },
-        )
-        if response.status_code != 200:
-            error_detail = response.text[:500]
-            raise ValueError(f"Ollama API error {response.status_code}: {error_detail}")
-        response.raise_for_status()
-        result = response.json()
-        
-        # Validate response structure
-        if not isinstance(result, dict) or "message" not in result:
-            raise ValueError(f"Invalid Ollama response structure: {result}")
-        if "content" not in result["message"]:
-            raise ValueError(f"Missing 'content' field in Ollama response message: {result['message']}")
-        
-        return result["message"]["content"]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                },
+            )
+            if response.status_code != 200:
+                error_detail = response.text[:500]
+                # Try to parse JSON error response from Ollama
+                try:
+                    error_json = response.json()
+                    if "error" in error_json and "not found" in error_json["error"]:
+                        error_msg = f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
+                        log.error(f"_call_ollama: {error_msg}")
+                        raise ValueError(error_msg)
+                except (ValueError, KeyError):
+                    pass
+                raise ValueError(f"Ollama API error {response.status_code}: {error_detail}")
+            response.raise_for_status()
+            result = response.json()
+            
+            # Validate response structure
+            if not isinstance(result, dict) or "message" not in result:
+                raise ValueError(f"Invalid Ollama response structure: {result}")
+            if "content" not in result["message"]:
+                raise ValueError(f"Missing 'content' field in Ollama response message: {result['message']}")
+            
+            return result["message"]["content"]
+    except httpx.TimeoutException as tex:
+        timeout_msg = f"Timeout calling Ollama model '{model}' after {timeout}s. Model may be downloading/loading. Try again later or increase timeout."
+        log.error(f"_call_ollama: {timeout_msg}")
+        raise ValueError(timeout_msg) from tex
+    except Exception as e:
+        log.error(f"_call_ollama: Unexpected error with model '{model}': {e}")
+        raise
 
 
 async def _call_abliteration(
@@ -756,6 +774,13 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     # 6. Built-in provider default
     default = _default_for_provider(provider, tier)
     log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")
+    
+    # Validate Ollama models exist in cache (fail-fast for visibility)
+    if provider == "ollama" and default not in _ollama_discovered:
+        error_msg = f"Ollama model '{default}' not found. Available: {_ollama_discovered or 'none'}. Run: ollama pull {default}"
+        log.warning(f"_model_for_tier: {error_msg}")
+        # Don't raise yet — let the actual API call fail with Ollama's error
+    
     return default
 
 
