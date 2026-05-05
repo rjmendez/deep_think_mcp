@@ -248,9 +248,9 @@ def _detect_cloud_providers() -> list[ModelInfo]:
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if anthropic_key and anthropic_key not in ("not-set", ""):
         for mid, tier in [
-            ("claude-opus-4-1-20250805",  "light"),
-            ("claude-sonnet-4-20250514", "medium"),
-            ("claude-opus-4-1-20250805",   "heavy"),
+            ("claude-haiku-4-5",  "light"),
+            ("claude-sonnet-4-6", "medium"),
+            ("claude-opus-4-7",   "heavy"),
         ]:
             models.append(ModelInfo(
                 model_id=mid, provider="anthropic",
@@ -382,9 +382,11 @@ async def run_discovery(
         log.warning("Ollama unreachable at %s: %s", base_url, e)
         result.errors.append(f"Ollama unreachable: {e}")
 
-    # Hash the current set of Ollama models (cache invalidation key)
+    # Hash the current set of Ollama models AND the cloud model list so that
+    # any code change to _detect_cloud_providers() busts the cache.
+    _cloud_ids = sorted(m.model_id for m in _detect_cloud_providers())
     ollama_hash = hashlib.md5(
-        json.dumps(sorted(ollama_model_ids)).encode()
+        json.dumps({"ollama": sorted(ollama_model_ids), "cloud": _cloud_ids}).encode()
     ).hexdigest()[:12]
 
     # --- Step 2: Check cache ---
@@ -397,6 +399,12 @@ async def run_discovery(
                 "Discovery: loaded from cache (%d models, assigned at %s)",
                 len(cached.models), cached.completed_at,
             )
+            for provider, ta in cached.tier_assignments.items():
+                if provider in ("anthropic", "copilot"):
+                    log.warning(
+                        "CLOUD MODELS (cache) [%s] light=%s medium=%s heavy=%s",
+                        provider, ta.light, ta.medium, ta.heavy,
+                    )
             return cached
 
     # --- Step 3: Benchmark Ollama models ---
@@ -452,6 +460,14 @@ async def run_discovery(
         result.discovery_secs,
         {p: vars(ta) for p, ta in result.tier_assignments.items()},
     )
+
+    # Explicit cloud model audit log — catch stale/date-coded IDs immediately.
+    for provider, ta in result.tier_assignments.items():
+        if provider in ("anthropic", "copilot"):
+            log.warning(
+                "CLOUD MODELS [%s] light=%s medium=%s heavy=%s",
+                provider, ta.light, ta.medium, ta.heavy,
+            )
 
     # --- Step 6: Persist ---
     try:
