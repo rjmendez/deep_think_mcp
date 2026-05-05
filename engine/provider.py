@@ -400,6 +400,18 @@ async def _call_abliteration(
     timeout = _timeout_for(tier)
     base_url = os.getenv("ABLITERATION_BASE_URL", "https://api.abliteration.ai/v1")
     
+    payload = {
+        "model": model,
+        "max_tokens": 4096,
+        "temperature": 1.0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    
+    log.debug(f"Abliteration request: model={model}, messages={len(payload['messages'])}")
+    
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
             f"{base_url}/chat/completions",
@@ -407,16 +419,12 @@ async def _call_abliteration(
                 "Authorization": f"Bearer {api_key}",
                 "content-type": "application/json",
             },
-            json={
-                "model": model,
-                "max_tokens": 4096,
-                "temperature": 1.0,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
+            json=payload,
         )
+        
+        if response.status_code != 200:
+            log.error(f"Abliteration API error {response.status_code}: {response.text[:500]}")
+        
         response.raise_for_status()
         result = response.json()
         return result["choices"][0]["message"]["content"]
