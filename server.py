@@ -94,39 +94,70 @@ _local_provider: Optional[object] = None
 
 @asynccontextmanager
 async def _lifespan(app):
-    store.init_db()
+    log.info("[LIFESPAN] Starting initialization...")
+    
+    try:
+        store.init_db()
+        log.info("[LIFESPAN] Database initialized")
+    except Exception as e:
+        log.error("[LIFESPAN] Database init failed: %s", e)
+        raise
     
     # [MQTT] Startup — initialize subscriber and processor
-    await mqtt_integration.mqtt_startup()
-    mqtt_integration.setup_signal_handlers()
+    try:
+        log.info("[LIFESPAN] Starting MQTT...")
+        await mqtt_integration.mqtt_startup()
+        log.info("[LIFESPAN] MQTT startup complete")
+        mqtt_integration.setup_signal_handlers()
+        log.info("[LIFESPAN] MQTT signal handlers registered")
+    except Exception as e:
+        log.error("[LIFESPAN] MQTT startup failed: %s", e)
+        raise
     
     # Initialize advanced MQTT engine adapter
-    mqtt_adapter = MQTTEngineAdapter(deep_think_fn=__import__("engine", fromlist=["deep_think_passes"]).deep_think_passes)
-    mqtt_initialized = await mqtt_adapter.start_mqtt()
-    app.mqtt_adapter = mqtt_adapter
-    mcp.mqtt_adapter = mqtt_adapter  # Expose to tools
-    
-    if mqtt_initialized:
-        log.info("[MQTT] MQTTEngineAdapter initialized and running")
+    try:
+        log.info("[LIFESPAN] Initializing MQTTEngineAdapter...")
+        mqtt_adapter = MQTTEngineAdapter(deep_think_fn=__import__("engine", fromlist=["deep_think_passes"]).deep_think_passes)
+        mqtt_initialized = await mqtt_adapter.start_mqtt()
+        log.info("[LIFESPAN] MQTTEngineAdapter initialized: %s", mqtt_initialized)
+        app.mqtt_adapter = mqtt_adapter
+        mcp.mqtt_adapter = mqtt_adapter  # Expose to tools
+        
+        if mqtt_initialized:
+            log.info("[MQTT] MQTTEngineAdapter initialized and running")
+    except Exception as e:
+        log.error("[LIFESPAN] MQTTEngineAdapter init failed: %s", e)
+        mqtt_adapter = None
+        mqtt_initialized = False
+        # Don't raise — let system continue without MQTT
     
     # Initialize validation suite for self-improvement
-    metrics_collector = MetricsCollector()
-    validation_suite = ValidationSuite(
-        metrics=metrics_collector,
-        git_repo_root="/home/USER/development/deep_think_mcp",
-        test_command="pytest --cov=adversarial_testing adversarial_testing/tests/",
-    )
-    app.validation_suite = validation_suite
-    mcp.validation_suite = validation_suite  # Expose to tools
-    log.info("ValidationSuite initialized for self-improvement")
+    try:
+        log.info("[LIFESPAN] Initializing ValidationSuite...")
+        metrics_collector = MetricsCollector()
+        validation_suite = ValidationSuite(
+            metrics=metrics_collector,
+            git_repo_root="/home/USER/development/deep_think_mcp",
+            test_command="pytest --cov=adversarial_testing adversarial_testing/tests/",
+        )
+        app.validation_suite = validation_suite
+        mcp.validation_suite = validation_suite  # Expose to tools
+        log.info("[LIFESPAN] ValidationSuite initialized")
+    except Exception as e:
+        log.error("[LIFESPAN] ValidationSuite init failed: %s", e)
+        validation_suite = None
     
     # Initialize planning engine
-    global _planning_engine
-    from .engine import deep_think_passes
-    _planning_engine = PlanningEngine(deep_think_fn=deep_think_passes)
-    app.planning_engine = _planning_engine
-    mcp.planning_engine = _planning_engine
-    log.info("PlanningEngine initialized for self-improvement")
+    try:
+        log.info("[LIFESPAN] Initializing PlanningEngine...")
+        global _planning_engine
+        from .engine import deep_think_passes
+        _planning_engine = PlanningEngine(deep_think_fn=deep_think_passes)
+        app.planning_engine = _planning_engine
+        mcp.planning_engine = _planning_engine
+        log.info("[LIFESPAN] PlanningEngine initialized")
+    except Exception as e:
+        log.error("[LIFESPAN] PlanningEngine init failed: %s", e)
     
     # Initialize verification system
     global _verify_queue, _verify_worker, _cloud_provider, _local_provider
@@ -187,10 +218,22 @@ async def _lifespan(app):
         if not base_url:
             log.error("Ollama provider configured but OLLAMA_BASE_URL not set")
         else:
+            log.info("[LIFESPAN] Creating model discovery task for Ollama at %s", base_url)
             discovery_task = asyncio.create_task(_discover.run_discovery(base_url, benchmark=True))
     else:
         log.info("No Ollama provider in use — skipping model discovery")
-    worker_task = asyncio.create_task(worker.worker_loop())
+    
+    log.info("[LIFESPAN] Creating worker loop task...")
+    try:
+        worker_task = asyncio.create_task(worker.worker_loop())
+        log.info("[LIFESPAN] Worker loop task created: %s", worker_task)
+    except Exception as e:
+        log.error("[LIFESPAN] Failed to create worker task: %s", e)
+        import traceback
+        traceback.print_exc()
+        raise
+    
+    log.info("[LIFESPAN] ===== INITIALIZATION COMPLETE, YIELDING CONTROL =====")
     try:
         yield
     finally:

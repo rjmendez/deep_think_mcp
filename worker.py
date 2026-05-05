@@ -212,8 +212,13 @@ async def worker_loop(max_concurrency: int = 0) -> None:
 
     active = 0
     worker_id = f"worker-{os.getpid()}"
+    poll_count = 0
 
     while True:
+        poll_count += 1
+        if poll_count % 30 == 0:  # Log every 30 polls (roughly every 30 seconds)
+            log.info("Worker loop polling (active=%d, poll_count=%d)", active, poll_count)
+        
         if active >= max_concurrency:
             await asyncio.sleep(0.5)
             continue
