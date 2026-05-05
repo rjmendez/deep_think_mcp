@@ -468,7 +468,8 @@ async def deep_think_passes(
     try:
         passes = validate_passes(passes)
     except ValidationError as e:
-        log.error(f"Parameter validation failed: {e}")
+        error_msg = str(e) or type(e).__qualname__
+        log.error(f"Parameter validation failed: {error_msg}")
         return {
             "error": str(e),
             "status": "validation_error",
@@ -677,7 +678,8 @@ async def run_fan_out(
         width = validate_width(width)
         height = validate_height(height)
     except ValidationError as e:
-        log.error(f"Parameter validation failed: {e}")
+        error_msg = str(e) or type(e).__qualname__
+        log.error(f"Parameter validation failed: {error_msg}")
         return {
             "error": str(e),
             "status": "validation_error",
@@ -763,8 +765,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
                 )
                 outputs.append(output)
             except Exception as e:
-                log.error(f"Perspective {mandate_name} pass {pass_num} failed: {e}")
                 error_msg = str(e) or type(e).__qualname__
+                log.error(f"Perspective {mandate_name} pass {pass_num} failed: {error_msg}")
                 outputs.append(f"[ERROR: {error_msg}]")
         
         # Synthesize perspective
@@ -799,8 +801,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
             provider_config=provider_config,
         )
     except Exception as e:
-        log.error(f"Synthesis failed: {e}")
         error_msg = str(e) or type(e).__qualname__
+        log.error(f"Synthesis failed: {error_msg}")
         final_answer = f"[SYNTHESIS ERROR: {error_msg}]"
     
     duration = time.time() - start_time
