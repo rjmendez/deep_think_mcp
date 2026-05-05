@@ -281,7 +281,8 @@ def _select_model(
 
 def _timeout_for(tier: str) -> float:
     """Calculate timeout in seconds based on tier."""
-    return {"light": 15, "medium": 45, "heavy": 120}.get(tier, 45)
+    # Increased from 15/45/120 to accommodate slower API responses
+    return {"light": 60, "medium": 180, "heavy": 300}.get(tier, 180)
 
 
 # ---------------------------------------------------------------------------
