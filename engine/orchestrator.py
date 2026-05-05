@@ -612,7 +612,8 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         except Exception as e:
             # BUG FIX #1: Removed debug file write to /tmp (not available in k8s containers)
             log.error(f"Pass {pass_num} failed: {e}")
-            pass_outputs.append(f"[ERROR: {e}]")
+            error_msg = str(e) or type(e).__qualname__
+            pass_outputs.append(f"[ERROR: {error_msg}]")
             validation_results.append(None)
     
     # Synthesize final answer
@@ -763,7 +764,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
                 outputs.append(output)
             except Exception as e:
                 log.error(f"Perspective {mandate_name} pass {pass_num} failed: {e}")
-                outputs.append(f"[ERROR: {e}]")
+                error_msg = str(e) or type(e).__qualname__
+                outputs.append(f"[ERROR: {error_msg}]")
         
         # Synthesize perspective
         perspective_synthesis = "\n\n".join(outputs)
@@ -798,7 +800,8 @@ Use this perspective to analyze the question. Be consistent with your assigned v
         )
     except Exception as e:
         log.error(f"Synthesis failed: {e}")
-        final_answer = f"[SYNTHESIS ERROR: {e}]"
+        error_msg = str(e) or type(e).__qualname__
+        final_answer = f"[SYNTHESIS ERROR: {error_msg}]"
     
     duration = time.time() - start_time
     
