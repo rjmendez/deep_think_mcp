@@ -113,6 +113,12 @@ def register(mcp):
         resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
         summary = model_summary(cfg, resolved_class)
 
+        # Validate provider_config early
+        if provider_config:
+            provider = provider_config.get("provider")
+            if not provider:
+                return {"error": "provider_config['provider'] is REQUIRED. Must be 'anthropic', 'ollama', 'copilot', or 'abliteration'", "status": "validation_error"}
+
         job_id = store.create_job(
             question=question,
             passes=total_passes,
@@ -358,6 +364,12 @@ def register(mcp):
         cfg = build_provider_config(pc)
         resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
         summary = model_summary(cfg, resolved_class)
+
+        # Validate provider_config early
+        if provider_config:
+            provider = provider_config.get("provider")
+            if not provider:
+                return {"error": "provider_config['provider'] is REQUIRED. Must be 'anthropic', 'ollama', 'copilot', or 'abliteration'", "status": "validation_error"}
 
         width = max(1, min(width, 6))
         height = max(1, min(height, 5))
