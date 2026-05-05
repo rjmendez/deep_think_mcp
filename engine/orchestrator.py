@@ -611,8 +611,8 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         
         except Exception as e:
             # BUG FIX #1: Removed debug file write to /tmp (not available in k8s containers)
-            log.error(f"Pass {pass_num} failed: {e}")
             error_msg = str(e) or type(e).__qualname__
+            log.error(f"Pass {pass_num} failed: {error_msg}", exc_info=True)
             pass_outputs.append(f"[ERROR: {error_msg}]")
             validation_results.append(None)
     
