@@ -835,8 +835,18 @@ def _discovered_tier_model(provider: str, tier: str) -> str:
 def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
     """Build a ProviderConfig by merging env defaults with per-call overrides."""
     ov = overrides or {}
+    data_policy = ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any"))
+    
+    # Determine default provider based on data_policy if not explicitly set
+    default_provider = ov.get("provider", "")
+    if not default_provider:
+        if data_policy == "cloud":
+            default_provider = "anthropic"  # Cloud-only policy prefers cloud provider
+        else:
+            default_provider = "ollama"  # Local or any: default to ollama (no API key needed)
+    
     cfg = ProviderConfig(
-        provider=ov.get("provider", ""),
+        provider=default_provider,
         base_url=ov.get("base_url", os.getenv("OLLAMA_BASE_URL", "")),
         light=ov.get("light", ov.get("light_model", "")),
         medium=ov.get("medium", ov.get("medium_model", "")),
@@ -845,7 +855,7 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
         light_provider=ov.get("light_provider", os.getenv("DEEP_THINK_LIGHT_PROVIDER", "")),
         medium_provider=ov.get("medium_provider", os.getenv("DEEP_THINK_MEDIUM_PROVIDER", "")),
         heavy_provider=ov.get("heavy_provider", os.getenv("DEEP_THINK_HEAVY_PROVIDER", "")),
-        data_policy=ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any")),
+        data_policy=data_policy,
     )
     return cfg
 
