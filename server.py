@@ -103,12 +103,16 @@ async def _lifespan(app):
         log.error("[LIFESPAN] Database init failed: %s", e)
         raise
     
-    # Refresh Ollama model cache for validation
+    # Refresh Ollama model cache for validation (non-blocking with short timeout)
     try:
         log.info("[LIFESPAN] Refreshing Ollama model cache...")
         ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        await refresh_ollama_models(ollama_url)
-        log.info("[LIFESPAN] Ollama model cache refreshed")
+        # Use asyncio.wait_for to prevent hanging if Ollama is unavailable
+        try:
+            await asyncio.wait_for(refresh_ollama_models(ollama_url), timeout=5)
+            log.info("[LIFESPAN] Ollama model cache refreshed")
+        except asyncio.TimeoutError:
+            log.warning("[LIFESPAN] Ollama model cache refresh timed out (5s timeout)")
     except Exception as e:
         log.warning("[LIFESPAN] Ollama model cache refresh failed (non-fatal): %s", e)
         # Continue without Ollama model validation — will fail at job runtime instead
