@@ -63,13 +63,9 @@ class TestValidateWidth:
         error_msg = str(exc_info.value)
         assert "must be an integer" in error_msg.lower()
     
-    def test_width_rejects_none(self):
-        """None should raise ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            validate_width(None)
-        
-        error_msg = str(exc_info.value)
-        assert "must be an integer" in error_msg.lower()
+    def test_width_defaults_none_to_one(self):
+        """None should apply the documented default width."""
+        assert validate_width(None) == 1
     
     def test_width_rejects_float(self):
         """Float should be converted to int."""
@@ -123,13 +119,9 @@ class TestValidatePasses:
         error_msg = str(exc_info.value)
         assert "must be an integer" in error_msg.lower()
     
-    def test_passes_rejects_none(self):
-        """None should raise ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            validate_passes(None)
-        
-        error_msg = str(exc_info.value)
-        assert "must be an integer" in error_msg.lower()
+    def test_passes_defaults_none_to_three(self):
+        """None should apply the documented default passes."""
+        assert validate_passes(None) == 3
 
 
 # ============================================================================
@@ -178,13 +170,9 @@ class TestValidateHeight:
         error_msg = str(exc_info.value)
         assert "must be an integer" in error_msg.lower()
     
-    def test_height_rejects_none(self):
-        """None should raise ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            validate_height(None)
-        
-        error_msg = str(exc_info.value)
-        assert "must be an integer" in error_msg.lower()
+    def test_height_defaults_none_to_one(self):
+        """None should apply the documented default height."""
+        assert validate_height(None) == 1
 
 
 # ============================================================================

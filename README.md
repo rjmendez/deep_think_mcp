@@ -19,6 +19,45 @@ Jobs are submitted instantly, run in the background, and polled for results. No 
 | `reasoning` | Complex logical / mathematical reasoning | Biases toward largest available models |
 | `auto` | Lightweight classifier picks the best class (confidence ≥ 0.75) | — |
 
+## Skill Files
+
+Predefined Deep Think skills are loaded from `skills/*.yaml` at startup. Each skill is auditable on disk, imported by the MCP server, and normalized into the in-memory routing registry used by the async and fan-out engines.
+
+Minimal file shape:
+
+```yaml
+kind: deep-think-skill
+version: 1
+id: code_review
+task_class: code_review
+description: Code analysis, bug detection, security review, and interface scrutiny.
+routing:
+  directive_set: code_review
+  mandate_set: code_review
+controls:
+  verification_mode: review
+models:
+  ollama:
+    light: qwen2.5-coder:7b
+    medium: qwen2.5-coder:7b
+    heavy: qwen2.5-coder:7b
+```
+
+Supported top-level fields:
+
+| Field | Purpose |
+|---|---|
+| `id` | Stable skill identifier used by MCP callers |
+| `task_class` | Base semantic class for enforcement and reporting |
+| `routing.directive_set` | Named built-in directive set (`general`, `investigation`, `planning`, etc.) |
+| `routing.mandate_set` | Named built-in fan-out mandate set |
+| `directives` | Optional inline directives instead of a named directive set |
+| `fan_out.mandates` | Optional inline mandate definitions |
+| `controls` | Profile controls such as `safety_precheck`, `force_local`, `block_research_tools` |
+| `models` | Per-provider, per-tier model preferences |
+
+Built-in shipped skills now include the original task classes plus `adversarial`, `research`, and `planning`.
+
 ### Data Policy
 
 Control which providers are allowed to receive data — important for sensitive security investigations:
@@ -177,6 +216,43 @@ Each reasoning pass uses a tier: `light` (cheap/fast), `medium` (analysis), `hea
 | `DEEP_THINK_MAX_CONCURRENCY` | `2` | Max simultaneous reasoning jobs |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
+### Portable / no-Nova mode
+
+If you want to run `deep_think_mcp` in an environment without Nova, disable the Nova-dependent layers explicitly:
+
+| Switch | Scope | Effect |
+|---|---|---|
+| `DEEP_THINK_NOVA_VERIFY=0` | server env | Disables the post-run Nova fact-check / verification pipeline in `worker.py` |
+| `SKIP_VALIDATION=1` | server env | Disables pass-level ground-truth validation hooks in `engine/orchestrator.py` |
+| `enable_research=false` | per-call parameter | Disables research-tool injection (Nova search, web search, DAMA lookups) for that job |
+
+Recommended minimal portable setup:
+
+```bash
+DEEP_THINK_NOVA_VERIFY=0
+SKIP_VALIDATION=1
+```
+
+Then submit jobs with:
+
+```json
+{
+  "enable_research": false
+}
+```
+
+This keeps the core async reasoning engine usable without Nova credentials, Nova `/verify`, or Nova-backed research services.
+
+### Applying config changes
+
+If `deep_think_mcp` is running as a systemd user service, environment or code changes are not live until the service is restarted:
+
+```bash
+systemctl --user restart deep-think-mcp.service
+```
+
+After restarting the service, reload/reconnect your MCP client so it binds to the fresh server process.
+
 ## Tools
 
 ### `deep_think_async`
@@ -186,6 +262,7 @@ Queue a reasoning job. Returns `job_id` immediately.
 ```json
 {
   "question": "Is this authentication code vulnerable to timing attacks?",
+  "skill": "code_review",
   "task_class": "code_review",
   "passes": 4,
   "data_policy": "local"
@@ -216,9 +293,11 @@ Parameters:
 | `question` | — | The question or problem to reason about |
 | `passes` | `3` | Number of reasoning passes (2–6) |
 | `task_class` | `"general"` | Task class — see table above |
+| `skill` | `null` | Optional predefined skill ID loaded from `skills/*.yaml` |
 | `data_policy` | `"any"` | `"any"` \| `"local"` \| `"cloud"` |
 | `model` | `""` | Override all tiers with one model ID |
 | `provider_config` | `null` | Per-call overrides (no secrets — use env vars) |
+| `enable_research` | `true` | Inject research tools when the task class permits them |
 
 `provider_config` keys (no secrets):
 
@@ -228,6 +307,13 @@ Parameters:
 | `base_url` | Ollama endpoint override |
 | `model` | Single model ID for all tiers |
 | `light` / `medium` / `heavy` | Per-tier model ID overrides |
+| `light_provider` / `medium_provider` / `heavy_provider` | Per-tier provider overrides |
+| `temperature` | Sampling temperature for supported providers |
+| `top_p` / `top_k` | Sampling controls for supported providers |
+| `max_tokens` | Output token cap (`num_predict` for Ollama) |
+| `seed` | Deterministic seed for Ollama |
+| `custom_params` | Nested provider-specific sampling params |
+| `options` | Ollama-native options object (merged with flat keys) |
 
 ### `get_thinking_result`
 

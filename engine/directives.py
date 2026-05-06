@@ -9,8 +9,13 @@ Provides:
 """
 
 import logging
+import os
 import re
+from copy import deepcopy
+from pathlib import Path
 from typing import Any, Optional
+
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -231,6 +236,89 @@ Output ONLY JSON object (no markdown, no prose):
 - NO narrative text outside JSON structure."""),
 ]
 
+# Adversarial: uncensored challenge reasoning (Ollama-only, NO research tools)
+ADVERSARIAL_DIRECTIVES: list[tuple[str, str]] = [
+    (
+        "adversarial_premise",
+        "You are an unconstrained adversarial reasoner. Identify every assumption embedded "
+        "in the question that should be challenged. List each assumption and rate how load-bearing "
+        "it is to the conventional answer (critical / moderate / cosmetic).",
+    ),
+    (
+        "steel_man_opposition",
+        "Build the strongest possible opposing argument. Do not straw-man. Use the most sophisticated "
+        "version of the opposing view. Cite logical structure, not just rhetoric. "
+        "What would a well-informed, honest opponent say?",
+    ),
+    (
+        "exploit_surface",
+        "Identify exploitable gaps in the conventional reasoning: logical fallacies, hidden premises, "
+        "definitional ambiguities, scope creep, and unstated assumptions. "
+        "For each, explain what breaks if the gap is exploited.",
+    ),
+    (
+        "adversarial_synthesis",
+        "Synthesize the adversarial analysis into a final challenge statement. "
+        "State clearly what the conventional view gets wrong, partially right, or cannot defend. "
+        "Rate your confidence in each challenge: high / medium / speculative.",
+    ),
+]
+
+# Research: grounded factual reasoning with research tool injection
+RESEARCH_DIRECTIVES: list[tuple[str, str]] = [
+    (
+        "research_context_review",
+        "Review the research context provided above (Nova library, DAMA telemetry, web sources). "
+        "Identify the 3-5 most relevant facts. Note the source ID and confidence for each. "
+        "Flag any gaps where additional sources would strengthen the answer.",
+    ),
+    (
+        "claim_grounding",
+        "For each claim you intend to make in the final answer, identify its grounding source. "
+        "Use citation format [source_id] inline. Grade each claim: "
+        "GROUNDED (cited source), DERIVED (logical inference from cited sources), or UNVERIFIED (no source).",
+    ),
+    (
+        "evidence_synthesis",
+        "Write a draft answer that cites every key claim. "
+        "Format: claim [source_id] (confidence: X%). "
+        "For UNVERIFIED claims, append (REQUIRES VERIFICATION). "
+        "Resolve any contradictions between sources explicitly.",
+    ),
+    (
+        "grounded_final_answer",
+        "Produce the final grounded answer. Every factual claim must have a citation or be "
+        "explicitly marked UNVERIFIED. "
+        "Conclude with: grounding_score (0-100%), uncited_claim_count, strongest_source.",
+    ),
+]
+
+# Planning: structured implementation plans for self-improvement and remediation
+PLANNING_DIRECTIVES: list[tuple[str, str]] = [
+    (
+        "problem_structuring",
+        "Reduce the problem to concrete failure modes, desired outcomes, dependencies, and constraints. "
+        "Separate confirmed facts from assumptions. Identify what must be true for the plan to succeed.",
+    ),
+    (
+        "strategy_design",
+        "Generate a primary fix strategy and one fallback. Prefer reversible, auditable steps. "
+        "Call out the order of operations, main risks, and any prerequisites that could block execution.",
+    ),
+    (
+        "dependency_mapping",
+        "Map dependencies, validation steps, and rollback conditions. "
+        "Identify how you will prove the plan worked and how you will detect partial failure.",
+    ),
+    (
+        "planning_output",
+        "Produce the final plan as strict JSON suitable for downstream automation. "
+        "Include: root_cause, primary_strategy, fallback_strategy, effort_estimate, "
+        "risk_level, dependencies, subtasks, validation_tests, and estimated_cost_tokens. "
+        "Return JSON only with no markdown or prose.",
+    ),
+]
+
 # Research synthesis: grounded literature analysis (evidence chains for DAMA insights)
 RESEARCH_SYNTHESIS_DIRECTIVES: list[tuple[str, str]] = [
     ("literature_survey", "Search scientific literature for papers on the query topic. Identify 3-5 high-authority sources."),
@@ -278,6 +366,15 @@ _FRAMING_TIER: dict[str, str] = {
     "misuse_scenarios":      "medium",
     "validation":            "medium",
     "narrative_stress_test": "medium",
+    "adversarial_premise":   "light",
+    "research_context_review": "light",
+    "problem_structuring":   "light",
+    "steel_man_opposition":  "medium",
+    "exploit_surface":       "medium",
+    "claim_grounding":       "medium",
+    "evidence_synthesis":    "medium",
+    "strategy_design":       "medium",
+    "dependency_mapping":    "medium",
     # Final/synthesis passes → heavy
 }
 
@@ -292,7 +389,7 @@ TASK_CLASS_PROFILES: dict = {
         "directives": PASS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "code_review": {
         "description": "Code analysis, bug detection, security review, code quality.",
@@ -300,14 +397,14 @@ TASK_CLASS_PROFILES: dict = {
         # qwen2.5-coder is code-specialized; codex models unsupported on /chat/completions
         "ollama":    {"light": "qwen2.5-coder:7b",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "investigation": {
         "description": "Security investigation, evidence weighing, threat hunting, IOC triage, incident response.",
         "directives": INVESTIGATION_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "safety": {
         "description": "Content safety, policy compliance, risk detection, guardrail evaluation.",
@@ -315,7 +412,7 @@ TASK_CLASS_PROFILES: dict = {
         "safety_precheck": True,  # run granite3-guardian (if available) before main passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "extraction": {
         "description": "Structured data extraction, entity recognition, schema-constrained JSON output.",
@@ -323,14 +420,14 @@ TASK_CLASS_PROFILES: dict = {
         # Code-tuned models excel at structured JSON; extraction is pattern-matching over deep reasoning
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen2.5-coder:7b",  "heavy": "qwen2.5-coder:7b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4",   "heavy": "gpt-5.4"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-opus-4-1-20250805",  "heavy": "claude-sonnet-4-20250514"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6",  "heavy": "claude-opus-4-7"},
     },
     "synthesis": {
         "description": "Writing, summarization, report drafting, narrative generation.",
         "directives": SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",          "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "reasoning": {
         "description": "Complex multi-step logical reasoning, mathematical analysis, philosophical inquiry.",
@@ -338,21 +435,21 @@ TASK_CLASS_PROFILES: dict = {
         # deepseek-r1:8b is the pure reasoning specialist; ideal for all challenge and synthesis passes
         "ollama":    {"light": "phi4-mini:latest",  "medium": "llama3.1:8b",    "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "data_governance": {
         "description": "Telemetry integrity analysis for sensor networks. Data quality issues, root cause attribution, remediation synthesis.",
         "directives": DATA_GOVERNANCE_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
     "research_synthesis": {
         "description": "Grounded research synthesis with evidence chains. Literature survey, claim grounding, citations with confidence scores.",
         "directives": RESEARCH_SYNTHESIS_DIRECTIVES,
         "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
-        "anthropic": {"light": "claude-opus-4-1-20250805",  "medium": "claude-sonnet-4-20250514", "heavy": "claude-opus-4-1-20250805"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
 }
 
@@ -590,3 +687,332 @@ PERSPECTIVE_MANDATES: dict = {
                    "Note if the same field could have different values in different contexts.",
     },
 }
+
+_BUILTIN_PROFILE_DEFAULTS = deepcopy(TASK_CLASS_PROFILES)
+_BUILTIN_MANDATE_DEFAULTS = deepcopy(PERSPECTIVE_MANDATES)
+
+_BUILTIN_DIRECTIVE_SETS: dict[str, list[tuple[str, str]]] = {
+    "general": PASS_DIRECTIVES,
+    "code_review": CODE_REVIEW_DIRECTIVES,
+    "investigation": INVESTIGATION_DIRECTIVES,
+    "safety": SAFETY_DIRECTIVES,
+    "extraction": EXTRACTION_DIRECTIVES,
+    "synthesis": SYNTHESIS_DIRECTIVES,
+    "reasoning": REASONING_DIRECTIVES,
+    "data_governance": DATA_GOVERNANCE_DIRECTIVES,
+    "research_synthesis": RESEARCH_SYNTHESIS_DIRECTIVES,
+    "adversarial": ADVERSARIAL_DIRECTIVES,
+    "research": RESEARCH_DIRECTIVES,
+    "planning": PLANNING_DIRECTIVES,
+}
+
+SKILL_FILE_KIND = "deep-think-skill"
+SKILL_FILE_VERSION = 1
+SKILL_NAMES: list[str] = list(TASK_CLASS_PROFILES.keys())
+TASK_CLASS_NAMES = list(TASK_CLASS_PROFILES.keys())
+
+
+def _skills_dir() -> Path:
+    raw = os.getenv("DEEP_THINK_SKILLS_DIR")
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parent.parent / "skills"
+
+
+def _iter_skill_files() -> list[Path]:
+    skills_dir = _skills_dir()
+    if not skills_dir.exists():
+        return []
+    paths: list[Path] = []
+    for pattern in ("*.yaml", "*.yml"):
+        paths.extend(sorted(skills_dir.glob(pattern)))
+    return sorted(set(paths))
+
+
+def _normalize_directives(
+    raw_directives: Any,
+    *,
+    skill_id: str,
+) -> list[tuple[str, str]]:
+    if not isinstance(raw_directives, list):
+        raise ValueError(f"Skill '{skill_id}' directives must be a list.")
+    normalized: list[tuple[str, str]] = []
+    for index, entry in enumerate(raw_directives, start=1):
+        if isinstance(entry, dict):
+            name = str(entry.get("name", "")).strip()
+            prompt = str(entry.get("prompt", "")).strip()
+        elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+            name = str(entry[0]).strip()
+            prompt = str(entry[1]).strip()
+        else:
+            raise ValueError(
+                f"Skill '{skill_id}' directive #{index} must be a mapping with name/prompt or a 2-item list."
+            )
+        if not name or not prompt:
+            raise ValueError(f"Skill '{skill_id}' directive #{index} must include non-empty name and prompt.")
+        normalized.append((name, prompt))
+    if not normalized:
+        raise ValueError(f"Skill '{skill_id}' must define at least one directive.")
+    return normalized
+
+
+def _normalize_mandates(
+    raw_mandates: Any,
+    *,
+    skill_id: str,
+) -> dict[str, str]:
+    if isinstance(raw_mandates, dict):
+        mandates = {
+            str(name).strip(): str(prompt).strip()
+            for name, prompt in raw_mandates.items()
+            if str(name).strip() and str(prompt).strip()
+        }
+    elif isinstance(raw_mandates, list):
+        mandates = {}
+        for index, entry in enumerate(raw_mandates, start=1):
+            if not isinstance(entry, dict):
+                raise ValueError(f"Skill '{skill_id}' mandate #{index} must be a mapping.")
+            name = str(entry.get("name", "")).strip()
+            mandate = str(entry.get("mandate", "")).strip()
+            if not name or not mandate:
+                raise ValueError(f"Skill '{skill_id}' mandate #{index} must include non-empty name and mandate.")
+            mandates[name] = mandate
+    else:
+        raise ValueError(f"Skill '{skill_id}' fan_out.mandates must be a mapping or list.")
+    return mandates
+
+
+def _merge_provider_models(
+    default_profile: dict[str, Any],
+    document: dict[str, Any],
+    *,
+    skill_id: str,
+) -> dict[str, dict[str, str]]:
+    model_section = document.get("models")
+    if model_section is not None and not isinstance(model_section, dict):
+        raise ValueError(f"Skill '{skill_id}' models must be a mapping.")
+
+    providers: dict[str, dict[str, str]] = {}
+    for provider_name in ("ollama", "copilot", "anthropic", "abliteration"):
+        merged = deepcopy(default_profile.get(provider_name, {}))
+        override = None
+        if isinstance(model_section, dict):
+            override = model_section.get(provider_name)
+        if override is None:
+            override = document.get(provider_name)
+        if override is not None:
+            if not isinstance(override, dict):
+                raise ValueError(f"Skill '{skill_id}' provider '{provider_name}' must map tiers to model IDs.")
+            for tier, model in override.items():
+                tier_name = str(tier).strip()
+                model_name = str(model).strip()
+                if not tier_name or not model_name:
+                    raise ValueError(
+                        f"Skill '{skill_id}' provider '{provider_name}' has an empty tier or model value."
+                    )
+                merged[tier_name] = model_name
+        if merged:
+            providers[provider_name] = merged
+    return providers
+
+
+def _normalize_skill_document(
+    document: dict[str, Any],
+    path: Path,
+    *,
+    default_profile: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    if not isinstance(document, dict):
+        raise ValueError(f"Skill file '{path}' must contain a top-level mapping.")
+
+    kind = str(document.get("kind", SKILL_FILE_KIND)).strip()
+    if kind != SKILL_FILE_KIND:
+        raise ValueError(f"Skill file '{path}' has unsupported kind '{kind}'.")
+
+    version = int(document.get("version", SKILL_FILE_VERSION))
+    if version != SKILL_FILE_VERSION:
+        raise ValueError(f"Skill file '{path}' has unsupported version '{version}'.")
+
+    skill_id = str(document.get("id", path.stem)).strip()
+    if not skill_id:
+        raise ValueError(f"Skill file '{path}' must define a non-empty id.")
+
+    task_class = str(document.get("task_class", default_profile.get("task_class", skill_id))).strip() or skill_id
+    description = str(document.get("description", default_profile.get("description", ""))).strip()
+    if not description:
+        raise ValueError(f"Skill '{skill_id}' must define a description.")
+
+    routing = document.get("routing", {})
+    if routing is None:
+        routing = {}
+    if not isinstance(routing, dict):
+        raise ValueError(f"Skill '{skill_id}' routing must be a mapping.")
+
+    directive_set = routing.get("directive_set")
+    if directive_set:
+        directive_set = str(directive_set).strip()
+        if directive_set not in _BUILTIN_DIRECTIVE_SETS:
+            raise ValueError(f"Skill '{skill_id}' references unknown directive_set '{directive_set}'.")
+        directives = deepcopy(_BUILTIN_DIRECTIVE_SETS[directive_set])
+    elif "directives" in document:
+        directives = _normalize_directives(document["directives"], skill_id=skill_id)
+    else:
+        directives = deepcopy(default_profile.get("directives", PASS_DIRECTIVES))
+
+    mandate_set = routing.get("mandate_set")
+    fan_out = document.get("fan_out", {})
+    if fan_out is None:
+        fan_out = {}
+    if not isinstance(fan_out, dict):
+        raise ValueError(f"Skill '{skill_id}' fan_out must be a mapping.")
+
+    if not mandate_set:
+        mandate_set = fan_out.get("mandate_set")
+
+    if mandate_set:
+        mandate_set = str(mandate_set).strip()
+        if mandate_set not in _BUILTIN_MANDATE_DEFAULTS:
+            raise ValueError(f"Skill '{skill_id}' references unknown mandate_set '{mandate_set}'.")
+        mandates = deepcopy(_BUILTIN_MANDATE_DEFAULTS[mandate_set])
+    elif "mandates" in fan_out:
+        mandates = _normalize_mandates(fan_out["mandates"], skill_id=skill_id)
+    elif "mandates" in document:
+        mandates = _normalize_mandates(document["mandates"], skill_id=skill_id)
+    else:
+        mandates = deepcopy(
+            _BUILTIN_MANDATE_DEFAULTS.get(skill_id)
+            or _BUILTIN_MANDATE_DEFAULTS.get(task_class, {})
+        )
+
+    controls = deepcopy(default_profile.get("controls", {}))
+    raw_controls = document.get("controls", {})
+    if raw_controls is None:
+        raw_controls = {}
+    if not isinstance(raw_controls, dict):
+        raise ValueError(f"Skill '{skill_id}' controls must be a mapping.")
+    controls.update(raw_controls)
+
+    normalized: dict[str, Any] = deepcopy(default_profile)
+    normalized.update(
+        {
+            "id": skill_id,
+            "kind": kind,
+            "version": version,
+            "description": description,
+            "task_class": task_class,
+            "skill_file": str(path),
+            "directives": directives,
+            "controls": controls,
+            "mandates": mandates,
+            "fan_out": {
+                "mandates": mandates,
+            },
+        }
+    )
+    if directive_set:
+        normalized["routing"] = {"directive_set": directive_set}
+        if mandate_set:
+            normalized["routing"]["mandate_set"] = mandate_set
+    elif mandate_set:
+        normalized["routing"] = {"mandate_set": mandate_set}
+
+    for flag in (
+        "safety_precheck",
+        "force_local",
+        "block_research_tools",
+        "enable_research_tools",
+        "block_abliteration",
+    ):
+        if flag in controls or flag in default_profile:
+            normalized[flag] = bool(controls.get(flag, default_profile.get(flag, False)))
+
+    for provider_name, provider_models in _merge_provider_models(default_profile, document, skill_id=skill_id).items():
+        normalized[provider_name] = provider_models
+
+    return skill_id, normalized, mandates
+
+
+def _load_skill_registry() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, str]]]:
+    profiles = deepcopy(_BUILTIN_PROFILE_DEFAULTS)
+    mandates = deepcopy(_BUILTIN_MANDATE_DEFAULTS)
+
+    for path in _iter_skill_files():
+        with path.open("r", encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+        raw_skill_id = str(document.get("id", path.stem)).strip() or path.stem
+        raw_task_class = str(document.get("task_class", "")).strip()
+        default_profile = (
+            profiles.get(raw_skill_id)
+            or profiles.get(raw_task_class, {})
+            or profiles.get(path.stem, {})
+        )
+        skill_id, profile, skill_mandates = _normalize_skill_document(
+            document,
+            path,
+            default_profile=default_profile,
+        )
+        profiles[skill_id] = profile
+        if skill_mandates:
+            mandates[skill_id] = skill_mandates
+        elif skill_id in mandates:
+            mandates.pop(skill_id, None)
+
+    return profiles, mandates
+
+
+def reload_skill_registry() -> dict[str, dict[str, Any]]:
+    """Reload skill files from disk and refresh the in-memory registry."""
+    profiles, mandates = _load_skill_registry()
+    TASK_CLASS_PROFILES.clear()
+    TASK_CLASS_PROFILES.update(profiles)
+    PERSPECTIVE_MANDATES.clear()
+    PERSPECTIVE_MANDATES.update(mandates)
+    SKILL_NAMES[:] = list(TASK_CLASS_PROFILES.keys())
+    TASK_CLASS_NAMES[:] = sorted(
+        {
+            str(profile.get("task_class", skill_id))
+            for skill_id, profile in TASK_CLASS_PROFILES.items()
+        }
+    )
+    return TASK_CLASS_PROFILES
+
+
+def get_skill_profile(skill_id: str) -> Optional[dict[str, Any]]:
+    """Return a normalized skill profile by ID."""
+    return TASK_CLASS_PROFILES.get(skill_id)
+
+
+def list_skill_profiles() -> list[dict[str, Any]]:
+    """Return skill metadata for MCP/UI discovery."""
+    profiles: list[dict[str, Any]] = []
+    for skill_id in sorted(TASK_CLASS_PROFILES.keys()):
+        profile = TASK_CLASS_PROFILES[skill_id]
+        mandates = PERSPECTIVE_MANDATES.get(skill_id, {})
+        profiles.append(
+            {
+                "id": skill_id,
+                "task_class": profile.get("task_class", skill_id),
+                "version": profile.get("version", SKILL_FILE_VERSION),
+                "description": profile.get("description", ""),
+                "skill_file": profile.get("skill_file"),
+                "directive_count": len(profile.get("directives", [])),
+                "perspective_count": len(mandates),
+                "controls": deepcopy(profile.get("controls", {})),
+            }
+        )
+    return profiles
+
+
+def resolve_skill_selection(
+    task_class: Optional[str] = None,
+    *,
+    skill: Optional[str] = None,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve a caller-provided skill/task selection to a loaded profile."""
+    requested = (skill or task_class or "").strip()
+    if requested and requested in TASK_CLASS_PROFILES:
+        return requested, TASK_CLASS_PROFILES[requested]
+    return "general", TASK_CLASS_PROFILES["general"]
+
+
+reload_skill_registry()

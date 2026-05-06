@@ -1,0 +1,41 @@
+kind: deep-think-skill
+version: 1
+id: adversarial
+task_class: adversarial
+description: Unconstrained challenge reasoning for stress-testing arguments and exposing logical exploits.
+routing:
+  directive_set: adversarial
+  mandate_set: reasoning
+controls:
+  force_local: true
+  block_research_tools: true
+  verification_mode: adversarial
+  provenance_mode: explicit-assumptions
+  layer_order:
+    - premise_inventory
+    - opposition_case
+    - exploit_surface
+    - challenge_strength
+  target_policy:
+    explicit_target_required: true
+  evidence_policy:
+    define_predicate_first: true
+    separate_observed_inferred_assumed: true
+    distinguish_candidate_from_confirmed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    bounded_change_only: true
+    stop_at_verified_boundary: true
+  report_contract:
+    - expose hidden assumptions before attacking conclusions
+    - rate each challenge by confidence and evidentiary support
+    - avoid presenting speculative attacks as confirmed facts
+  stop_conditions:
+    - stop when the attack depends on unavailable evidence
+    - stop when external research would be required
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest

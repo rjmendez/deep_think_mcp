@@ -10,10 +10,20 @@ Environment variables:
 import logging
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency is declared in requirements.txt
+    load_dotenv = None
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+
+if load_dotenv is not None:
+    load_dotenv()
+else:
+    logging.warning("python-dotenv not installed; .env file was not loaded")
 
 # Monkey-patch FastMCP's schema builder to handle numeric defaults correctly
 # (Tier 1 fix for slice(None, 3, None) bug in fastmcp 3.2.0)

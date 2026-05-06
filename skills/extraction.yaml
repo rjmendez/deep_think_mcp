@@ -1,0 +1,51 @@
+kind: deep-think-skill
+version: 1
+id: extraction
+task_class: extraction
+description: Structured data extraction, entity recognition, and schema-constrained JSON output.
+routing:
+  directive_set: extraction
+  mandate_set: extraction
+controls:
+  verification_mode: schema
+  provenance_mode: source-cited
+  layer_order:
+    - schema_inventory
+    - source_mapping
+    - consistency
+    - confidence
+    - completeness
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    stop_at_verified_boundary: true
+  verification_tiers:
+    - schema
+    - consistency
+    - completeness
+  report_contract:
+    - distinguish present, partial, and absent fields
+    - tie extracted values back to source text
+    - mark low-confidence fields explicitly
+  stop_conditions:
+    - stop when a field cannot be grounded to source text
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.4
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

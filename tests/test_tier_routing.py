@@ -97,6 +97,7 @@ class TestTierRouting:
         # Should return a model ID, not the tier name
         assert model != "medium"
         assert isinstance(model, str)
+        assert model == "heretic-llama31-8b-instruct:latest"
 
     def test_model_for_tier_with_invalid_tier_logs_warning(self):
         """Test that invalid tier names are handled gracefully."""
@@ -179,6 +180,37 @@ class TestOrchestratorTierRouting:
             if model_name:  # If model was passed to the provider
                 # Should use the override, not a derived model
                 assert "custom" in model_name or model_name == "my-custom-model"
+
+
+class TestProviderSpecificHelpers:
+    """Tests for provider-specific lightweight helper model selection."""
+
+    @pytest.mark.asyncio
+    async def test_classify_task_uses_provider_compatible_model(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = "general"
+
+            result = await provider_module.classify_task(
+                "Classify this request.",
+                provider="ollama",
+            )
+
+            assert result == "general"
+            assert mock_call.await_args.kwargs["model"] == "heretic-llama31-8b-instruct:latest"
+
+    @pytest.mark.asyncio
+    async def test_safety_precheck_uses_available_ollama_guardian(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = '{"safe": true, "reason": "ok", "requires_review": false}'
+
+            safe, reason = await provider_module._run_safety_precheck(
+                "Check this request.",
+                provider="ollama",
+            )
+
+            assert safe is True
+            assert reason == "ok"
+            assert mock_call.await_args.kwargs["model"] == "granite3-guardian:2b"
 
 
 class TestEdgeCases:

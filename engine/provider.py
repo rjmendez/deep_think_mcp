@@ -18,6 +18,7 @@ import httpx
 
 from deep_think_mcp import store
 from deep_think_mcp import discover
+from deep_think_mcp import metrics as runtime_metrics
 from .types import ProviderConfig, PassResult
 
 log = logging.getLogger(__name__)
@@ -202,9 +203,9 @@ def _read_credential(provider: str, key: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _ANTHROPIC_DEFAULTS = {
-    "light": "claude-opus-4-1-20250805",  # Using opus as haiku isn't available
-    "medium": "claude-sonnet-4-20250514",
-    "heavy": "claude-opus-4-1-20250805",
+    "light": "claude-haiku-4-5",
+    "medium": "claude-sonnet-4-6",
+    "heavy": "claude-opus-4-7",
 }
 
 _COPILOT_DEFAULTS = {
@@ -214,9 +215,9 @@ _COPILOT_DEFAULTS = {
 }
 
 _OLLAMA_DEFAULTS = {
-    "light": "phi4-mini:latest",
-    "medium": "qwen3.5:27b",
-    "heavy": "llama3.1:8b",
+    "light": "heretic-llama31-8b-instruct:latest",
+    "medium": "heretic-llama31-8b-instruct:latest",
+    "heavy": "heretic-llama31-8b-instruct:latest",
 }
 
 _ABLITERATION_DEFAULTS = {
@@ -284,8 +285,76 @@ def _select_model(
 
 def _timeout_for(tier: str) -> float:
     """Calculate timeout in seconds based on tier."""
-    # Increased from 15/45/120 to accommodate slower API responses
-    return {"light": 60, "medium": 180, "heavy": 300}.get(tier, 180)
+    defaults = {"light": 120, "medium": 180, "heavy": 300}
+    env_key = f"DEEP_THINK_TIMEOUT_{tier.upper()}"
+    try:
+        return float(os.getenv(env_key, str(defaults.get(tier, 180))))
+    except ValueError:
+        log.warning("Invalid %s value; using default timeout for tier %s", env_key, tier)
+        return float(defaults.get(tier, 180))
+
+
+def _record_timeout(component: str) -> None:
+    try:
+        runtime_metrics.get_metrics().record_timeout(component)
+    except Exception:
+        log.debug("Failed to record timeout metric for %s", component, exc_info=True)
+
+
+_CUSTOM_PARAM_KEYS: dict[str, set[str]] = {
+    "anthropic": {"temperature", "top_p", "top_k", "max_tokens", "stop_sequences"},
+    "copilot": {"temperature", "top_p", "max_tokens", "stop"},
+    "ollama": {
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "num_ctx",
+        "num_predict",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "mirostat",
+        "mirostat_tau",
+        "mirostat_eta",
+        "repeat_last_n",
+        "min_p",
+        "stop",
+        "max_tokens",
+    },
+    "abliteration": {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "frequency_penalty",
+        "presence_penalty",
+        "focus",
+    },
+}
+
+
+def _custom_params_from_provider_config(
+    provider: str,
+    provider_config: dict | None,
+) -> dict[str, Any]:
+    """Extract provider-specific custom params from provider_config."""
+    provider_config = provider_config or {}
+    custom_params: dict[str, Any] = {}
+
+    nested = provider_config.get("custom_params")
+    if isinstance(nested, dict):
+        custom_params.update(nested)
+
+    if provider == "ollama":
+        options = provider_config.get("options")
+        if isinstance(options, dict):
+            custom_params.update(options)
+
+    for key in _CUSTOM_PARAM_KEYS.get(provider, set()):
+        if key in provider_config:
+            custom_params[key] = provider_config[key]
+
+    return custom_params
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +367,11 @@ async def _call_anthropic(
     system: str,
     user_prompt: str,
     tier: str = "medium",
+    custom_params: dict | None = None,
 ) -> str:
     """Call Anthropic Claude API."""
     timeout = _timeout_for(tier)
+    custom_params = custom_params or {}
     
     log.info(f"_call_anthropic: ENTER model='{model}', tier={tier}, key_len={len(api_key) if api_key else 0}")
     
@@ -310,38 +381,51 @@ async def _call_anthropic(
     if not api_key.startswith("sk-ant"):
         log.warning(f"API key doesn't start with sk-ant: {api_key[:20]}...")
     
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        payload = {
-            "model": model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": [{"role": "user", "content": user_prompt}],
-        }
-        log.warning(f"_call_anthropic: POSTING to API with model='{model}'")
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-        if response.status_code != 200:
-            error_detail = response.text[:500]
-            raise ValueError(f"Anthropic API error {response.status_code}: {error_detail}")
-        response.raise_for_status()
-        result = response.json()
-        
-        # Validate response structure
-        if not isinstance(result, dict) or "content" not in result:
-            raise ValueError(f"Invalid Anthropic response structure: {result}")
-        if not result.get("content") or len(result["content"]) == 0:
-            raise ValueError("Empty content in Anthropic response")
-        if "text" not in result["content"][0]:
-            raise ValueError(f"Missing 'text' field in Anthropic response content: {result['content'][0]}")
-        
-        return result["content"][0]["text"]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            payload = {
+                "model": model,
+                "max_tokens": custom_params.get("max_tokens", 4096),
+                "system": system,
+                "messages": [{"role": "user", "content": user_prompt}],
+            }
+            for key in ("temperature", "top_p", "top_k", "stop_sequences"):
+                if key in custom_params:
+                    payload[key] = custom_params[key]
+            log.warning(f"_call_anthropic: POSTING to API with model='{model}'")
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            if response.status_code != 200:
+                error_detail = response.text[:500]
+                raise ValueError(f"Anthropic API error {response.status_code}: {error_detail}")
+            response.raise_for_status()
+            result = response.json()
+            
+            # Validate response structure
+            if not isinstance(result, dict) or "content" not in result:
+                raise ValueError(f"Invalid Anthropic response structure: {result}")
+            if not result.get("content") or len(result["content"]) == 0:
+                raise ValueError("Empty content in Anthropic response")
+            if "text" not in result["content"][0]:
+                raise ValueError(f"Missing 'text' field in Anthropic response content: {result['content'][0]}")
+            
+            return result["content"][0]["text"]
+    except httpx.TimeoutException as exc:
+        _record_timeout("anthropic")
+        msg = f"Timeout calling Anthropic model '{model}' after {timeout}s"
+        log.error("_call_anthropic: %s", msg)
+        raise ValueError(msg) from exc
+    except httpx.HTTPError as exc:
+        msg = f"Anthropic transport error calling model '{model}': {exc}"
+        log.error("_call_anthropic: %s", msg)
+        raise ValueError(msg) from exc
 
 
 async def _call_copilot(
@@ -350,41 +434,58 @@ async def _call_copilot(
     system: str,
     user_prompt: str,
     tier: str = "medium",
+    custom_params: dict | None = None,
 ) -> str:
     """Call GitHub Copilot API (using Anthropic endpoint)."""
     timeout = _timeout_for(tier)
+    custom_params = custom_params or {}
     
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            "https://api.github.com/copilot/chat/completions",
-            headers={
-                "Authorization": f"Bearer {oauth_token}",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": [{"role": "user", "content": user_prompt}],
-            },
-        )
-        if response.status_code != 200:
-            error_detail = response.text[:500]
-            raise ValueError(f"Copilot API error {response.status_code}: {error_detail}")
-        response.raise_for_status()
-        result = response.json()
-        
-        # Validate response structure
-        if not isinstance(result, dict) or "choices" not in result:
-            raise ValueError(f"Invalid Copilot response structure: {result}")
-        if not result.get("choices") or len(result["choices"]) == 0:
-            raise ValueError("Empty choices in Copilot response")
-        if "message" not in result["choices"][0]:
-            raise ValueError(f"Missing 'message' field in Copilot response choices: {result['choices'][0]}")
-        if "content" not in result["choices"][0]["message"]:
-            raise ValueError(f"Missing 'content' field in Copilot response message: {result['choices'][0]['message']}")
-        
-        return result["choices"][0]["message"]["content"]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://api.github.com/copilot/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {oauth_token}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": custom_params.get("max_tokens", 4096),
+                    "system": system,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                    **{
+                        key: custom_params[key]
+                        for key in ("temperature", "top_p", "stop")
+                        if key in custom_params
+                    },
+                },
+            )
+            if response.status_code != 200:
+                error_detail = response.text[:500]
+                raise ValueError(f"Copilot API error {response.status_code}: {error_detail}")
+            response.raise_for_status()
+            result = response.json()
+            
+            # Validate response structure
+            if not isinstance(result, dict) or "choices" not in result:
+                raise ValueError(f"Invalid Copilot response structure: {result}")
+            if not result.get("choices") or len(result["choices"]) == 0:
+                raise ValueError("Empty choices in Copilot response")
+            if "message" not in result["choices"][0]:
+                raise ValueError(f"Missing 'message' field in Copilot response choices: {result['choices'][0]}")
+            if "content" not in result["choices"][0]["message"]:
+                raise ValueError(f"Missing 'content' field in Copilot response message: {result['choices'][0]['message']}")
+            
+            return result["choices"][0]["message"]["content"]
+    except httpx.TimeoutException as exc:
+        _record_timeout("copilot")
+        msg = f"Timeout calling Copilot model '{model}' after {timeout}s"
+        log.error("_call_copilot: %s", msg)
+        raise ValueError(msg) from exc
+    except httpx.HTTPError as exc:
+        msg = f"Copilot transport error calling model '{model}': {exc}"
+        log.error("_call_copilot: %s", msg)
+        raise ValueError(msg) from exc
 
 
 async def _call_ollama(
@@ -393,9 +494,11 @@ async def _call_ollama(
     system: str,
     user_prompt: str,
     tier: str = "medium",
+    custom_params: dict | None = None,
 ) -> str:
     """Call local Ollama instance."""
     timeout = _timeout_for(tier)
+    custom_params = custom_params or {}
     log.info(f"_call_ollama: ENTER model='{model}', tier={tier}, timeout={timeout}s, base_url={base_url}")
     
     if not base_url:
@@ -403,16 +506,44 @@ async def _call_ollama(
     
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
+            options = {
+                key: custom_params[key]
+                for key in (
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "seed",
+                    "num_ctx",
+                    "num_predict",
+                    "repeat_penalty",
+                    "presence_penalty",
+                    "frequency_penalty",
+                    "mirostat",
+                    "mirostat_tau",
+                    "mirostat_eta",
+                    "repeat_last_n",
+                    "min_p",
+                    "stop",
+                )
+                if key in custom_params
+            }
+            if "max_tokens" in custom_params and "num_predict" not in options:
+                options["num_predict"] = custom_params["max_tokens"]
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+            }
+            if options:
+                payload["options"] = options
+
             response = await client.post(
                 f"{base_url}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "stream": False,
-                },
+                json=payload,
             )
             if response.status_code != 200:
                 error_detail = response.text[:500]
@@ -437,9 +568,14 @@ async def _call_ollama(
             
             return result["message"]["content"]
     except httpx.TimeoutException as tex:
+        _record_timeout("ollama")
         timeout_msg = f"Timeout calling Ollama model '{model}' after {timeout}s. Model may be downloading/loading. Try again later or increase timeout."
         log.error(f"_call_ollama: {timeout_msg}")
         raise ValueError(timeout_msg) from tex
+    except httpx.HTTPError as exc:
+        msg = f"Ollama transport error calling model '{model}': {exc}"
+        log.error("_call_ollama: %s", msg)
+        raise ValueError(msg) from exc
     except Exception as e:
         log.error(f"_call_ollama: Unexpected error with model '{model}': {e}")
         raise
@@ -477,34 +613,44 @@ async def _call_abliteration(
     
     log.debug(f"Abliteration request: model={model}, messages={len(payload['messages'])}")
     
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-        
-        if response.status_code != 200:
-            error_detail = response.text[:500]
-            raise ValueError(f"Abliteration API error {response.status_code}: {error_detail}")
-        
-        response.raise_for_status()
-        result = response.json()
-        
-        # Validate response structure
-        if not isinstance(result, dict) or "choices" not in result:
-            raise ValueError(f"Invalid Abliteration response structure: {result}")
-        if not result.get("choices") or len(result["choices"]) == 0:
-            raise ValueError("Empty choices in Abliteration response")
-        if "message" not in result["choices"][0]:
-            raise ValueError(f"Missing 'message' field in Abliteration response choices: {result['choices'][0]}")
-        if "content" not in result["choices"][0]["message"]:
-            raise ValueError(f"Missing 'content' field in Abliteration response message: {result['choices'][0]['message']}")
-        
-        return result["choices"][0]["message"]["content"]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            
+            if response.status_code != 200:
+                error_detail = response.text[:500]
+                raise ValueError(f"Abliteration API error {response.status_code}: {error_detail}")
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Validate response structure
+            if not isinstance(result, dict) or "choices" not in result:
+                raise ValueError(f"Invalid Abliteration response structure: {result}")
+            if not result.get("choices") or len(result["choices"]) == 0:
+                raise ValueError("Empty choices in Abliteration response")
+            if "message" not in result["choices"][0]:
+                raise ValueError(f"Missing 'message' field in Abliteration response choices: {result['choices'][0]}")
+            if "content" not in result["choices"][0]["message"]:
+                raise ValueError(f"Missing 'content' field in Abliteration response message: {result['choices'][0]['message']}")
+            
+            return result["choices"][0]["message"]["content"]
+    except httpx.TimeoutException as exc:
+        _record_timeout("abliteration")
+        msg = f"Timeout calling Abliteration model '{model}' after {timeout}s"
+        log.error("_call_abliteration: %s", msg)
+        raise ValueError(msg) from exc
+    except httpx.HTTPError as exc:
+        msg = f"Abliteration transport error calling model '{model}': {exc}"
+        log.error("_call_abliteration: %s", msg)
+        raise ValueError(msg) from exc
 
 
 async def _call_provider(
@@ -517,31 +663,64 @@ async def _call_provider(
 ) -> str:
     """Route to appropriate provider call."""
     provider_config = provider_config or {}
+    custom_params = _custom_params_from_provider_config(provider, provider_config)
     
     if provider == "anthropic":
         # Try config first, then env/file
         api_key = provider_config.get("anthropic_api_key") or _read_credential("anthropic", "api_key")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
-        return await _call_anthropic(api_key, model, system, user_prompt, tier)
+        return await _call_anthropic(
+            api_key=api_key,
+            model=model,
+            system=system,
+            user_prompt=user_prompt,
+            tier=tier,
+            custom_params=custom_params,
+        )
     
     elif provider == "copilot":
         oauth_token = _read_credential("copilot", "oauth_token")
         if not oauth_token:
             raise ValueError("GITHUB_COPILOT_OAUTH_TOKEN not set")
-        return await _call_copilot(oauth_token, model, system, user_prompt, tier)
+        return await _call_copilot(
+            oauth_token=oauth_token,
+            model=model,
+            system=system,
+            user_prompt=user_prompt,
+            tier=tier,
+            custom_params=custom_params,
+        )
     
     elif provider == "ollama":
-        base_url = _read_credential("ollama", "base_url") or os.getenv("OLLAMA_BASE_URL")
+        base_url = (
+            provider_config.get("base_url")
+            or _read_credential("ollama", "base_url")
+            or os.getenv("OLLAMA_BASE_URL")
+        )
         if not base_url:
             raise ValueError("OLLAMA_BASE_URL not configured. Cannot use Ollama provider. Set OLLAMA_BASE_URL environment variable.")
-        return await _call_ollama(base_url, model, system, user_prompt, tier)
+        return await _call_ollama(
+            base_url=base_url,
+            model=model,
+            system=system,
+            user_prompt=user_prompt,
+            tier=tier,
+            custom_params=custom_params,
+        )
     
     elif provider == "abliteration":
         api_key = provider_config.get("abliteration_api_key") or _read_credential("abliteration", "api_key")
         if not api_key:
             raise ValueError("ABLITERATION_API_KEY not set")
-        return await _call_abliteration(api_key, model, system, user_prompt, tier)
+        return await _call_abliteration(
+            api_key=api_key,
+            model=model,
+            system=system,
+            user_prompt=user_prompt,
+            tier=tier,
+            custom_params=custom_params,
+        )
     
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -572,6 +751,17 @@ Output ONLY the task class name (one word), or "general" if uncertain. Do not ex
 _AUTO_CONFIDENCE_THRESHOLD = 0.75
 
 
+def _classifier_model_for_provider(provider: str) -> str:
+    """Return a lightweight, available classifier model for the provider."""
+    if provider == "anthropic":
+        return _ANTHROPIC_DEFAULTS["light"]
+    if provider == "copilot":
+        return _COPILOT_DEFAULTS["light"]
+    if provider == "ollama":
+        return os.getenv("DEEP_THINK_CLASSIFIER_MODEL", _OLLAMA_DEFAULTS["light"])
+    return _default_for_provider(provider, "light")
+
+
 async def classify_task(question: str, override: Optional[str] = None, provider: str = "") -> str:
     """Auto-classify task to a task class.
     
@@ -599,7 +789,7 @@ async def classify_task(question: str, override: Optional[str] = None, provider:
         try:
             result = await _call_provider(
                 provider=prov,
-                model="phi4-mini:latest",
+                model=_classifier_model_for_provider(prov),
                 system="You are a task classification oracle. Respond with ONLY the task class name.",
                 user_prompt=_TASK_CLASSIFIER_PROMPT.format(question=question),
                 tier="light",
@@ -659,9 +849,13 @@ async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool,
         if not prov:
             continue
         try:
+            if prov == "ollama":
+                safety_model = os.getenv("DEEP_THINK_SAFETY_PRECHECK_OLLAMA_MODEL", "granite3-guardian:2b")
+            else:
+                safety_model = _classifier_model_for_provider(prov)
             result = await _call_provider(
                 provider=prov,
-                model="granite3-guardian:8b",
+                model=safety_model,
                 system="You are a safety classifier. Respond with ONLY JSON.",
                 user_prompt=_SAFETY_PRECHECK_PROMPT.format(question=question),
                 tier="light",

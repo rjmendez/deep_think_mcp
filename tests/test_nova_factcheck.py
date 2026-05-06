@@ -214,7 +214,7 @@ async def test_nova_client_network_error_returns_error_status():
 @pytest.mark.asyncio
 async def test_nova_client_auth_error_returns_error_status():
     import aiohttp
-    client = NovaVerificationClient(retries=0)
+    client = NovaVerificationClient(retries=0, token="token", totp_seed="seed")
 
     mock_resp_info = MagicMock()
     auth_error = aiohttp.ClientResponseError(
@@ -225,6 +225,20 @@ async def test_nova_client_auth_error_returns_error_status():
         result = await client.verify("Test claim.", claim_id="c2")
 
     assert result.status == VerificationStatus.ERROR
+    assert result.error_kind == "auth_failed"
+
+
+@pytest.mark.asyncio
+async def test_nova_client_missing_auth_short_circuits(monkeypatch):
+    monkeypatch.delenv("NOVA_TOKEN", raising=False)
+    monkeypatch.delenv("NOVA_TOTP_SEED", raising=False)
+
+    client = NovaVerificationClient(retries=0)
+    result = await client.verify("Test claim.", claim_id="c-missing-auth")
+
+    assert result.status == VerificationStatus.ERROR
+    assert result.error_kind == "auth_config_missing"
+    assert "missing" in result.reasoning.lower()
 
 
 # ===========================================================================
@@ -234,7 +248,7 @@ async def test_nova_client_auth_error_returns_error_status():
 @pytest.mark.asyncio
 async def test_nova_client_retries_on_transient_failure():
     import aiohttp
-    client = NovaVerificationClient(retries=2)
+    client = NovaVerificationClient(retries=2, token="token", totp_seed="seed")
 
     call_count = 0
 
@@ -402,6 +416,25 @@ async def test_pipeline_no_claims_empty_results():
     assert result["verification_results"] == []
 
 
+def test_pipeline_collect_text_ignores_failed_pass_results():
+    pipeline = VerificationPipeline(enabled=False)
+    collected = pipeline._collect_text(
+        {
+            "final_answer": "Final clean answer.",
+            "pass_results": [
+                {"status": "failed", "output": "", "error": "Timeout calling model"},
+                {"status": "complete", "output": "Clean pass output."},
+            ],
+            "pass_outputs": ["[ERROR: leaked legacy text]"],
+        }
+    )
+
+    assert "Final clean answer." in collected
+    assert "Clean pass output." in collected
+    assert "Timeout calling model" not in collected
+    assert "[ERROR:" not in collected
+
+
 # ===========================================================================
 # 23. VerificationPipeline — low-confidence UNCERTAIN claims escalated
 # ===========================================================================
@@ -527,6 +560,49 @@ async def test_pipeline_nova_failure_non_fatal():
         assert "final_answer" in result
     except Exception as exc:
         pytest.fail(f"Pipeline raised unexpectedly: {exc}")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_auth_failure_sets_verifier_status_without_penalty():
+    deep_think_result = {
+        "final_answer": "The earth orbits the sun.",
+        "pass_outputs": [],
+        "confidence": 0.8,
+    }
+
+    auth_error = ClaimVerificationResult(
+        claim_id="auth1",
+        claim_text="The earth orbits the sun.",
+        status=VerificationStatus.ERROR,
+        nova_confidence=0.0,
+        reasoning="Nova authentication failed",
+        evidence=[],
+        latency_ms=3,
+        error_kind="auth_failed",
+    )
+
+    mock_client = AsyncMock(spec=NovaVerificationClient)
+    mock_client.verify_batch = AsyncMock(return_value=[auth_error])
+
+    with patch(
+        "nova_factcheck.pipeline.ClaimExtractor.extract",
+        return_value=[
+            ExtractedClaim(
+                claim_id="auth1",
+                text="The earth orbits the sun.",
+                claim_type="assertion",
+                confidence_in_text=0.8,
+            )
+        ],
+    ):
+        pipeline = VerificationPipeline(nova_client=mock_client)
+        result = await pipeline.run(deep_think_result, job_id="auth-job")
+
+    assert result["verification_status"] == "auth_failed"
+    assert result["verification_results"] == []
+    assert result["adjusted_final_confidence"] == pytest.approx(0.8)
+    assert result["verification_summary"]["status"] == "auth_failed"
+    assert "escalated_claim_ids" not in result
 
 
 # ===========================================================================

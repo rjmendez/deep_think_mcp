@@ -5,6 +5,7 @@ This is the primary integration point.  Call run() after deep_think_passes
 completes to enrich the result dict with verification data.
 
 Result enrichment:
+    result["verification_status"]        — optional verifier-wide state (auth_failed / unavailable)
     result["verification_results"]       — list of per-claim dicts
     result["adjusted_final_confidence"]  — confidence after applying boosts/penalties
     result["verification_summary"]       — counts and net adjustment
@@ -110,10 +111,36 @@ class VerificationPipeline:
         log.info("Extracted %d claims for job %s; verifying with Nova...", len(claims), job_id)
 
         # 2. Verify with Nova
-        vr_list: List[ClaimVerificationResult] = await self._verify_claims(claims)
+        original_conf = float(result.get("confidence", 0.5))
+        try:
+            vr_list = await self._verify_claims(claims)
+        except Exception as exc:
+            log.warning("Verification unavailable for job %s: %s", job_id, exc)
+            return _mark_verification_unavailable(
+                result=result,
+                original_confidence=original_conf,
+                total_claims=len(claims),
+                status="unavailable",
+                reason=str(exc) or type(exc).__qualname__,
+            )
+
+        verifier_status = _summarize_verifier_status(vr_list)
+        if verifier_status is not None:
+            log.warning(
+                "Verification unavailable for job %s: %s (%s)",
+                job_id,
+                verifier_status["status"],
+                verifier_status["reason"],
+            )
+            return _mark_verification_unavailable(
+                result=result,
+                original_confidence=original_conf,
+                total_claims=len(claims),
+                status=verifier_status["status"],
+                reason=verifier_status["reason"],
+            )
 
         # 3. Recalculate confidence
-        original_conf = float(result.get("confidence", 0.5))
         recalc = self._recalculator.recalculate(original_conf, vr_list)
 
         # 4. Route unverifiable claims to escalation queue
@@ -162,10 +189,19 @@ class VerificationPipeline:
         if final_answer:
             parts.append(str(final_answer))
 
-        pass_outputs = result.get("pass_outputs", [])
-        for po in pass_outputs:
-            if isinstance(po, str) and po:
-                parts.append(po)
+        pass_results = result.get("pass_results", [])
+        if isinstance(pass_results, list) and pass_results:
+            for pr in pass_results:
+                if not isinstance(pr, dict) or pr.get("status") != "complete":
+                    continue
+                output = pr.get("output")
+                if isinstance(output, str) and output:
+                    parts.append(output)
+        else:
+            pass_outputs = result.get("pass_outputs", [])
+            for po in pass_outputs:
+                if isinstance(po, str) and po:
+                    parts.append(po)
 
         # Fan-out synthesis text
         synthesis = result.get("synthesis", "")
@@ -263,3 +299,47 @@ def _build_verification_results(
         rows.append(row)
 
     return rows
+
+
+def _summarize_verifier_status(
+    vr_list: List[ClaimVerificationResult],
+) -> Optional[Dict[str, str]]:
+    """Collapse verifier-wide auth/outage failures into a single explicit state."""
+    if not vr_list or any(vr.status != VerificationStatus.ERROR for vr in vr_list):
+        return None
+
+    error_kinds = {vr.error_kind for vr in vr_list if vr.error_kind}
+    if not error_kinds:
+        return None
+    reason = next((vr.reasoning for vr in vr_list if vr.reasoning), "Verification unavailable")
+
+    if error_kinds and error_kinds.issubset({"auth_failed", "auth_config_missing"}):
+        return {"status": "auth_failed", "reason": reason}
+
+    return {"status": "unavailable", "reason": reason}
+
+
+def _mark_verification_unavailable(
+    result: Dict[str, Any],
+    original_confidence: float,
+    total_claims: int,
+    status: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Record verifier-wide outage/auth state without poisoning claim confidence."""
+    result["verification_status"] = status
+    result["verification_results"] = []
+    result["adjusted_final_confidence"] = original_confidence
+    result["verification_summary"] = {
+        "status": status,
+        "reason": reason,
+        "total_claims": total_claims,
+        "true_count": 0,
+        "false_count": 0,
+        "uncertain_count": 0,
+        "error_count": 0,
+        "net_adjustment": 0.0,
+        "original_confidence": original_confidence,
+    }
+    result.pop("escalated_claim_ids", None)
+    return result

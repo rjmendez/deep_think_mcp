@@ -26,6 +26,7 @@ Learning / adaptation:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -645,6 +646,8 @@ class CreativeReasoningEngine:
 
             # Determine tier: exploration passes → medium; final pass → heavy
             tier = "heavy" if pass_num == passes else "medium"
+            provider_name = cfg.provider or provider_config.get("provider", "ollama")
+            model_name = provider_config.get("model", "")
 
             log.info(
                 "[creative] Pass %d/%d mode=%s temperature=%.2f tier=%s",
@@ -652,9 +655,11 @@ class CreativeReasoningEngine:
             )
 
             try:
+                pass_provider_config = dict(provider_config)
+                pass_provider_config["temperature"] = temperature
                 output = await provider_module._call_provider(
-                    provider=cfg.provider or provider_config.get("provider", "ollama"),
-                    model=provider_config.get("model", ""),
+                    provider=provider_name,
+                    model=model_name,
                     system=(
                         f"You are a creative reasoning assistant operating in "
                         f"'{mode}' mode. "
@@ -663,10 +668,40 @@ class CreativeReasoningEngine:
                     ),
                     user_prompt=prompt,
                     tier=tier,
+                    provider_config=pass_provider_config,
                 )
             except Exception as exc:
-                log.error("[creative] Pass %d failed: %s", pass_num, exc)
-                output = f"[ERROR: {exc}]"
+                error_msg = str(exc) or type(exc).__qualname__ or f"Exception: {repr(exc)}"
+                custom_params = {}
+                try:
+                    custom_params = provider_module._custom_params_from_provider_config(
+                        provider_name, pass_provider_config
+                    )
+                except Exception:
+                    log.debug("[creative] Failed to extract custom params", exc_info=True)
+                log.error(
+                    "pass_event %s",
+                    json.dumps(
+                        {
+                            "event": "creative_pass_exception",
+                            "job_id": job_id,
+                            "mode": mode,
+                            "pass_num": pass_num,
+                            "framing": framing_name,
+                            "tier": tier,
+                            "provider": provider_name,
+                            "model": model_name,
+                            "temperature": temperature,
+                            "custom_params": custom_params,
+                            "exception_type": type(exc).__qualname__,
+                            "error": error_msg,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                )
+                log.error("[creative] Pass %d failed: %s", pass_num, error_msg, exc_info=True)
+                output = f"[ERROR: {error_msg}]"
 
             metrics = extract_quality_metrics(output)
             last_novelty = metrics["novelty_score"]

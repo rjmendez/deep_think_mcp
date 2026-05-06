@@ -1,0 +1,51 @@
+kind: deep-think-skill
+version: 1
+id: synthesis
+task_class: synthesis
+description: Writing, summarization, report drafting, and narrative synthesis.
+routing:
+  directive_set: synthesis
+  mandate_set: synthesis
+controls:
+  verification_mode: narrative
+  provenance_mode: explicit-attribution
+  layer_order:
+    - source_inventory
+    - thesis
+    - contradiction_handling
+    - uncertainty
+    - audience_fit
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    stop_at_verified_boundary: true
+  verification_tiers:
+    - source
+    - contradiction
+    - audience
+  report_contract:
+    - separate quoted source facts from synthesis
+    - acknowledge unresolved contradictions directly
+    - state residual uncertainty instead of smoothing it away
+  stop_conditions:
+    - stop when the synthesis would require uncited factual claims
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.5
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

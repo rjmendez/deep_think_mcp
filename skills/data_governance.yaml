@@ -1,0 +1,55 @@
+kind: deep-think-skill
+version: 1
+id: data_governance
+task_class: data_governance
+description: Telemetry integrity analysis, data quality triage, and remediation synthesis.
+routing:
+  directive_set: data_governance
+  mandate_set: investigation
+controls:
+  verification_mode: telemetry
+  provenance_mode: layered
+  layer_order:
+    - target_identity
+    - stream_presence
+    - freshness
+    - integrity
+    - attribution
+    - remediation_readiness
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+    compare_current_vs_intended: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    distinguish_candidate_from_confirmed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    bounded_change_only: true
+    stop_at_verified_boundary: true
+  verification_tiers:
+    - telemetry
+    - control_plane
+    - end_to_end
+  report_contract:
+    - separate missing data from corrupted data
+    - distinguish root-cause evidence from correlation
+    - state the next observation needed to confirm attribution
+  stop_conditions:
+    - stop when remediation is not yet justified by evidence quality
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.5
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

@@ -54,6 +54,8 @@ class PassResult:
         output: The full text output from the model
         validation: Optional validation results from ground truth provider
         measured_confidence: Optional confidence score from validation
+        status: "complete" when semantic output exists, otherwise "failed"
+        error: Failure detail when status is "failed"
     """
     pass_num: int
     framing: str
@@ -63,6 +65,8 @@ class PassResult:
     output: str
     validation: Optional[dict] = None
     measured_confidence: Optional[float] = None
+    status: str = "complete"
+    error: Optional[str] = None
 
 
 @dataclass

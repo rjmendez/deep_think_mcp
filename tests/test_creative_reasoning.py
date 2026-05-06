@@ -248,6 +248,58 @@ def test_creative_run_updates_metrics_accumulator():
     assert creative_mod._metrics.total_jobs == before_jobs + 1
 
 
+def test_creative_run_passes_actual_temperature_to_provider(monkeypatch):
+    import deep_think_mcp.engine.provider as prov
+
+    captured = {}
+
+    async def _capture_provider(*args, **kwargs):
+        captured["provider_config"] = kwargs.get("provider_config", {})
+        return (
+            "Here is my analysis.\n"
+            "Novelty: 0.55\n"
+            "Feasibility: 0.60\n"
+            "Impact: 0.65\n"
+        )
+
+    monkeypatch.setattr(prov, "_call_provider", _capture_provider)
+
+    engine = CreativeReasoningEngine()
+    asyncio.get_event_loop().run_until_complete(
+        engine.run(question="Test?", mode="blue-sky", passes=1, provider_config={"provider": "ollama"})
+    )
+
+    assert "temperature" in captured["provider_config"]
+    assert isinstance(captured["provider_config"]["temperature"], float)
+
+
+def test_creative_run_logs_structured_pass_exception(monkeypatch, caplog):
+    import deep_think_mcp.engine.provider as prov
+
+    async def _failing_provider(*args, **kwargs):
+        raise RuntimeError("creative lane exploded")
+
+    monkeypatch.setattr(prov, "_call_provider", _failing_provider)
+
+    engine = CreativeReasoningEngine()
+    with caplog.at_level("ERROR"):
+        asyncio.get_event_loop().run_until_complete(
+            engine.run(
+                question="Test?",
+                mode="blue-sky",
+                passes=1,
+                provider_config={"provider": "ollama", "model": "heretic-gemma3-4b-it:latest"},
+                job_id="creative-job-1",
+            )
+        )
+
+    assert "pass_event" in caplog.text
+    assert '"job_id": "creative-job-1"' in caplog.text
+    assert '"mode": "blue-sky"' in caplog.text
+    assert '"temperature":' in caplog.text
+    assert '"error": "creative lane exploded"' in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # 20. CreativeJobResult.to_dict serialization
 # ---------------------------------------------------------------------------

@@ -1,0 +1,56 @@
+kind: deep-think-skill
+version: 1
+id: code_review
+task_class: code_review
+description: Code analysis, bug detection, security review, and interface scrutiny.
+routing:
+  directive_set: code_review
+  mandate_set: code_review
+controls:
+  verification_mode: review
+  provenance_mode: file-and-line
+  layer_order:
+    - target_surface
+    - control_flow
+    - data_flow
+    - side_effects
+    - exploitability
+    - fix_verification
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+    compare_current_vs_intended: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    distinguish_candidate_from_confirmed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    bounded_change_only: true
+    stop_at_verified_boundary: true
+  verification_tiers:
+    - static
+    - behavioral
+    - integration
+  report_contract:
+    - cite file and line evidence for material claims
+    - separate demonstrated bugs from plausible risks
+    - state which assumptions still need runtime proof
+  stop_conditions:
+    - stop when a claim lacks a concrete code path
+    - stop when the proposed fix would exceed the requested scope
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.5
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

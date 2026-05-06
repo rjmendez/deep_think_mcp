@@ -8,7 +8,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .. import mcp_help
-from ..engine import TASK_CLASS_PROFILES, build_provider_config
+from ..engine import build_provider_config
+from ..engine.directives import TASK_CLASS_NAMES, list_skill_profiles as _list_skill_profiles
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ def register(mcp):
         Response includes:
         - passes: [2, 3, 4, 5, 6] - available pass counts
         - task_classes: available reasoning modes
+        - skills: loaded predefined skill profiles
         - providers: configured providers with available models
         - latency_estimates: estimated latency per pass count and provider
         
@@ -36,7 +38,7 @@ def register(mcp):
             "providers": {
                 "anthropic": {
                     "available": true,
-                    "models": ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"]
+                    "models": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"]
                 },
                 "ollama": {
                     "available": true,
@@ -53,9 +55,8 @@ def register(mcp):
         """
         try:
             build_provider_config()
-            
-            # Get list of task classes from TASK_CLASS_PROFILES
-            task_classes = list(TASK_CLASS_PROFILES.keys())
+            task_classes = list(TASK_CLASS_NAMES)
+            skills = _list_skill_profiles()
             
             # Check provider availability
             providers = {}
@@ -65,9 +66,9 @@ def register(mcp):
                 providers["anthropic"] = {
                     "available": True,
                     "models": [
-                        "claude-opus-4-1-20250805",
-                        "claude-sonnet-4-20250514",
-                        "claude-opus-4-1",
+                        "claude-haiku-4-5",
+                        "claude-sonnet-4-6",
+                        "claude-opus-4-7",
                     ]
                 }
                 providers["copilot"] = {
@@ -119,6 +120,7 @@ def register(mcp):
                     "passes": [2, 3, 4, 5, 6],
                     "width_range": [1, 2, 3, 4, 5, 6],
                     "task_classes": task_classes,
+                    "skills": skills,
                     "providers": providers,
                     "latency_estimates": latency_estimates,
                 },
@@ -131,6 +133,25 @@ def register(mcp):
                 {"error": f"Failed to get capabilities: {str(e)}"},
                 status_code=500,
             )
+
+    @mcp.custom_route("/skills", methods=["GET"])
+    async def get_skills(request: Request) -> JSONResponse:
+        """List normalized skill profiles loaded from skills/*.yaml."""
+        try:
+            skills = _list_skill_profiles()
+            return JSONResponse({"count": len(skills), "skills": skills}, status_code=200)
+        except Exception as e:
+            log.exception("Skills endpoint error")
+            return JSONResponse(
+                {"error": f"Failed to get skills: {str(e)}"},
+                status_code=500,
+            )
+
+    @mcp.tool()
+    async def list_skill_profiles() -> dict:
+        """List predefined Deep Think skill profiles loaded from skills/*.yaml."""
+        skills = _list_skill_profiles()
+        return {"count": len(skills), "skills": skills}
 
     @mcp.custom_route("/suggest", methods=["POST"])
     async def suggest_reasoning_config(request: Request) -> JSONResponse:

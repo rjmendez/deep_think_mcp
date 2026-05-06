@@ -1,0 +1,53 @@
+kind: deep-think-skill
+version: 1
+id: safety
+task_class: safety
+description: Content safety, policy compliance, risk detection, and guardrail evaluation.
+routing:
+  directive_set: safety
+  mandate_set: safety
+controls:
+  safety_precheck: true
+  verification_mode: guardrail
+  provenance_mode: layered
+  layer_order:
+    - content_inventory
+    - harm_surface
+    - misuse_preconditions
+    - mitigation_options
+    - verdict
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    bounded_change_only: true
+    stop_at_verified_boundary: true
+  verification_tiers:
+    - classifier
+    - policy
+    - context
+  report_contract:
+    - state the concrete harm predicate under review
+    - distinguish explicit content from inferred risk
+    - separate observed harms from hypothetical misuse
+  stop_conditions:
+    - stop when context is too incomplete to justify a firm verdict
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.5
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

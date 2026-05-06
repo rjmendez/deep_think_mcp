@@ -1,0 +1,60 @@
+kind: deep-think-skill
+version: 1
+id: general
+task_class: general
+description: General-purpose reasoning and analysis. Default when no other class fits.
+routing:
+  directive_set: general
+  mandate_set: general
+controls:
+  verification_mode: standard
+  provenance_mode: layered
+  layer_order:
+    - target_identity
+    - current_state
+    - reachability
+    - authorization
+    - execution_readiness
+    - post_action_verification
+  target_policy:
+    explicit_target_required: true
+    inspect_current_state_first: true
+    compare_current_vs_intended: true
+  evidence_policy:
+    define_predicate_first: true
+    answer_highest_verified_layer_only: true
+    separate_observed_inferred_assumed: true
+    distinguish_candidate_from_confirmed: true
+    state_remaining_gap: true
+  action_policy:
+    read_only_first: true
+    bounded_change_only: true
+    stop_at_verified_boundary: true
+  approval_policy:
+    explicit_confirmation_for_external_mutation: true
+  verification_tiers:
+    - syntactic
+    - control_plane
+    - data_plane
+    - end_to_end
+  report_contract:
+    - define the target and predicate before concluding
+    - report only the highest verified layer reached
+    - separate confirmed state from best candidate
+    - state the residual uncertainty plainly
+  stop_conditions:
+    - stop when the next step would require an unverified assumption
+    - stop when target identity cannot be proven
+models:
+  ollama:
+    light: heretic-llama31-8b-instruct:latest
+    medium: heretic-llama31-8b-instruct:latest
+    heavy: heretic-llama31-8b-instruct:latest
+  copilot:
+    light: gpt-5.4
+    medium: gpt-5.4
+    heavy: gpt-5.5
+  anthropic:
+    light: claude-haiku-4-5
+    medium: claude-sonnet-4-6
+    heavy: claude-opus-4-7

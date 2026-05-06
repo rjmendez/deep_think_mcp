@@ -51,14 +51,22 @@ log = logging.getLogger(__name__)
 _active_tasks: set[asyncio.Task] = set()
 
 
+def _log_job_event(level: str, event: str, **fields) -> None:
+    payload = {"event": event, **fields}
+    message = json.dumps(payload, sort_keys=True, default=str)
+    getattr(log, level)("job_event %s", message)
+
+
 async def _run_job(job: dict) -> None:
     job_id = job["job_id"]
+    task_class = job.get("task_class", "general")
+    data_policy = job.get("data_policy", "any")
     try:
         provider_config = json.loads(job.get("provider_config_json") or "{}")
         
-        # Extract job control params (pop from provider_config where stored there)
+        # Extract job control params while preserving routing-critical overrides.
         task_class = provider_config.pop("task_class", job.get("task_class", "general"))
-        data_policy = provider_config.pop("data_policy", job.get("data_policy", "any"))
+        data_policy = provider_config.get("data_policy", job.get("data_policy", "any"))
         device_id = job.get("device_id", "")
         force_local_models = job.get("force_local_models", False)
 
@@ -73,6 +81,17 @@ async def _run_job(job: dict) -> None:
         if device_id or force_local_models:
             force_local_models = True
             log.info(f"[MQTT] Detected MQTT job (device_id={device_id}), enabling local-only models")
+
+        _log_job_event(
+            "info",
+            "job_started",
+            job_id=job_id,
+            task_class=task_class,
+            data_policy=data_policy,
+            passes=job.get("passes"),
+            force_local_models=force_local_models,
+            device_id=device_id or None,
+        )
 
         if provider_config.pop("fan_out", False):
             width = int(provider_config.pop("width", 3))
@@ -135,11 +154,35 @@ async def _run_job(job: dict) -> None:
         try:
             result = await asyncio.wait_for(_verification_pipeline.run(result, job_id=job_id), timeout=30.0)
         except asyncio.TimeoutError:
+            metrics.get_metrics().record_timeout("nova_verification")
+            _log_job_event(
+                "warning",
+                "job_verification_timeout",
+                job_id=job_id,
+                timeout_seconds=30.0,
+            )
             log.warning("Nova verification pipeline timed out for job %s (non-fatal)", job_id)
         except Exception as vexc:
+            _log_job_event(
+                "warning",
+                "job_verification_failed",
+                job_id=job_id,
+                exception_type=type(vexc).__qualname__,
+                error=str(vexc) or type(vexc).__qualname__,
+            )
             log.warning("Nova verification pipeline failed for job %s (non-fatal): %s", job_id, vexc)
 
         await asyncio.to_thread(store.complete_job, job_id, json.dumps(result))
+        _log_job_event(
+            "info",
+            "job_completed",
+            job_id=job_id,
+            task_class=task_class,
+            result_status=result.get("status"),
+            verification_status=result.get("verification_status"),
+            final_answer_len=len(result.get("final_answer", "") or ""),
+            pass_result_count=len(result.get("pass_results", []) or []),
+        )
     except Exception as exc:
         error_msg = str(exc) or type(exc).__qualname__
         try:
@@ -150,6 +193,15 @@ async def _run_job(job: dict) -> None:
             log.error("Job %s: DOUBLE FAILURE - complete_job AND fail_job failed. complete: %s, fail: %s", 
                      job_id, error_msg, fail_error_msg)
             # Don't re-raise — let orphan watchdog detect and requeue
+        _log_job_event(
+            "error",
+            "job_failed",
+            job_id=job_id,
+            task_class=task_class,
+            data_policy=data_policy,
+            exception_type=type(exc).__qualname__,
+            error=error_msg,
+        )
         log.error("Job %s failed: %s", job_id, error_msg)
 
 
@@ -224,7 +276,7 @@ async def worker_loop(max_concurrency: int = 0) -> None:
     while True:
         poll_count += 1
         if poll_count % 30 == 0:  # Log every 30 polls (roughly every 30 seconds)
-            log.info("Worker loop polling (active=%d, poll_count=%d)", active, poll_count)
+            _log_job_event("info", "worker_poll", active=active, poll_count=poll_count, worker_id=worker_id)
         
         if active >= max_concurrency:
             await asyncio.sleep(0.5)
@@ -242,6 +294,14 @@ async def worker_loop(max_concurrency: int = 0) -> None:
             continue
 
         active += 1
+        _log_job_event(
+            "info",
+            "job_claimed",
+            job_id=job["job_id"],
+            worker_id=worker_id,
+            active=active,
+            remaining_capacity=max_concurrency - active,
+        )
         log.info("Picked up job %s (%d active)", job["job_id"], active)
 
         async def _run_and_release(j: dict) -> None:

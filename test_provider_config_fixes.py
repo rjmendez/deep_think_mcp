@@ -245,6 +245,116 @@ class TestFix5AbliterationCustomParams:
             assert payload["max_tokens"] == 2048
 
 
+class TestTemperatureKnobPropagation:
+    """Test that provider_config custom params reach provider payloads."""
+
+    @pytest.mark.asyncio
+    async def test_call_provider_forwards_ollama_custom_params_and_base_url(self):
+        """Test that flat provider_config keys reach Ollama with base_url override."""
+        with patch.object(provider_module, "_call_ollama", new_callable=AsyncMock) as mock_ollama:
+            mock_ollama.return_value = "ok"
+
+            await provider_module._call_provider(
+                provider="ollama",
+                model="heretic-gemma3-4b-it:latest",
+                system="system",
+                user_prompt="prompt",
+                tier="medium",
+                provider_config={
+                    "base_url": "http://[REDACTED_INTERNAL_IP]:11434",
+                    "temperature": 1.3,
+                    "top_p": 0.7,
+                    "seed": 42,
+                    "max_tokens": 512,
+                },
+            )
+
+            call = mock_ollama.await_args
+            assert call.kwargs["base_url"] == "http://[REDACTED_INTERNAL_IP]:11434"
+            assert call.kwargs["custom_params"]["temperature"] == 1.3
+            assert call.kwargs["custom_params"]["top_p"] == 0.7
+            assert call.kwargs["custom_params"]["seed"] == 42
+            assert call.kwargs["custom_params"]["max_tokens"] == 512
+
+    @pytest.mark.asyncio
+    async def test_call_provider_forwards_anthropic_custom_params(self):
+        """Test that custom params reach Anthropic provider calls."""
+        with patch.object(provider_module, "_call_anthropic", new_callable=AsyncMock) as mock_anthropic:
+            mock_anthropic.return_value = "ok"
+
+            await provider_module._call_provider(
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                system="system",
+                user_prompt="prompt",
+                tier="medium",
+                provider_config={
+                    "anthropic_api_key": "sk-ant-test",
+                    "temperature": 0.4,
+                    "top_p": 0.8,
+                    "max_tokens": 2048,
+                },
+            )
+
+            call = mock_anthropic.await_args
+            assert call.kwargs["custom_params"]["temperature"] == 0.4
+            assert call.kwargs["custom_params"]["top_p"] == 0.8
+            assert call.kwargs["custom_params"]["max_tokens"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_ollama_payload_includes_temperature_options(self):
+        """Test that Ollama receives sampling params in its options block."""
+        with patch('httpx.AsyncClient') as mock_client:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "message": {"content": "test"}
+            }
+
+            mock_client_instance = AsyncMock()
+            mock_client_instance.__aenter__.return_value = mock_client_instance
+            mock_client_instance.__aexit__.return_value = None
+            mock_client_instance.post = AsyncMock(return_value=mock_response)
+            mock_client.return_value = mock_client_instance
+
+            result = await provider_module._call_ollama(
+                base_url="http://localhost:11434",
+                model="test-model",
+                system="test system",
+                user_prompt="test prompt",
+                custom_params={
+                    "temperature": 1.1,
+                    "top_p": 0.85,
+                    "seed": 7,
+                    "max_tokens": 321,
+                },
+            )
+
+            assert mock_client_instance.post.called
+            payload = mock_client_instance.post.call_args.kwargs.get("json")
+            assert payload["options"]["temperature"] == 1.1
+            assert payload["options"]["top_p"] == 0.85
+            assert payload["options"]["seed"] == 7
+            assert payload["options"]["num_predict"] == 321
+            assert result == "test"
+
+
+class TestAnthropicOfficialDefaults:
+    """Guard against reintroducing date-coded Anthropic defaults."""
+
+    def test_anthropic_defaults_use_official_ids(self):
+        defaults = provider_module._ANTHROPIC_DEFAULTS
+        assert defaults["light"] == "claude-haiku-4-5"
+        assert defaults["medium"] == "claude-sonnet-4-6"
+        assert defaults["heavy"] == "claude-opus-4-7"
+
+    def test_model_for_tier_anthropic_default_is_not_date_coded(self):
+        cfg = provider_module.ProviderConfig(provider="anthropic")
+        model = provider_module._model_for_tier(cfg, "medium", "general")
+        assert model == "claude-sonnet-4-6"
+        assert "2025" not in model and "2026" not in model
+
+
 class TestFix6SynthesisTierProvider:
     """Test Fix #6: Synthesis uses proper tier/provider selection."""
     

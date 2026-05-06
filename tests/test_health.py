@@ -46,11 +46,19 @@ class TestHealthMetrics:
         assert "http_status" in metrics
         assert "timestamp" in metrics
         assert "pending_count" in metrics
+        assert "running_count" in metrics
+        assert "failed_count" in metrics
         assert "avg_latency" in metrics
         assert "last_success_timestamp" in metrics
+        assert "oldest_queued_age_secs" in metrics
+        assert "oldest_running_age_secs" in metrics
         assert "worker_count" in metrics
         assert "db_status" in metrics
         assert "completed_count" in metrics
+        assert "timeout_count" in metrics
+        assert "timeout_by_component" in metrics
+        assert "orphaned_jobs_detected" in metrics
+        assert "orphaned_jobs_requeued" in metrics
 
     def test_health_status_healthy(self):
         """Test healthy status when pending jobs are below threshold."""

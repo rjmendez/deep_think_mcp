@@ -56,6 +56,22 @@ def _db_path() -> str:
     return path
 
 
+def _max_result_bytes() -> int:
+    import os
+
+    return int(os.getenv("DEEP_THINK_MAX_RESULT_BYTES", str(2 * 1024 * 1024)))
+
+
+def _validate_result_size(result: str) -> None:
+    size_bytes = len(result.encode("utf-8"))
+    max_bytes = _max_result_bytes()
+    if size_bytes > max_bytes:
+        raise ValueError(
+            f"Result payload too large to persist safely ({size_bytes} bytes > {max_bytes} bytes). "
+            f"Increase DEEP_THINK_MAX_RESULT_BYTES or reduce output size."
+        )
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(), check_same_thread=False, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -95,6 +111,18 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_created "
             "ON thinking_jobs(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_status_created "
+            "ON thinking_jobs(status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_status_claimed "
+            "ON thinking_jobs(status, claimed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_status_completed "
+            "ON thinking_jobs(status, completed_at)"
         )
         conn.execute(
             """
@@ -450,6 +478,7 @@ def complete_job(
                       model_used, provider, output
     """
     now = datetime.now(timezone.utc).isoformat()
+    _validate_result_size(result)
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")

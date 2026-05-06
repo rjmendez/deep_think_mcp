@@ -26,6 +26,9 @@ def validate_width(value) -> int:
     Raises:
         ValidationError: If value is a slice object or cannot be converted to int
     """
+    if value is None:
+        return 1
+
     # Reject slice objects (FastMCP bug indicator)
     if isinstance(value, slice):
         max_val = 6
@@ -64,6 +67,9 @@ def validate_passes(value) -> int:
     Raises:
         ValidationError: If value is a slice object or cannot be converted to int
     """
+    if value is None:
+        return 3
+
     # Reject slice objects (FastMCP bug indicator)
     if isinstance(value, slice):
         max_val = 6
@@ -102,6 +108,9 @@ def validate_height(value) -> int:
     Raises:
         ValidationError: If value is a slice object or cannot be converted to int
     """
+    if value is None:
+        return 1
+
     # Reject slice objects (FastMCP bug indicator)
     if isinstance(value, slice):
         max_val = 5

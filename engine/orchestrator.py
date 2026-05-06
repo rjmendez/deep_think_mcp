@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import uuid
+from dataclasses import asdict
 from typing import Optional, Any
 
 try:
@@ -23,11 +24,51 @@ except ImportError:
 from .types import ProviderConfig, PassResult, ValidationData
 from . import provider as provider_module
 from . import directives as directives_module
+from .task_class_enforcer import enforce_task_class
 from .validator import validate_passes, validate_width, validate_height, ValidationError
 from deep_think_mcp import store
 from deep_think_mcp import discover
 
 log = logging.getLogger(__name__)
+
+
+def _log_pass_exception(
+    *,
+    pass_num: int,
+    framing: str,
+    tier: str,
+    provider: str,
+    model: str,
+    error: str,
+    exception_type: str,
+    job_id: Optional[str] = None,
+    task_class: Optional[str] = None,
+    provider_config: Optional[dict] = None,
+    **extra: Any,
+) -> None:
+    """Emit structured pass-level failure context without changing result shape."""
+    custom_params = {}
+    try:
+        custom_params = provider_module._custom_params_from_provider_config(provider, provider_config)
+    except Exception:
+        log.debug("Failed to extract custom params for pass exception", exc_info=True)
+
+    payload = {
+        "event": "pass_exception",
+        "job_id": job_id,
+        "task_class": task_class,
+        "pass_num": pass_num,
+        "framing": framing,
+        "tier": tier,
+        "provider": provider,
+        "model": model,
+        "error": error,
+        "exception_type": exception_type,
+    }
+    if custom_params:
+        payload["custom_params"] = custom_params
+    payload.update({k: v for k, v in extra.items() if v is not None})
+    log.error("pass_event %s", json.dumps(payload, sort_keys=True, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +197,75 @@ def _extract_subject_from_statement(statement: str) -> str:
             return clean_word
     
     return "unknown"
+
+
+def _serialize_validation_data(validation: Optional[ValidationData]) -> Optional[dict]:
+    """Convert ValidationData into a JSON-safe summary."""
+    if validation is None:
+        return None
+
+    return {
+        "claim_count": len(validation.claims),
+        "validation_result_count": len(validation.validation_results),
+        "hallucination_count": validation.hallucination_count,
+        "overall_confidence": validation.overall_confidence,
+        "contradictions": validation.contradictions,
+        "hallucination_details": validation.hallucination_details,
+    }
+
+
+def _build_pass_result(
+    pass_num: int,
+    framing: str,
+    tier: str,
+    provider: str,
+    model: str,
+    output: str = "",
+    validation: Optional[ValidationData] = None,
+    error: Optional[str] = None,
+) -> dict:
+    """Build a serialized pass result with explicit success/failure state."""
+    return asdict(
+        PassResult(
+            pass_num=pass_num,
+            framing=framing,
+            tier=tier,
+            provider=provider,
+            model=model,
+            output=output,
+            validation=_serialize_validation_data(validation),
+            measured_confidence=validation.overall_confidence if validation else None,
+            status="failed" if error else "complete",
+            error=error,
+        )
+    )
+
+
+def _successful_outputs(pass_results: list[dict]) -> list[str]:
+    """Return only semantic outputs from successful passes."""
+    return [
+        pr["output"]
+        for pr in pass_results
+        if pr.get("status") == "complete"
+        and isinstance(pr.get("output"), str)
+        and pr.get("output").strip()
+    ]
+
+
+def _result_status(pass_results: list[dict]) -> str:
+    """Summarize pass completion status for the overall result."""
+    successes = sum(
+        1
+        for pr in pass_results
+        if pr.get("status") == "complete"
+        and isinstance(pr.get("output"), str)
+        and pr.get("output").strip()
+    )
+    if successes == len(pass_results) and pass_results:
+        return "complete"
+    if successes:
+        return "partial"
+    return "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +567,7 @@ async def deep_think_passes(
         web_domain_whitelist: Whitelist domains for web search
     
     Returns:
-        Dict with keys: final_answer, pass_outputs, confidence, duration_secs
+        Dict with keys: final_answer, pass_outputs, pass_results, confidence, duration_secs
     """
     import time
     import os
@@ -475,6 +585,7 @@ async def deep_think_passes(
             "status": "validation_error",
             "final_answer": None,
             "pass_outputs": [],
+            "pass_results": [],
             "confidence": 0,
             "duration_secs": 0,
         }
@@ -498,16 +609,30 @@ async def deep_think_passes(
         )
     
     # Get task profile
-    if task_class not in directives_module.TASK_CLASS_NAMES:
+    if task_class not in directives_module.TASK_CLASS_PROFILES:
         log.warning(f"Unknown task class '{task_class}'; using 'general'")
         task_class = "general"
     
     task_profile = directives_module.TASK_CLASS_PROFILES[task_class]
+    base_task_class = task_profile.get("task_class", task_class)
     directives = task_profile.get("directives", [])
     
     # Initialize provider config
     if provider_config is None:
         provider_config = {}
+    else:
+        provider_config = dict(provider_config)
+
+    if task_profile.get("force_local"):
+        force_local_models = True
+        provider_config.setdefault("provider", "ollama")
+        provider_config["light_provider"] = "ollama"
+        provider_config["medium_provider"] = "ollama"
+        provider_config["heavy_provider"] = "ollama"
+        provider_config.setdefault("data_policy", "local")
+
+    if task_profile.get("block_research_tools"):
+        enable_research = False
     
     # Create provider config object
     cfg = provider_module.build_provider_config(provider_config)
@@ -523,6 +648,11 @@ async def deep_think_passes(
         cfg.data_policy = data_policy
     elif force_local_models:
         cfg.data_policy = "local"  # Ensure local is set
+
+    for tier_name in ("light", "medium", "heavy"):
+        tier_provider = provider_module._tier_provider(cfg, tier_name)
+        tier_model = model or provider_module._model_for_tier(cfg, tier_name, task_class)
+        enforce_task_class(base_task_class, tier_provider, [tier_model], job_id)
     
     # Run safety precheck if required
     if task_profile.get("safety_precheck"):
@@ -532,11 +662,14 @@ async def deep_think_passes(
             return {
                 "final_answer": f"Request blocked by safety check: {reason}",
                 "pass_outputs": [],
+                "pass_results": [],
                 "confidence": 0.0,
                 "duration_secs": time.time() - start_time,
+                "skill": task_class,
+                "task_class": base_task_class,
             }
     
-    pass_outputs = []
+    pass_results = []
     validation_results = []
     
     # Execute passes
@@ -583,8 +716,8 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         
         # Fallback: ensure we have a valid Anthropic model
         if provider_name == "anthropic" and (not model_name or not model_name.startswith("claude")):
-            log.warning(f"deep_think_passes: Invalid Anthropic model '{model_name}', falling back to claude-opus-4-1-20250805")
-            model_name = "claude-opus-4-1-20250805"
+            log.warning(f"deep_think_passes: Invalid Anthropic model '{model_name}', falling back to claude-sonnet-4-6")
+            model_name = "claude-sonnet-4-6"
         
         try:
             # Call provider
@@ -596,13 +729,22 @@ Use the mandate to structure your response. Be precise and evidence-based."""
                 tier=tier,
                 provider_config=provider_config,
             )
-            
-            pass_outputs.append(output)
-            
+
             # Extract and validate claims
             claims = _extract_claims_from_pass_output(output)
             validation = await _validate_claims_against_ground_truth(claims, ground_truth_provider)
             validation_results.append(validation)
+            pass_results.append(
+                _build_pass_result(
+                    pass_num=pass_num,
+                    framing=framing_name,
+                    tier=tier,
+                    provider=provider_name,
+                    model=model_name,
+                    output=output,
+                    validation=validation,
+                )
+            )
             
             log.info(f"Pass {pass_num} complete ({framing_name})")
         
@@ -610,11 +752,33 @@ Use the mandate to structure your response. Be precise and evidence-based."""
             # BUG FIX #1: Removed debug file write to /tmp (not available in k8s containers)
             # Ensure error_msg is never empty (some exceptions have empty str() representation)
             error_msg = str(e) or type(e).__qualname__ or f"Exception: {repr(e)}"
+            _log_pass_exception(
+                pass_num=pass_num,
+                framing=framing_name,
+                tier=tier,
+                provider=provider_name,
+                model=model_name,
+                error=error_msg,
+                exception_type=type(e).__qualname__,
+                job_id=job_id,
+                task_class=task_class,
+                provider_config=provider_config,
+            )
             log.error(f"Pass {pass_num} failed: {error_msg}", exc_info=True)
-            pass_outputs.append(f"[ERROR: {error_msg}]")
             validation_results.append(None)
+            pass_results.append(
+                _build_pass_result(
+                    pass_num=pass_num,
+                    framing=framing_name,
+                    tier=tier,
+                    provider=provider_name,
+                    model=model_name,
+                    error=error_msg,
+                )
+            )
     
     # Synthesize final answer
+    pass_outputs = _successful_outputs(pass_results)
     final_answer = pass_outputs[-1] if pass_outputs else ""
     
     # Calculate confidence
@@ -624,8 +788,12 @@ Use the mandate to structure your response. Be precise and evidence-based."""
     duration = time.time() - start_time
     
     return {
+        "status": _result_status(pass_results),
+        "skill": task_class,
+        "task_class": base_task_class,
         "final_answer": final_answer,
         "pass_outputs": pass_outputs,
+        "pass_results": pass_results,
         "confidence": avg_confidence,
         "duration_secs": duration,
     }
@@ -699,7 +867,31 @@ async def run_fan_out(
     # Enforce local-only models on all configs
     if provider_config is None:
         provider_config = {}
-    
+    else:
+        provider_config = dict(provider_config)
+
+    # Auto-classify if not provided
+    if not task_class:
+        task_class = await provider_module.classify_task(
+            question,
+            provider=provider_config.get("provider", ""),
+        )
+
+    if task_class not in directives_module.TASK_CLASS_PROFILES:
+        log.warning(f"Unknown task class '{task_class}'; using 'general'")
+        task_class = "general"
+
+    task_profile = directives_module.TASK_CLASS_PROFILES[task_class]
+    base_task_class = task_profile.get("task_class", task_class)
+
+    if task_profile.get("force_local"):
+        force_local_models = True
+        provider_config.setdefault("provider", "ollama")
+        provider_config["light_provider"] = "ollama"
+        provider_config["medium_provider"] = "ollama"
+        provider_config["heavy_provider"] = "ollama"
+        provider_config["data_policy"] = "local"
+
     cfg = provider_module.build_provider_config(provider_config)
     
     if force_local_models:
@@ -714,18 +906,21 @@ async def run_fan_out(
     elif data_policy and data_policy != "any":
         cfg.data_policy = data_policy
         provider_config["data_policy"] = data_policy
-    
-    # Auto-classify if not provided
-    if not task_class:
-        task_class = await provider_module.classify_task(question, provider=cfg.provider)
+
+    for tier_name in ("light", "medium", "heavy"):
+        tier_provider = provider_module._tier_provider(cfg, tier_name)
+        tier_model = model or provider_module._model_for_tier(cfg, tier_name, task_class)
+        enforce_task_class(base_task_class, tier_provider, [tier_model], "")
     
     # Get mandates for this task class
-    mandates = directives_module.PERSPECTIVE_MANDATES.get(task_class, {})
+    mandates = directives_module.PERSPECTIVE_MANDATES.get(
+        task_class,
+        directives_module.PERSPECTIVE_MANDATES.get(base_task_class, {}),
+    )
     mandate_names = list(mandates.keys())[:width]
     
     if not mandate_names:
-        # Fallback: use default investigation mandates
-        mandates = directives_module.PERSPECTIVE_MANDATES.get("investigation", {})
+        mandates = directives_module.PERSPECTIVE_MANDATES.get("general", {})
         mandate_names = list(mandates.keys())[:width]
     
     log.info(f"Fan-out: {len(mandate_names)} perspectives × {height} passes each")
@@ -737,7 +932,7 @@ async def run_fan_out(
         """Run one perspective with its mandate."""
         mandate = mandates.get(mandate_name, "")
         
-        outputs = []
+        pass_results = []
         for pass_num in range(1, height + 1):
             system_prompt = f"""Adopt this perspective: {mandate_name}
 
@@ -746,25 +941,66 @@ async def run_fan_out(
 Use this perspective to analyze the question. Be consistent with your assigned viewpoint."""
             
             user_prompt = f"Question: {question}"
+            perspective_provider = provider_module._tier_provider(cfg, "medium")
+            perspective_model = model or provider_module._model_for_tier(cfg, "medium", task_class)
             
             try:
                 output = await provider_module._call_provider(
-                    provider=provider_module._tier_provider(cfg, "medium"),
-                    model=model or provider_module._model_for_tier(cfg, "medium", task_class),
+                    provider=perspective_provider,
+                    model=perspective_model,
                     system=system_prompt,
                     user_prompt=user_prompt,
                     tier="medium",
                     provider_config=provider_config,
                 )
-                outputs.append(output)
+                pass_results.append(
+                    _build_pass_result(
+                        pass_num=pass_num,
+                        framing=mandate_name,
+                        tier="medium",
+                        provider=perspective_provider,
+                        model=perspective_model,
+                        output=output,
+                    )
+                )
             except Exception as e:
                 error_msg = str(e) or type(e).__qualname__ or f"Exception: {repr(e)}"
-                log.error(f"Perspective {mandate_name} pass {pass_num} failed: {error_msg}")
-                outputs.append(f"[ERROR: {error_msg}]")
+                _log_pass_exception(
+                    pass_num=pass_num,
+                    framing=mandate_name,
+                    tier="medium",
+                    provider=perspective_provider,
+                    model=perspective_model,
+                    error=error_msg,
+                    exception_type=type(e).__qualname__,
+                    task_class=task_class,
+                    provider_config=provider_config,
+                    perspective=mandate_name,
+                )
+                log.error(f"Perspective {mandate_name} pass {pass_num} failed: {error_msg}", exc_info=True)
+                pass_results.append(
+                    _build_pass_result(
+                        pass_num=pass_num,
+                        framing=mandate_name,
+                        tier="medium",
+                        provider=perspective_provider,
+                        model=perspective_model,
+                        error=error_msg,
+                    )
+                )
         
         # Synthesize perspective
+        outputs = _successful_outputs(pass_results)
         perspective_synthesis = "\n\n".join(outputs)
-        return (mandate_name, {"outputs": outputs, "synthesis": perspective_synthesis})
+        return (
+            mandate_name,
+            {
+                "status": _result_status(pass_results),
+                "outputs": outputs,
+                "pass_results": pass_results,
+                "synthesis": perspective_synthesis,
+            },
+        )
     
     # Run all perspectives concurrently
     tasks = [run_perspective(name) for name in mandate_names]
@@ -777,7 +1013,22 @@ Use this perspective to analyze the question. Be consistent with your assigned v
     perspective_texts = "\n\n---\n\n".join([
         f"[{name}]\n{output['synthesis']}"
         for name, output in perspective_outputs.items()
+        if output.get("synthesis")
     ])
+
+    if not perspective_texts:
+        duration = time.time() - start_time
+        return {
+            "status": "failed",
+            "skill": task_class,
+            "task_class": base_task_class,
+            "final_answer": "",
+            "perspective_outputs": perspective_outputs,
+            "synthesis": "",
+            "synthesis_error": "No successful perspective outputs available for synthesis.",
+            "confidence": 0.0,
+            "duration_secs": duration,
+        }
     
     synthesis_prompt = _FAN_OUT_SYNTHESIS_PROMPT.format(
         question=question,
@@ -793,17 +1044,23 @@ Use this perspective to analyze the question. Be consistent with your assigned v
             tier="heavy",
             provider_config=provider_config,
         )
+        synthesis_error = None
     except Exception as e:
         error_msg = str(e) or type(e).__qualname__
         log.error(f"Synthesis failed: {error_msg}")
-        final_answer = f"[SYNTHESIS ERROR: {error_msg}]"
+        final_answer = ""
+        synthesis_error = error_msg
     
     duration = time.time() - start_time
     
     return {
+        "status": "complete" if final_answer else "partial",
+        "skill": task_class,
+        "task_class": base_task_class,
         "final_answer": final_answer,
         "perspective_outputs": perspective_outputs,
         "synthesis": final_answer,
+        "synthesis_error": synthesis_error,
         "confidence": 0.7,  # Placeholder
         "duration_secs": duration,
     }

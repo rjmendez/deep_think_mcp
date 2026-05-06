@@ -10,11 +10,13 @@ from .. import store, discover as _discover
 from ..engine import (
     build_provider_config,
     TASK_CLASS_PROFILES,
+    classify_task,
     model_summary,
     PERSPECTIVE_MANDATES,
     CREATIVE_MODES,
     get_metrics_snapshot,
 )
+from ..engine.directives import resolve_skill_selection
 from ..engine.validator import validate_passes, validate_width, validate_height, ValidationError
 
 log = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ def register(mcp):
         question: str,
         passes: Optional[int] = None,
         task_class: Optional[str] = None,
+        skill: Optional[str] = None,
         data_policy: Optional[str] = None,
         model: Optional[str] = None,
         provider_config: Optional[dict] = None,
@@ -59,6 +62,8 @@ def register(mcp):
                 "reasoning"     Complex logical / mathematical reasoning.
                 "adversarial"   Unconstrained challenge reasoning. Ollama-only, NO research tools.
                 "research"      Grounded research. Full research tools, no abliteration models.
+            skill:          Optional predefined skill profile ID loaded from skills/*.yaml.
+                            When provided, it overrides task_class routing.
             data_policy: Controls which providers are allowed.
                 "any"    (default) Use any configured provider including cloud.
                 "local"  Ollama ONLY — never send data to cloud providers.
@@ -74,6 +79,12 @@ def register(mcp):
                 light_provider  Per-tier provider (e.g. "ollama" for cheap local)
                 medium_provider Per-tier provider
                 heavy_provider  Per-tier provider (e.g. "copilot" for synthesis)
+                temperature     Sampling temperature for supported providers
+                top_p/top_k     Sampling controls for supported providers
+                max_tokens      Output cap (mapped to num_predict for Ollama)
+                seed            Deterministic seed for Ollama
+                custom_params   Nested provider-specific sampling params
+                options         Ollama-native options object
             verify:      If True, runs an extra heavy-tier re-traversal pass after the main passes
                          to check for gaps, contradictions, and unsupported claims (RYS verification).
             enable_research: If True and task_class permits, inject grounded research context.
@@ -109,9 +120,14 @@ def register(mcp):
         else:
             total_passes = max(2, min(passes, 6))
 
+        requested_selection = skill or task_class
+        if not skill and task_class == "auto":
+            requested_selection = await classify_task(question, provider=pc.get("provider", ""))
+
         cfg = build_provider_config(pc)
-        resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
-        summary = model_summary(cfg, resolved_class)
+        selected_skill, skill_profile = resolve_skill_selection(requested_selection)
+        resolved_class = skill_profile.get("task_class", selected_skill)
+        summary = model_summary(cfg, selected_skill)
 
         job_id = store.create_job(
             question=question,
@@ -120,7 +136,10 @@ def register(mcp):
             model_summary=summary,
             provider_config_json=json.dumps({
                 **pc,
-                "task_class": task_class,
+                "task_class": selected_skill,
+                "skill": selected_skill,
+                "base_task_class": resolved_class,
+                "skill_version": skill_profile.get("version", 1),
                 "data_policy": data_policy,
                 "verify": verify,
                 "enable_research": enable_research,
@@ -139,10 +158,12 @@ def register(mcp):
             "job_id": job_id,
             "status": "queued",
             "task_class": resolved_class,
+            "skill": selected_skill,
+            "skill_version": skill_profile.get("version", 1),
             "data_policy": data_policy,
             "provider": cfg.provider,
             "model_summary": summary,
-            "research_enabled": enable_research and resolved_class not in ("adversarial",),
+            "research_enabled": enable_research and not skill_profile.get("block_research_tools", False),
         }
         
         if fan_out_enabled:
@@ -216,6 +237,8 @@ def register(mcp):
                 if isinstance(result, dict) and result.get("verification_pass") is not None:
                     response["verification_pass"] = result["verification_pass"]
                 if isinstance(result, dict):
+                    if result.get("verification_status") is not None:
+                        response["verification_status"] = result["verification_status"]
                     if result.get("verification_results") is not None:
                         response["verification_results"] = result["verification_results"]
                     if result.get("adjusted_final_confidence") is not None:
@@ -286,6 +309,7 @@ def register(mcp):
         width: Optional[int] = None,
         height: Optional[int] = None,
         task_class: Optional[str] = None,
+        skill: Optional[str] = None,
         data_policy: Optional[str] = None,
         max_parallel: Optional[int] = None,
         max_width: Optional[int] = None,
@@ -321,6 +345,8 @@ def register(mcp):
                 "reasoning"     → formal / adversarial / constraints / alternative / verification / simplification
                 "synthesis"     → structure / accuracy / clarity / completeness / audience / attribution
                 "extraction"    → schema / completeness / disambiguation / confidence / validation / context
+            skill:               Optional predefined skill profile ID loaded from skills/*.yaml.
+                                  When provided, it overrides task_class routing.
             data_policy:          "any" | "local" | "cloud"
             max_parallel:         Max concurrent perspectives (default 2 — safe for Copilot Business
                                   heavy-tier limits). Increase to 4 for Enterprise accounts.
@@ -355,9 +381,14 @@ def register(mcp):
         if data_policy and data_policy != "any":
             pc["data_policy"] = data_policy
 
+        requested_selection = skill or task_class
+        if not skill and task_class == "auto":
+            requested_selection = await classify_task(question, provider=pc.get("provider", ""))
+
         cfg = build_provider_config(pc)
-        resolved_class = task_class if task_class in TASK_CLASS_PROFILES else "general"
-        summary = model_summary(cfg, resolved_class)
+        selected_skill, skill_profile = resolve_skill_selection(requested_selection)
+        resolved_class = skill_profile.get("task_class", selected_skill)
+        summary = model_summary(cfg, selected_skill)
 
         width = max(1, min(width, 6))
         height = max(1, min(height, 5))
@@ -370,7 +401,10 @@ def register(mcp):
             model_summary=summary,
             provider_config_json=json.dumps({
                 **pc,
-                "task_class": task_class,
+                "task_class": selected_skill,
+                "skill": selected_skill,
+                "base_task_class": resolved_class,
+                "skill_version": skill_profile.get("version", 1),
                 "data_policy": data_policy,
                 "fan_out": True,
                 "width": width,
@@ -382,7 +416,7 @@ def register(mcp):
             }),
         )
 
-        mandates = PERSPECTIVE_MANDATES.get(resolved_class, PERSPECTIVE_MANDATES["general"])
+        mandates = PERSPECTIVE_MANDATES.get(selected_skill, PERSPECTIVE_MANDATES["general"])
         # Extract first 'width' perspective names from the mandates dict
         perspective_names = list(mandates.keys())[:width]
 
@@ -390,6 +424,8 @@ def register(mcp):
             "job_id": job_id,
             "status": "queued",
             "task_class": resolved_class,
+            "skill": selected_skill,
+            "skill_version": skill_profile.get("version", 1),
             "width": width,
             "height": height,
             "total_llm_calls": total_calls,
