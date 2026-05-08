@@ -580,14 +580,14 @@ def fail_job(job_id: str, error: str) -> None:
 def requeue_stale(stale_after_minutes: int = 0) -> int:
     """Reset timed-out 'running' jobs to 'queued'. Call on startup for crash recovery.
 
-    Uses a time-based cutoff (default DEEP_THINK_STALE_JOB_MINUTES, fallback 120 min)
+    Uses a time-based cutoff (DEEP_THINK_ORPHAN_TIMEOUT_MINUTES, default 10 min)
     so concurrent worker processes only requeue genuinely abandoned jobs, not each
     other's actively-running work.
     """
     import os
     from datetime import timedelta
     if stale_after_minutes <= 0:
-        stale_after_minutes = int(os.getenv("DEEP_THINK_STALE_JOB_MINUTES", "120"))
+        stale_after_minutes = int(os.getenv("DEEP_THINK_ORPHAN_TIMEOUT_MINUTES", "10"))
     cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
     ).isoformat()
@@ -609,15 +609,14 @@ def detect_orphaned_jobs(stale_after_minutes: int = 0) -> list[dict]:
     """Detect jobs stuck in 'running' state for longer than threshold.
     
     Returns list of orphaned job dicts that should be requeued.
-    Uses DEEP_THINK_ORPHAN_TIMEOUT_MINUTES env var (default 5 min) for background
-    watchdog detection. This is separate from DEEP_THINK_STALE_JOB_MINUTES (120 min)
-    used only at startup for crash recovery.
+    Uses DEEP_THINK_ORPHAN_TIMEOUT_MINUTES env var (default 10 min) for background
+    watchdog detection. This is also used at startup via requeue_stale for crash recovery.
     """
     import os
     from datetime import timedelta
     
     if stale_after_minutes <= 0:
-        stale_after_minutes = int(os.getenv("DEEP_THINK_ORPHAN_TIMEOUT_MINUTES", "5"))
+        stale_after_minutes = int(os.getenv("DEEP_THINK_ORPHAN_TIMEOUT_MINUTES", "10"))
     
     cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)

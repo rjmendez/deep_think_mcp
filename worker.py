@@ -50,6 +50,17 @@ log = logging.getLogger(__name__)
 
 _active_tasks: set[asyncio.Task] = set()
 
+_job_available = asyncio.Event()
+
+
+def notify_job_available() -> None:
+    """Signal the worker loop that a new job is waiting.
+
+    Safe to call from any coroutine in the same event loop.  The worker wakes
+    immediately instead of burning through its poll-sleep window.
+    """
+    _job_available.set()
+
 
 def _log_job_event(level: str, event: str, **fields) -> None:
     payload = {"event": event, **fields}
@@ -205,13 +216,18 @@ async def _run_job(job: dict) -> None:
         log.error("Job %s failed: %s", job_id, error_msg)
 
 
-async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
+async def _orphan_watchdog(check_interval_seconds: int = 0) -> None:
     """Background watchdog that detects and requeues orphaned jobs.
     
     Runs continuously, checking every check_interval_seconds for jobs stuck in
     'running' state beyond the orphan timeout threshold. When found, requeues
     them by resetting status='queued' and logging the event with metrics.
+
+    Interval is controlled by DEEP_THINK_WATCHDOG_INTERVAL_SECONDS (default 60).
+    Timeout threshold is controlled by DEEP_THINK_ORPHAN_TIMEOUT_MINUTES (default 10).
     """
+    if check_interval_seconds <= 0:
+        check_interval_seconds = int(os.getenv("DEEP_THINK_WATCHDOG_INTERVAL_SECONDS", "60"))
     log.info("Orphan watchdog started (check interval=%ds)", check_interval_seconds)
     m = metrics.get_metrics()
     
@@ -223,7 +239,7 @@ async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
             if not orphans:
                 continue
             
-            log.warning("Detected %d orphaned job(s)", len(orphans))
+            log.error("Detected %d orphaned job(s) stuck in running state", len(orphans))
             m.increment_orphaned_jobs_detected()
             
             for orphan in orphans:
@@ -238,7 +254,7 @@ async def _orphan_watchdog(check_interval_seconds: int = 30) -> None:
                         "timeout"
                     )
                     if requeued:
-                        log.warning(
+                        log.error(
                             "Requeued orphaned job %s (claimed_by=%s at %s)",
                             job_id, claimed_by, claimed_at
                         )
