@@ -357,6 +357,17 @@ async def worker_loop(max_concurrency: int = 0) -> None:
                 nonlocal active
                 try:
                     await _run_job(j)
+                except asyncio.CancelledError:
+                    # Worker is shutting down — mark the job failed so it's
+                    # visible immediately rather than waiting for the orphan
+                    # watchdog timeout on next startup.
+                    jid = j.get("job_id", "")
+                    if jid:
+                        try:
+                            await asyncio.to_thread(store.fail_job, jid, "worker shutdown")
+                        except Exception as fe:
+                            log.warning("Could not fail job %s on cancel: %s", jid, fe)
+                    raise
                 finally:
                     active -= 1
 

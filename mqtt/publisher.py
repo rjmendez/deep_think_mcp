@@ -310,6 +310,8 @@ class MQTTFindingsPublisher:
         self._connected = False
         self._running = False
         self._confirmation_callback: Optional[Callable[[str, str, str], Awaitable[None]]] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._subscription_task: Optional[asyncio.Task] = None
 
         # In-memory queue for batches that could not be published while
         # disconnected.  Drained and re-published on successful reconnect
@@ -350,7 +352,7 @@ class MQTTFindingsPublisher:
             await self._replay_persisted_findings()
 
             # Start subscription listener in background
-            asyncio.create_task(self._subscription_loop())
+            self._subscription_task = asyncio.create_task(self._subscription_loop())
         except Exception as e:
             log.error(f"Failed to connect to MQTT broker: {e}")
             self._connected = False
@@ -358,7 +360,7 @@ class MQTTFindingsPublisher:
 
         # Always start the reconnect loop so transient failures and later drops
         # are handled automatically without manual intervention.
-        asyncio.create_task(self._reconnect_loop())
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
         """Reconnect to MQTT broker with exponential backoff + jitter.
@@ -415,8 +417,16 @@ class MQTTFindingsPublisher:
                 # Replay any findings persisted while we were offline
                 await self._replay_persisted_findings()
 
+                # Cancel previous subscription loop before spawning a new one
+                # to avoid double-subscription on the same client.
+                if self._subscription_task and not self._subscription_task.done():
+                    self._subscription_task.cancel()
+                    try:
+                        await self._subscription_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 # Restart the confirmation subscription listener
-                asyncio.create_task(self._subscription_loop())
+                self._subscription_task = asyncio.create_task(self._subscription_loop())
 
             except Exception as e:
                 self._connected = False
@@ -434,6 +444,22 @@ class MQTTFindingsPublisher:
         Ensures all pending findings are published before shutdown.
         """
         self._running = False
+
+        # Cancel the reconnect loop — it may be sleeping up to 60s on backoff
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Cancel the subscription loop
+        if self._subscription_task and not self._subscription_task.done():
+            self._subscription_task.cancel()
+            try:
+                await self._subscription_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Cancel all pending batch timers
         for timer_task in self._batch_timers.values():

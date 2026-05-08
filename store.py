@@ -303,7 +303,12 @@ def init_db_with_integrity_check() -> None:
 
 
 def _ensure_daily_backup(db_path: Path) -> None:
-    """Copy the database to a .db.backup sidecar if it is missing or older than 24 h."""
+    """Copy the database to a .db.backup sidecar if it is missing or older than 24 h.
+
+    Uses the SQLite online backup API (sqlite3.Connection.backup) instead of
+    shutil.copy2 so that WAL-mode writes accumulated since the last checkpoint
+    are captured atomically even with concurrent connections open.
+    """
     backup_path = db_path.parent / (db_path.name + ".backup")
     now = datetime.now(timezone.utc).timestamp()
     needs_backup = (
@@ -312,7 +317,13 @@ def _ensure_daily_backup(db_path: Path) -> None:
     )
     if needs_backup:
         try:
-            shutil.copy2(str(db_path), str(backup_path))
+            src = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
+            dst = sqlite3.connect(str(backup_path), check_same_thread=False, timeout=10)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
             log.info("Daily DB backup created: %s", backup_path)
         except Exception as exc:
             log.warning("Failed to create daily DB backup: %s", exc)
@@ -346,13 +357,19 @@ def _startup_integrity_check() -> None:
 
 
 def _backup_db(suffix: str = "auto") -> str:
-    """Create a backup of the database. Returns backup path."""
+    """Create a backup of the database using sqlite3 online backup API. Returns backup path."""
     db_path = Path(_db_path())
     backup_dir = db_path.parent / "backups"
     backup_dir.mkdir(exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"jobs_{timestamp}_{suffix}.db"
-    shutil.copy2(db_path, backup_path)
+    src = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
+    dst = sqlite3.connect(str(backup_path), check_same_thread=False, timeout=10)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
     log.info(f"Database backup created: {backup_path}")
     return str(backup_path)
 
@@ -665,9 +682,8 @@ def requeue_stale(stale_after_minutes: int = 0) -> int:
 def evict_expired_cache(conn_or_path: Optional[str] = None) -> int:
     """Delete expired rows from pass_cache and perspective_cache.
 
-    Rows whose expires_at timestamp (ISO-8601 TEXT) is earlier than the
-    current UTC time are considered stale and purged.  Analogous to DAMA
-    pheromone evaporation — stale signals fade so fresh ones dominate.
+    Rows whose expires_at timestamp (ISO-8601 TEXT) is earlier than or equal to
+    the current UTC time are considered stale and purged.
 
     Args:
         conn_or_path: Path to the SQLite database file, or None to use the
@@ -686,17 +702,17 @@ def evict_expired_cache(conn_or_path: Optional[str] = None) -> int:
         conn = _connect()
     try:
         cur_pass = conn.execute(
-            "DELETE FROM pass_cache WHERE expires_at < ?", (now,)
+            "DELETE FROM pass_cache WHERE expires_at <= ?", (now,)
         )
         cur_persp = conn.execute(
-            "DELETE FROM perspective_cache WHERE expires_at < ?", (now,)
+            "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
         )
         evicted = cur_pass.rowcount + cur_persp.rowcount
         conn.commit()
         if evicted:
             log.info(
-                f"Evicted {evicted} expired cache rows "
-                f"({cur_pass.rowcount} pass_cache, {cur_persp.rowcount} perspective_cache)"
+                "Evicted %d expired cache rows (%d pass_cache, %d perspective_cache)",
+                evicted, cur_pass.rowcount, cur_persp.rowcount,
             )
         return evicted
     finally:
@@ -992,25 +1008,6 @@ def set_perspective_cache(
         conn.close()
 
 
-def evict_expired_cache() -> int:
-    """Remove expired pass_cache and perspective_cache entries. Returns total count removed."""
-    now = datetime.now(timezone.utc).isoformat()
-    conn = _connect()
-    try:
-        cur1 = conn.execute(
-            "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
-        )
-        cur2 = conn.execute(
-            "DELETE FROM pass_cache WHERE expires_at <= ?", (now,)
-        )
-        count = cur1.rowcount + cur2.rowcount
-        conn.commit()
-        if count:
-            log.info("Evicted %d expired cache entries (%d perspective, %d pass)",
-                     count, cur1.rowcount, cur2.rowcount)
-        return count
-    finally:
-        conn.close()
 
 
 def list_perspective_cache(job_id: str = "") -> list[dict]:
