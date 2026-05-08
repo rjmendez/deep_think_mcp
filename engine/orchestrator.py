@@ -7,6 +7,7 @@ Handles:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -671,7 +672,19 @@ async def deep_think_passes(
     
     pass_results = []
     validation_results = []
-    
+
+    # Compute a run signature that locks in all execution inputs for pass cache keying.
+    _run_sig = hashlib.sha256(
+        "\n".join([
+            question,
+            str(passes),
+            task_class,
+            repr(directives),
+            mandate_prefix,
+            cfg.data_policy,
+        ]).encode()
+    ).hexdigest()
+
     # Execute passes
     for pass_num in range(1, passes + 1):
         log.info(f"Pass {pass_num}/{passes}")
@@ -747,6 +760,14 @@ Use the mandate to structure your response. Be precise and evidence-based."""
             )
             
             log.info(f"Pass {pass_num} complete ({framing_name})")
+
+            # Persist pass output immediately for partial result recovery on crash.
+            if job_id:
+                await asyncio.to_thread(
+                    store.set_pass_cache,
+                    job_id, perspective_name, pass_num, _run_sig,
+                    framing_name, tier, model_name, provider_name, output,
+                )
         
         except Exception as e:
             # BUG FIX #1: Removed debug file write to /tmp (not available in k8s containers)
