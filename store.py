@@ -81,6 +81,13 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    db_path = Path(_db_path())
+
+    # Daily backup: copy .db to .db.backup if backup is missing or >24 h old.
+    # Only when the database already exists (skip on first-time creation).
+    if db_path.exists():
+        _ensure_daily_backup(db_path)
+
     conn = _connect()
     try:
         conn.execute(
@@ -243,6 +250,9 @@ def init_db() -> None:
     finally:
         conn.close()
 
+    # Integrity check: warn and attempt VACUUM on failure.
+    _startup_integrity_check()
+
 
 def init_db_with_integrity_check() -> None:
     """Initialize database and verify integrity on startup.
@@ -286,6 +296,49 @@ def init_db_with_integrity_check() -> None:
         for job_id, job_issues in issues.items():
             log.warning(f"  Job {job_id}: {job_issues}")
 
+
+
+def _ensure_daily_backup(db_path: Path) -> None:
+    """Copy the database to a .db.backup sidecar if it is missing or older than 24 h."""
+    backup_path = db_path.parent / (db_path.name + ".backup")
+    now = datetime.now(timezone.utc).timestamp()
+    needs_backup = (
+        not backup_path.exists()
+        or (now - backup_path.stat().st_mtime) > 86400
+    )
+    if needs_backup:
+        try:
+            shutil.copy2(str(db_path), str(backup_path))
+            log.info("Daily DB backup created: %s", backup_path)
+        except Exception as exc:
+            log.warning("Failed to create daily DB backup: %s", exc)
+
+
+def _startup_integrity_check() -> None:
+    """Run PRAGMA integrity_check; log WARNING and attempt VACUUM on failure."""
+    is_ok, message = check_db_integrity()
+    if is_ok:
+        return
+
+    log.warning("Database integrity check failed on startup: %s", message)
+
+    # Attempt VACUUM before giving up
+    try:
+        conn = _connect()
+        try:
+            conn.execute("VACUUM")
+            conn.commit()
+        finally:
+            conn.close()
+        log.info("VACUUM completed; re-checking integrity…")
+        is_ok, message = check_db_integrity()
+        if is_ok:
+            log.info("Database integrity check passed after VACUUM")
+            return
+    except Exception as exc:
+        log.warning("VACUUM attempt failed: %s", exc)
+
+    log.error("Database integrity check still failing after VACUUM: %s", message)
 
 
 def _backup_db(suffix: str = "auto") -> str:
@@ -895,15 +948,21 @@ def set_perspective_cache(
 
 
 def evict_expired_cache() -> int:
-    """Remove expired perspective cache entries. Returns count removed."""
+    """Remove expired pass_cache and perspective_cache entries. Returns total count removed."""
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:
-        cur = conn.execute(
+        cur1 = conn.execute(
             "DELETE FROM perspective_cache WHERE expires_at <= ?", (now,)
         )
-        count = cur.rowcount
+        cur2 = conn.execute(
+            "DELETE FROM pass_cache WHERE expires_at <= ?", (now,)
+        )
+        count = cur1.rowcount + cur2.rowcount
         conn.commit()
+        if count:
+            log.info("Evicted %d expired cache entries (%d perspective, %d pass)",
+                     count, cur1.rowcount, cur2.rowcount)
         return count
     finally:
         conn.close()
