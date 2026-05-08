@@ -16,7 +16,6 @@ import logging
 import os
 import signal
 import sqlite3
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -37,6 +36,7 @@ class MQTTMetrics:
     """Track MQTT health metrics."""
     messages_received: int = 0
     messages_published: int = 0
+    messages_dropped: int = 0
     deep_think_runs: int = 0
     deep_think_failures: int = 0
     publish_failures: int = 0
@@ -117,7 +117,9 @@ class MQTTEngineAdapter:
         self.metrics = MQTTMetrics()
         self._running = False
         self._tasks: list[asyncio.Task] = []
-        self._claim_queue: deque = deque(maxlen=self.config.subscriber_batch_size * 2)
+        # Bounded queue — drops are logged at WARNING, never silently discarded.
+        _queue_size = int(os.getenv("DEEP_THINK_MQTT_QUEUE_SIZE", "50"))
+        self._claim_queue: asyncio.Queue = asyncio.Queue(maxsize=_queue_size)
         self._finding_batch: list[dict] = []
         self._finding_batch_timer: Optional[asyncio.Task] = None
         
@@ -324,7 +326,14 @@ class MQTTEngineAdapter:
                         
                         try:
                             payload = json.loads(message.payload.decode())
-                            self._claim_queue.append(payload)
+                            try:
+                                self._claim_queue.put_nowait(payload)
+                            except asyncio.QueueFull:
+                                self.metrics.messages_dropped += 1
+                                log.warning(
+                                    f"[MQTT] Claim queue full — message dropped "
+                                    f"(total dropped: {self.metrics.messages_dropped})"
+                                )
                             self.metrics.messages_received += 1
                         except json.JSONDecodeError:
                             log.debug(f"[MQTT] Skipping malformed JSON from {message.topic}")
@@ -377,8 +386,8 @@ class MQTTEngineAdapter:
                 batch_size = self.config.subscriber_batch_size
                 batch = []
                 for _ in range(batch_size):
-                    if self._claim_queue:
-                        batch.append(self._claim_queue.popleft())
+                    if not self._claim_queue.empty():
+                        batch.append(self._claim_queue.get_nowait())
                     else:
                         break
                 
@@ -627,6 +636,7 @@ class MQTTEngineAdapter:
                 log.info(
                     "[MQTT] Heartbeat: "
                     f"received={self.metrics.messages_received}, "
+                    f"dropped={self.metrics.messages_dropped}, "
                     f"published={self.metrics.messages_published}, "
                     f"deep_think={self.metrics.deep_think_runs}, "
                     f"failures={self.metrics.deep_think_failures}, "
@@ -647,6 +657,7 @@ class MQTTEngineAdapter:
             "circuit_breaker": self.circuit_breaker_state.value,
             "metrics": {
                 "messages_received": self.metrics.messages_received,
+                "messages_dropped": self.metrics.messages_dropped,
                 "messages_published": self.metrics.messages_published,
                 "deep_think_runs": self.metrics.deep_think_runs,
                 "deep_think_failures": self.metrics.deep_think_failures,
