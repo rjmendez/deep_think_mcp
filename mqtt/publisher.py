@@ -14,6 +14,7 @@ Features:
 """
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -310,6 +311,12 @@ class MQTTFindingsPublisher:
         self._running = False
         self._confirmation_callback: Optional[Callable[[str, str, str], Awaitable[None]]] = None
 
+        # In-memory queue for batches that could not be published while
+        # disconnected.  Drained and re-published on successful reconnect
+        # before touching the persistence store (fast path).
+        # maxlen caps memory usage; overflow falls through to the SQLite store.
+        self._offline_queue: collections.deque[tuple[str, list]] = collections.deque(maxlen=500)
+
         log.debug(
             f"MQTTFindingsPublisher initialized: {mqtt_host}:{mqtt_port}, "
             f"batch_size={batch_size}, timeout={batch_timeout_ms}ms, "
@@ -320,6 +327,7 @@ class MQTTFindingsPublisher:
         """Start MQTT publisher (connect to broker, start subscription loop).
         
         Handles connection failures gracefully — continues without MQTT if unavailable.
+        A background reconnect loop retries with exponential backoff on failure.
         """
         if not self.enabled or aiomqtt is None:
             log.info("MQTT publisher disabled or aiomqtt not available")
@@ -347,6 +355,78 @@ class MQTTFindingsPublisher:
             log.error(f"Failed to connect to MQTT broker: {e}")
             self._connected = False
             log.warning("Continuing without MQTT; findings will be persisted locally")
+
+        # Always start the reconnect loop so transient failures and later drops
+        # are handled automatically without manual intervention.
+        asyncio.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        """Reconnect to MQTT broker with exponential backoff + jitter.
+
+        Monitors self._connected and retries whenever the publisher is
+        disconnected. On successful reconnect, replays any findings that
+        were queued to the persistence store while offline.
+
+        Backoff: starts at 1 s, doubles each attempt, caps at 60 s.
+        Jitter: ±10 % of the current backoff to spread retries.
+        """
+        import random
+
+        backoff = 1.0
+        max_backoff = 60.0
+
+        while self._running:
+            if self._connected:
+                await asyncio.sleep(1.0)
+                continue
+
+            try:
+                log.info(
+                    f"[MQTT] Reconnecting to {self.mqtt_host}:{self.mqtt_port} "
+                    f"(backoff={backoff:.1f}s)..."
+                )
+                self._client = aiomqtt.Client(
+                    self.mqtt_host,
+                    self.mqtt_port,
+                    username=self.mqtt_username,
+                    password=self.mqtt_password,
+                    clean_session=True,
+                )
+                await self._client.connect()
+                self._connected = True
+                backoff = 1.0  # reset on success
+                log.info(
+                    f"[MQTT] Reconnected to {self.mqtt_host}:{self.mqtt_port}; "
+                    "replaying queued findings..."
+                )
+
+                # Drain in-memory offline queue first (fast path — no DB I/O)
+                drained = 0
+                while self._offline_queue:
+                    try:
+                        _device_id, _findings = self._offline_queue.popleft()
+                        await self._publish_batch(_device_id, _findings)
+                        drained += 1
+                    except Exception as drain_err:
+                        log.error(f"[MQTT] Error replaying offline queue item: {drain_err}")
+                if drained:
+                    log.info(f"[MQTT] Drained {drained} batches from in-memory offline queue")
+
+                # Replay any findings persisted while we were offline
+                await self._replay_persisted_findings()
+
+                # Restart the confirmation subscription listener
+                asyncio.create_task(self._subscription_loop())
+
+            except Exception as e:
+                self._connected = False
+                jitter = random.uniform(-backoff * 0.1, backoff * 0.1)
+                wait = backoff + jitter
+                log.warning(
+                    f"[MQTT] Reconnect failed: {e}. Retrying in {wait:.1f}s..."
+                )
+                await asyncio.sleep(wait)
+                backoff = min(backoff * 2, max_backoff)
 
     async def stop(self) -> None:
         """Stop MQTT publisher (flush batches, disconnect).
@@ -538,9 +618,19 @@ class MQTTFindingsPublisher:
             return True
 
         if not self.enabled or not self._connected or not self._client:
-            log.debug(f"MQTT not connected, persisting {len(findings)} findings")
-            for finding in findings:
-                self.store.save_finding(finding)
+            if len(self._offline_queue) < self._offline_queue.maxlen:
+                log.debug(
+                    f"MQTT not connected, queuing {len(findings)} findings in-memory "
+                    f"({len(self._offline_queue) + 1}/{self._offline_queue.maxlen})"
+                )
+                self._offline_queue.append((device_id, list(findings)))
+            else:
+                # Offline queue full — fall back to SQLite persistence so no findings are dropped
+                log.warning(
+                    f"Offline queue full, persisting {len(findings)} findings to store"
+                )
+                for finding in findings:
+                    self.store.save_finding(finding)
             return False
 
         topic = f"dama/colony/findings/{device_id}"
