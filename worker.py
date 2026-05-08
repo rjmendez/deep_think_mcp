@@ -244,10 +244,21 @@ async def _orphan_watchdog(check_interval_seconds: int = 0) -> None:
     log.info("Orphan watchdog started (check interval=%ds)", check_interval_seconds)
     m = metrics.get_metrics()
     
+    _evict_cycle = 0
     while True:
         try:
             await asyncio.sleep(check_interval_seconds)
-            
+
+            # Evict expired cache entries every 10 watchdog cycles
+            _evict_cycle += 1
+            if _evict_cycle % 10 == 0:
+                try:
+                    evicted = await asyncio.to_thread(store.evict_expired_cache)
+                    if evicted:
+                        log.info("Cache eviction: removed %d expired entries", evicted)
+                except Exception as exc:
+                    log.warning("Cache eviction error (non-fatal): %s", exc)
+
             orphans = await asyncio.to_thread(store.detect_orphaned_jobs)
             if not orphans:
                 continue
@@ -303,59 +314,76 @@ async def worker_loop(max_concurrency: int = 0) -> None:
     worker_id = f"worker-{os.getpid()}"
     poll_count = 0
 
-    while True:
-        poll_count += 1
-        if poll_count % 30 == 0:
-            _log_job_event("info", "worker_poll", active=active, poll_count=poll_count, worker_id=worker_id)
+    try:
+        while True:
+            poll_count += 1
+            if poll_count % 30 == 0:
+                _log_job_event("info", "worker_poll", active=active, poll_count=poll_count, worker_id=worker_id)
 
-        if active >= max_concurrency:
-            await asyncio.sleep(0.5)
-            continue
+            if active >= max_concurrency:
+                await asyncio.sleep(0.5)
+                continue
 
-        # Clear before claiming so any notify_job_available() call that arrives
-        # during the DB round-trip is not lost: if set() races with our clear(),
-        # claim_next_job will still find the job and we never reach the wait.
-        _job_available.clear()
-        try:
-            job = await asyncio.to_thread(store.claim_next_job, worker_id)
-        except Exception as exc:
-            log.error("claim_next_job failed (will retry): %s", exc)
-            await asyncio.sleep(2.0)
-            continue
-
-        if job is None:
+            # Clear before claiming so any notify_job_available() call that arrives
+            # during the DB round-trip is not lost: if set() races with our clear(),
+            # claim_next_job will still find the job and we never reach the wait.
+            _job_available.clear()
             try:
-                await asyncio.wait_for(_job_available.wait(), timeout=30.0)
-            except asyncio.TimeoutError:
-                pass
-            continue
+                job = await asyncio.to_thread(store.claim_next_job, worker_id)
+            except Exception as exc:
+                log.error("claim_next_job failed (will retry): %s", exc)
+                await asyncio.sleep(2.0)
+                continue
 
-        active += 1
-        _log_job_event(
-            "info",
-            "job_claimed",
-            job_id=job["job_id"],
-            worker_id=worker_id,
-            active=active,
-            remaining_capacity=max_concurrency - active,
-        )
-        log.info("Picked up job %s (%d active)", job["job_id"], active)
+            if job is None:
+                try:
+                    await asyncio.wait_for(_job_available.wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    pass
+                continue
 
-        async def _run_and_release(j: dict) -> None:
-            nonlocal active
+            active += 1
+            _log_job_event(
+                "info",
+                "job_claimed",
+                job_id=job["job_id"],
+                worker_id=worker_id,
+                active=active,
+                remaining_capacity=max_concurrency - active,
+            )
+            log.info("Picked up job %s (%d active)", job["job_id"], active)
+
+            async def _run_and_release(j: dict) -> None:
+                nonlocal active
+                try:
+                    await _run_job(j)
+                finally:
+                    active -= 1
+
             try:
-                await _run_job(j)
-            finally:
+                task = asyncio.create_task(_run_and_release(job))
+            except Exception as exc:
+                # create_task failed after DB row is already marked 'running' — fail it
+                log.error("create_task failed for job %s: %s", job["job_id"], exc)
                 active -= 1
+                await asyncio.to_thread(store.fail_job, job["job_id"], f"create_task: {exc}")
+                continue
 
-        try:
-            task = asyncio.create_task(_run_and_release(job))
-        except Exception as exc:
-            # create_task failed after DB row is already marked 'running' — fail it
-            log.error("create_task failed for job %s: %s", job["job_id"], exc)
-            active -= 1
-            await asyncio.to_thread(store.fail_job, job["job_id"], f"create_task: {exc}")
-            continue
-
-        _active_tasks.add(task)
-        task.add_done_callback(_active_tasks.discard)
+            _active_tasks.add(task)
+            task.add_done_callback(_active_tasks.discard)
+    except asyncio.CancelledError:
+        log.info("Worker loop cancelled — shutting down")
+        raise
+    finally:
+        remaining = [t for t in list(_active_tasks) if not t.done()]
+        if remaining:
+            log.info("Cancelling %d remaining task(s) on shutdown...", len(remaining))
+            for t in remaining:
+                t.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*remaining, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Timed out waiting for %d task(s) to cancel", len(remaining))
