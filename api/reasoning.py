@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TypedDict
 
 from .. import store, discover as _discover
+from .. import worker as _worker
 from ..engine import (
     build_provider_config,
     TASK_CLASS_PROFILES,
@@ -22,6 +23,28 @@ from ..engine.validator import validate_passes, validate_width, validate_height,
 log = logging.getLogger(__name__)
 
 
+class ProviderConfigOverrides(TypedDict, total=False):
+    """Explicit schema for per-call provider overrides exposed via MCP."""
+
+    provider: str
+    base_url: str
+    model: str
+    light: str
+    medium: str
+    heavy: str
+    light_provider: str
+    medium_provider: str
+    heavy_provider: str
+    data_policy: str
+    temperature: float
+    top_p: float
+    top_k: int
+    max_tokens: int
+    seed: int
+    custom_params: dict
+    options: dict
+
+
 def register(mcp):
     """Register reasoning routes."""
     
@@ -33,7 +56,7 @@ def register(mcp):
         skill: Optional[str] = None,
         data_policy: Optional[str] = None,
         model: Optional[str] = None,
-        provider_config: Optional[dict] = None,
+        provider_config: Optional[ProviderConfigOverrides] = None,
         verify: bool = False,
         width: Optional[int] = None,
         height: Optional[int] = None,
@@ -67,18 +90,18 @@ def register(mcp):
             data_policy: Controls which providers are allowed.
                 "any"    (default) Use any configured provider including cloud.
                 "local"  Ollama ONLY — never send data to cloud providers.
-                "cloud"  Cloud providers preferred; Ollama only for light tier.
+                "cloud"  Use cloud providers only unless you explicitly override tiers otherwise.
             model:           Override all tiers with a single model ID (shorthand).
             provider_config: Optional per-call overrides (no secrets — use env vars for those):
-                provider        "anthropic" | "copilot" | "ollama"
+                provider        "anthropic" | "copilot" | "ollama" | "abliteration"
                 base_url        Ollama endpoint, e.g. "http://localhost:11434"
                 model           Single model ID for all tiers
                 light           Light-tier model ID override
                 medium          Medium-tier model ID override
                 heavy           Heavy-tier model ID override
                 light_provider  Per-tier provider (e.g. "ollama" for cheap local)
-                medium_provider Per-tier provider
-                heavy_provider  Per-tier provider (e.g. "copilot" for synthesis)
+                medium_provider Per-tier provider (e.g. "abliteration")
+                heavy_provider  Per-tier provider (e.g. "anthropic" for synthesis)
                 temperature     Sampling temperature for supported providers
                 top_p/top_k     Sampling controls for supported providers
                 max_tokens      Output cap (mapped to num_predict for Ollama)
@@ -97,6 +120,8 @@ def register(mcp):
             ANTHROPIC_API_KEY              Anthropic API key
             GITHUB_COPILOT_OAUTH_TOKEN     GitHub Copilot OAuth token
             OLLAMA_BASE_URL                Ollama base URL (default: http://localhost:11434)
+            ABLITERATION_API_KEY           Abliteration API key
+            ABLITERATION_BASE_URL          Abliteration base URL (default: https://api.abliteration.ai/v1)
 
         Response includes proof_chain field when research tools were used.
         """
@@ -153,6 +178,7 @@ def register(mcp):
                 "extract_claims": extract_claims,
             }),
         )
+        _worker.notify_job_available()
 
         response = {
             "job_id": job_id,
@@ -315,7 +341,7 @@ def register(mcp):
         max_width: Optional[int] = None,
         confidence_threshold: Optional[int] = None,
         extract_claims: bool = False,
-        provider_config: Optional[dict] = None,
+        provider_config: Optional[ProviderConfigOverrides] = None,
     ) -> dict:
         """Queue a perspective fan-out reasoning job and return a job_id immediately.
 
@@ -355,7 +381,16 @@ def register(mcp):
             extract_claims:       If True, distil each perspective's prose into a structured claim set
                                   (light-tier model) before synthesis. Reduces synthesis context ~10-20×.
                                   Default False.
-            provider_config: Optional per-call model/provider overrides (no secrets).
+            provider_config: Optional per-call model/provider overrides (no secrets — use env vars for those).
+                provider        "anthropic" | "copilot" | "ollama" | "abliteration"
+                model           Single model ID for all tiers
+                light           Light-tier model ID override
+                medium          Medium-tier model ID override
+                heavy           Heavy-tier model ID override
+                light_provider  Per-tier provider override
+                medium_provider Per-tier provider override (e.g. "abliteration")
+                heavy_provider  Per-tier provider override (e.g. "anthropic")
+                temperature/top_p/top_k/max_tokens/seed/custom_params/options
 
         Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
         Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
@@ -415,6 +450,7 @@ def register(mcp):
                 "extract_claims": extract_claims,
             }),
         )
+        _worker.notify_job_available()
 
         mandates = PERSPECTIVE_MANDATES.get(selected_skill, PERSPECTIVE_MANDATES["general"])
         # Extract first 'width' perspective names from the mandates dict
@@ -454,7 +490,7 @@ def register(mcp):
         passes: int = 4,
         data_policy: str = "any",
         model: str = "",
-        provider_config: Optional[dict] = None,
+        provider_config: Optional[ProviderConfigOverrides] = None,
         verify_with_nova: bool = False,
     ) -> dict:
         """Queue a high-temperature creative reasoning job and return a job_id immediately.
@@ -475,6 +511,9 @@ def register(mcp):
             data_policy:      "any" | "local" | "cloud"
             model:            Override all tiers with a single model ID (shorthand).
             provider_config:  Optional per-call overrides (no secrets — use env vars for those).
+                provider        "anthropic" | "copilot" | "ollama" | "abliteration"
+                light_provider / medium_provider / heavy_provider supported
+                ABLITERATION_API_KEY and ABLITERATION_BASE_URL are read from env or ~/.abliteration/credentials
             verify_with_nova: If True, verify the best-scoring pass against Nova's /pre_action.
 
         Temperature schedule (automatic):
@@ -518,6 +557,7 @@ def register(mcp):
                 "verify_with_nova": verify_with_nova,
             }),
         )
+        _worker.notify_job_available()
 
         return {
             "job_id":        job_id,

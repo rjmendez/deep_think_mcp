@@ -259,6 +259,7 @@ async def _orphan_watchdog(check_interval_seconds: int = 0) -> None:
                             job_id, claimed_by, claimed_at
                         )
                         m.increment_orphaned_jobs_requeued()
+                        _job_available.set()
                 except Exception as exc:
                     log.error("Failed to requeue orphaned job %s: %s", job_id, exc)
         
@@ -291,13 +292,17 @@ async def worker_loop(max_concurrency: int = 0) -> None:
 
     while True:
         poll_count += 1
-        if poll_count % 30 == 0:  # Log every 30 polls (roughly every 30 seconds)
+        if poll_count % 30 == 0:
             _log_job_event("info", "worker_poll", active=active, poll_count=poll_count, worker_id=worker_id)
-        
+
         if active >= max_concurrency:
             await asyncio.sleep(0.5)
             continue
 
+        # Clear before claiming so any notify_job_available() call that arrives
+        # during the DB round-trip is not lost: if set() races with our clear(),
+        # claim_next_job will still find the job and we never reach the wait.
+        _job_available.clear()
         try:
             job = await asyncio.to_thread(store.claim_next_job, worker_id)
         except Exception as exc:
@@ -306,7 +311,10 @@ async def worker_loop(max_concurrency: int = 0) -> None:
             continue
 
         if job is None:
-            await asyncio.sleep(1.0)
+            try:
+                await asyncio.wait_for(_job_available.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
             continue
 
         active += 1
