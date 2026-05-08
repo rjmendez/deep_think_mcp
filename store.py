@@ -250,6 +250,10 @@ def init_db() -> None:
     finally:
         conn.close()
 
+    # Purge expired cache rows on every startup so stale entries don't
+    # accumulate between runs (DAMA pheromone evaporation).
+    evict_expired_cache()
+
     # Integrity check: warn and attempt VACUUM on failure.
     _startup_integrity_check()
 
@@ -654,6 +658,47 @@ def requeue_stale(stale_after_minutes: int = 0) -> int:
         count = cur.rowcount
         conn.commit()
         return count
+    finally:
+        conn.close()
+
+
+def evict_expired_cache(conn_or_path: Optional[str] = None) -> int:
+    """Delete expired rows from pass_cache and perspective_cache.
+
+    Rows whose expires_at timestamp (ISO-8601 TEXT) is earlier than the
+    current UTC time are considered stale and purged.  Analogous to DAMA
+    pheromone evaporation — stale signals fade so fresh ones dominate.
+
+    Args:
+        conn_or_path: Path to the SQLite database file, or None to use the
+                      default path resolved by ``_db_path()``.
+
+    Returns:
+        Total number of rows deleted across both tables.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    if isinstance(conn_or_path, str):
+        conn = sqlite3.connect(conn_or_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+    else:
+        conn = _connect()
+    try:
+        cur_pass = conn.execute(
+            "DELETE FROM pass_cache WHERE expires_at < ?", (now,)
+        )
+        cur_persp = conn.execute(
+            "DELETE FROM perspective_cache WHERE expires_at < ?", (now,)
+        )
+        evicted = cur_pass.rowcount + cur_persp.rowcount
+        conn.commit()
+        if evicted:
+            log.info(
+                f"Evicted {evicted} expired cache rows "
+                f"({cur_pass.rowcount} pass_cache, {cur_persp.rowcount} perspective_cache)"
+            )
+        return evicted
     finally:
         conn.close()
 
