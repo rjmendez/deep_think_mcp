@@ -580,14 +580,14 @@ def fail_job(job_id: str, error: str) -> None:
 def requeue_stale(stale_after_minutes: int = 0) -> int:
     """Reset timed-out 'running' jobs to 'queued'. Call on startup for crash recovery.
 
-    Uses a time-based cutoff (DEEP_THINK_ORPHAN_TIMEOUT_MINUTES, default 10 min)
-    so concurrent worker processes only requeue genuinely abandoned jobs, not each
-    other's actively-running work.
+    Uses DEEP_THINK_STALE_JOB_MINUTES (default 120 min) — intentionally conservative
+    so concurrent worker processes don't race to requeue each other's live jobs.
+    The live watchdog uses the much shorter DEEP_THINK_ORPHAN_TIMEOUT_MINUTES.
     """
     import os
     from datetime import timedelta
     if stale_after_minutes <= 0:
-        stale_after_minutes = int(os.getenv("DEEP_THINK_ORPHAN_TIMEOUT_MINUTES", "10"))
+        stale_after_minutes = int(os.getenv("DEEP_THINK_STALE_JOB_MINUTES", "120"))
     cutoff = (
         datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
     ).isoformat()
@@ -610,7 +610,9 @@ def detect_orphaned_jobs(stale_after_minutes: int = 0) -> list[dict]:
     
     Returns list of orphaned job dicts that should be requeued.
     Uses DEEP_THINK_ORPHAN_TIMEOUT_MINUTES env var (default 10 min) for background
-    watchdog detection. This is also used at startup via requeue_stale for crash recovery.
+    watchdog detection. Intentionally shorter than the startup requeue threshold
+    (DEEP_THINK_STALE_JOB_MINUTES) — safe to use from a live running process where
+    there are no peer workers that could be mid-execution.
     """
     import os
     from datetime import timedelta

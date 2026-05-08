@@ -104,62 +104,75 @@ async def _run_job(job: dict) -> None:
             device_id=device_id or None,
         )
 
-        if provider_config.pop("fan_out", False):
-            width = int(provider_config.pop("width", 3))
-            height = int(provider_config.pop("height", 2))
-            result = await engine.run_fan_out(
-                question=job["question"],
-                width=width,
-                height=height,
-                provider_config=provider_config,
-                task_class=task_class,
-                data_policy=data_policy,
-                force_local_models=force_local_models,
-                device_id=device_id,
+        job_timeout_secs = max(int(job.get("timeout_secs") or 300), 60)
+
+        async def _execute_engine() -> dict:
+            if provider_config.pop("fan_out", False):
+                width = int(provider_config.pop("width", 3))
+                height = int(provider_config.pop("height", 2))
+                r = await engine.run_fan_out(
+                    question=job["question"],
+                    width=width,
+                    height=height,
+                    provider_config=provider_config,
+                    task_class=task_class,
+                    data_policy=data_policy,
+                    force_local_models=force_local_models,
+                    device_id=device_id,
+                )
+                cfg = engine.build_provider_config(provider_config)
+                log.info(
+                    "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
+                    job_id, width, height, task_class, cfg.provider,
+                )
+                return r
+            elif provider_config.pop("creative", False):
+                creative_mode = provider_config.pop("creative_mode", "lateral-thinking")
+                creative_passes = int(provider_config.pop("creative_passes", job.get("passes", 4)))
+                verify_with_nova = provider_config.pop("verify_with_nova", False)
+                creative_engine = CreativeReasoningEngine()
+                creative_result = await creative_engine.run(
+                    question=job["question"],
+                    mode=creative_mode,
+                    passes=creative_passes,
+                    provider_config=provider_config,
+                    verify_with_nova=verify_with_nova,
+                    job_id=job_id,
+                )
+                r = creative_result.to_dict()
+                cfg = engine.build_provider_config(provider_config)
+                log.info(
+                    "Creative job %s complete (mode=%s passes=%d provider=%s)",
+                    job_id, creative_mode, creative_passes, cfg.provider,
+                )
+                return r
+            else:
+                r = await engine.deep_think_passes(
+                    question=job["question"],
+                    passes=int(job["passes"]),
+                    provider_config=provider_config,
+                    model=provider_config.get("model"),
+                    task_class=task_class,
+                    data_policy=data_policy,
+                    force_local_models=force_local_models,
+                    device_id=device_id,
+                    job_id=job_id,
+                    enable_research=enable_research,
+                    research_query=research_query or "",
+                    dama_node_id=dama_node_id,
+                    dama_metric=dama_metric,
+                    web_domain_whitelist=web_domain_whitelist,
+                )
+                cfg = engine.build_provider_config(provider_config)
+                log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
+                return r
+
+        try:
+            result = await asyncio.wait_for(_execute_engine(), timeout=job_timeout_secs)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Job {job_id} exceeded timeout of {job_timeout_secs}s (task_class={task_class})"
             )
-            cfg = engine.build_provider_config(provider_config)
-            log.info(
-                "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
-                job_id, width, height, task_class, cfg.provider,
-            )
-        elif provider_config.pop("creative", False):
-            creative_mode = provider_config.pop("creative_mode", "lateral-thinking")
-            creative_passes = int(provider_config.pop("creative_passes", job.get("passes", 4)))
-            verify_with_nova = provider_config.pop("verify_with_nova", False)
-            creative_engine = CreativeReasoningEngine()
-            creative_result = await creative_engine.run(
-                question=job["question"],
-                mode=creative_mode,
-                passes=creative_passes,
-                provider_config=provider_config,
-                verify_with_nova=verify_with_nova,
-                job_id=job_id,
-            )
-            result = creative_result.to_dict()
-            cfg = engine.build_provider_config(provider_config)
-            log.info(
-                "Creative job %s complete (mode=%s passes=%d provider=%s)",
-                job_id, creative_mode, creative_passes, cfg.provider,
-            )
-        else:
-            result = await engine.deep_think_passes(
-                question=job["question"],
-                passes=int(job["passes"]),
-                provider_config=provider_config,
-                model=provider_config.get("model"),
-                task_class=task_class,
-                data_policy=data_policy,
-                force_local_models=force_local_models,
-                device_id=device_id,
-                job_id=job_id,
-                enable_research=enable_research,
-                research_query=research_query or "",
-                dama_node_id=dama_node_id,
-                dama_metric=dama_metric,
-                web_domain_whitelist=web_domain_whitelist,
-            )
-            cfg = engine.build_provider_config(provider_config)
-            log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
 
         # Nova fact-check: enrich result with verification_results and adjusted confidence
         try:
