@@ -382,18 +382,25 @@ class MQTTEngineAdapter:
                         await asyncio.sleep(1)
                         continue
                 
-                # Collect batch from queue
+                # Collect batch from queue using adaptive timeout:
+                # - 100ms if items are already waiting (bursty workload)
+                # - batch_timeout (5s) if queue is empty (avoid busy-polling)
                 batch_size = self.config.subscriber_batch_size
                 batch = []
-                for _ in range(batch_size):
+                timeout = 0.1 if not self._claim_queue.empty() else batch_timeout
+                try:
+                    first_item = await asyncio.wait_for(
+                        self._claim_queue.get(), timeout=timeout
+                    )
+                    batch.append(first_item)
+                except asyncio.TimeoutError:
+                    continue
+                # Collect remaining already-available items up to batch_size
+                for _ in range(batch_size - 1):
                     if not self._claim_queue.empty():
                         batch.append(self._claim_queue.get_nowait())
                     else:
                         break
-                
-                if not batch:
-                    await asyncio.sleep(0.1)
-                    continue
                 
                 # Process batch through deep_think
                 try:
