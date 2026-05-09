@@ -66,6 +66,8 @@ _CLOUD_TIMEOUTS: list[tuple[str, int]] = [
     ("opus-4.6",      180),
     ("opus-4.7",      180),
     ("opus-4",        180),
+    # Abliteration default cloud model
+    ("abliterated-model", 120),
     ("gpt-5.4",       120),
 ]
 _CLOUD_TIMEOUT_DEFAULT = 120
@@ -155,7 +157,7 @@ def _timeout_from_benchmark(benchmark_ms: int) -> int:
 @dataclass
 class ModelInfo:
     model_id: str
-    provider: str                          # "ollama" | "anthropic" | "copilot"
+    provider: str                          # "ollama" | "anthropic" | "copilot" | "abliteration"
     size_b: float = 0.0
     suggested_tier: str = "medium"
     capabilities: list = field(default_factory=list)
@@ -285,6 +287,31 @@ def _detect_cloud_providers() -> list[ModelInfo]:
                 suggested_tier=tier, capabilities=["general", "code", "reasoning"],
                 timeout_secs=cloud_timeout(mid), last_checked=now,
             ))
+
+    # Abliteration
+    abliteration_key = os.getenv("ABLITERATION_API_KEY", "").strip()
+    if not abliteration_key:
+        try:
+            import socket
+
+            hostname = socket.gethostname()
+            cred_path = os.path.expanduser("~/.abliteration/credentials")
+            if os.path.exists(cred_path):
+                with open(cred_path, encoding="utf-8") as cred_file:
+                    for line in cred_file:
+                        if line.startswith(f"{hostname}="):
+                            abliteration_key = line.split("=", 1)[1].strip()
+                            break
+        except Exception:
+            pass
+
+    if abliteration_key:
+        mid = "abliterated-model"
+        models.append(ModelInfo(
+            model_id=mid, provider="abliteration",
+            suggested_tier="medium", capabilities=["general", "code", "reasoning"],
+            timeout_secs=cloud_timeout(mid), last_checked=now,
+        ))
 
     return models
 
