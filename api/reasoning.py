@@ -263,6 +263,8 @@ def register(mcp):
                         response["grounding_warnings"] = result["grounding_warnings"]
                     if result.get("tools_invoked_total") is not None:
                         response["tools_invoked_total"] = result["tools_invoked_total"]
+                    if result.get("tool_successes_total") is not None:
+                        response["tool_successes_total"] = result["tool_successes_total"]
                     if result.get("topology") is not None:
                         response["topology"] = result["topology"]
                     if result.get("adaptive_config") is not None:

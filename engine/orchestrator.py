@@ -870,6 +870,7 @@ _FILE_CITATION_RE = re.compile(r"\b[\w./\-]+\.\w{1,10}:\d+\b")
 def _validate_synthesis_grounding(
     synthesis_text: str,
     tools_invoked_total: int,
+    successful_tool_calls: int,
     enable_tool_use: bool,
     task_class: str,
 ) -> tuple[bool, list[str]]:
@@ -881,14 +882,14 @@ def _validate_synthesis_grounding(
     warnings: list[str] = []
     inference_only = False
 
-    if enable_tool_use and tools_invoked_total == 0:
+    if enable_tool_use and successful_tool_calls == 0:
         inference_only = True
         warnings.append(
-            "GROUNDING UNAVAILABLE: enable_tool_use=True but no tools were invoked. "
+            "GROUNDING UNAVAILABLE: enable_tool_use=True but no tool calls returned evidence. "
             "All findings are model inference only — not backed by file evidence."
         )
 
-    if task_class == "code_review" and tools_invoked_total == 0:
+    if task_class == "code_review" and successful_tool_calls == 0:
         if not _FILE_CITATION_RE.search(synthesis_text):
             if not any("GROUNDING UNAVAILABLE" in w for w in warnings):
                 warnings.append(
@@ -1487,11 +1488,16 @@ async def run_fan_out(
 
     cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
     tools_invoked_total = sum(len(p.get("tools_invoked", [])) for p in perspective_outputs)
+    successful_tool_calls = sum(
+        max(len(p.get("tools_invoked", [])) - len(p.get("tool_errors", [])), 0)
+        for p in perspective_outputs
+    )
 
     # Grounding gate
     inference_only, grounding_warnings = _validate_synthesis_grounding(
         synthesis_text=synthesis_text,
         tools_invoked_total=tools_invoked_total,
+        successful_tool_calls=successful_tool_calls,
         enable_tool_use=enable_tool_use,
         task_class=resolved_class,
     )
@@ -1513,6 +1519,7 @@ async def run_fan_out(
         "perspectives_succeeded": len(successes),
         "cache_hits": cache_hits,
         "tools_invoked_total": tools_invoked_total,
+        "tool_successes_total": successful_tool_calls,
         "inference_only": inference_only,
         "grounding_warnings": grounding_warnings,
         "adaptive_triggered": adaptive_triggered,

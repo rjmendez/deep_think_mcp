@@ -5,6 +5,7 @@ import socket
 from fastmcp import FastMCP
 
 from deep_think_mcp.api import reasoning as reasoning_api
+from deep_think_mcp.engine import orchestrator
 from deep_think_mcp import discover
 
 
@@ -46,3 +47,15 @@ def test_detect_cloud_providers_reads_abliteration_credentials_file(monkeypatch,
     abliteration_models = [m for m in providers if m.provider == "abliteration"]
     assert abliteration_models
     assert abliteration_models[0].timeout_secs == discover.cloud_timeout("abliterated-model")
+
+
+def test_grounding_gate_marks_failed_tool_calls_as_inference_only():
+    inference_only, warnings = orchestrator._validate_synthesis_grounding(
+        synthesis_text="The result cites deep_think_mcp.c:123",
+        tools_invoked_total=1,
+        successful_tool_calls=0,
+        enable_tool_use=True,
+        task_class="code_review",
+    )
+    assert inference_only is True
+    assert any("GROUNDING UNAVAILABLE" in w for w in warnings)
