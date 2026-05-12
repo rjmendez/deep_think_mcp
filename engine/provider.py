@@ -895,15 +895,25 @@ def _read_copilot_token() -> str:
     return ""
 
 
+_CLOUD_ONLY_PROVIDERS = {"anthropic", "copilot", "azure", "openai", "abliteration"}
+
+
 def _tier_provider(cfg: ProviderConfig, tier: str) -> str:
     """Resolve effective provider for a given tier, respecting data_policy."""
     if cfg.data_policy == "local":
         return "ollama"
     override = getattr(cfg, f"{tier}_provider", "")
     effective = override if override else cfg.provider
-    # data_policy="cloud": force light tier to provider specified at call time if no explicit override
-    if cfg.data_policy == "cloud" and tier == "light" and not override:
-        return cfg.provider
+    # data_policy="cloud": enforce that effective provider is a cloud provider, even when an
+    # explicit provider="ollama" was passed.  Fall back to the top-level provider (which was
+    # already defaulted to "anthropic" in build_provider_config) so we never route to Ollama.
+    if cfg.data_policy == "cloud" and effective not in _CLOUD_ONLY_PROVIDERS:
+        fallback = cfg.provider if cfg.provider in _CLOUD_ONLY_PROVIDERS else "anthropic"
+        log.warning(
+            "_tier_provider: data_policy=cloud blocks provider %r for tier %s; using %r instead",
+            effective, tier, fallback,
+        )
+        return fallback
     return effective
 
 
@@ -928,21 +938,47 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     4. Task class profile recommendations
     5. Dynamically-discovered assignments (if available from startup discovery)
     6. Built-in provider defaults
+
+    For Anthropic, all precedence paths are validated with _is_valid_anthropic_model.
+    Invalid model IDs fall through to the next precedence level.
     """
-    # 1. Single override
+    provider = _tier_provider(cfg, tier)
+
+    def _warn_invalid_anthropic(model: str, source: str) -> None:
+        """Log a warning for invalid Anthropic model IDs but do not reject."""
+        if provider == "anthropic" and not _is_valid_anthropic_model(model):
+            log.warning(
+                "_model_for_tier: Non-standard Anthropic model %r for tier %s (source: %s) — "
+                "prefer official IDs like claude-haiku-4-5, claude-sonnet-4-6",
+                model, tier, source,
+            )
+
+    def _validate_anthropic_fallthrough(model: str, source: str) -> str | None:
+        """Return model if valid for Anthropic, else None (triggers fall-through)."""
+        if provider == "anthropic" and not _is_valid_anthropic_model(model):
+            log.warning(
+                "_model_for_tier: Skipping invalid Anthropic model %r from %s for tier %s; falling through",
+                model, source, tier,
+            )
+            return None
+        return model
+
+    # 1. Single override — respect explicit user choice; warn but don't fall through
     if cfg.model:
+        _warn_invalid_anthropic(cfg.model, "cfg.model")
         log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
         return cfg.model
-    # 2. Explicit per-tier call override
+    # 2. Explicit per-tier call override — same: respect, warn only
     call_override = getattr(cfg, tier, "")
     if call_override:
+        _warn_invalid_anthropic(call_override, f"per-tier override ({tier})")
         log.info(f"_model_for_tier: Using call_override for {tier}={call_override}")
         return call_override
-    # 3. Env var override
-    provider = _tier_provider(cfg, tier)
+    # 3. Env var override — explicit user configuration; warn but don't fall through
     if provider == "anthropic":
         env_val = os.getenv(f"DEEP_THINK_ANTHROPIC_{tier.upper()}", "")
         if env_val:
+            _warn_invalid_anthropic(env_val, f"env DEEP_THINK_ANTHROPIC_{tier.upper()}")
             log.info(f"_model_for_tier: Using env var for anthropic/{tier}={env_val}")
             return env_val
     elif provider == "copilot":
@@ -968,8 +1004,10 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     # 5. Dynamically-discovered assignment (from startup discovery if available)
     discovered = _discovered_tier_model(provider, tier)
     if discovered:
-        log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={discovered}")
-        return discovered
+        result = _validate_anthropic_fallthrough(discovered, "dynamic discovery")
+        if result is not None:
+            log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={result}")
+            return result
     # 6. Built-in provider default
     default = _default_for_provider(provider, tier)
     log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")

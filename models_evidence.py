@@ -37,6 +37,7 @@ class ToolResult:
     results: str                     # raw tool output (JSON/text)
     error_message: Optional[str] = None  # if status != "success"
     execution_time_ms: int = 0       # how long did this take?
+    confidence_impact: float = 0.0   # confidence delta from the invoker wrapper
     timestamp: datetime = field(default_factory=datetime.now)
     
     def __post_init__(self):

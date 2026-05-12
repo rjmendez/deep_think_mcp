@@ -600,7 +600,9 @@ async def deep_think_passes(
         mandate_prefix: Mandate prefix for fan-out perspectives
         verify: Enable verification pass
         perspective_name: Perspective name for fan-out jobs
-        enable_research: Enable research tools (Nova search, web search)
+        enable_research: Accepted for API compatibility. This function runs pure LLM passes and
+            has no internal tool loop. For fan-out jobs, enable_research=False suppresses
+            enable_tool_use at the worker level before run_fan_out is called.
         research_query: Optional custom research query
         dama_node_id: DAMA device node ID for telemetry
         dama_metric: DAMA metric name
@@ -1462,12 +1464,47 @@ async def run_fan_out(
         is_healthy = status_value == "complete" and has_answer
         return status_value, error_value, is_healthy
 
-    synthesis_result = await deep_think_passes(
-        question=synthesis_question, passes=1,
-        provider_config=synthesis_cfg_pc,
-        task_class="synthesis",
-        data_policy=data_policy,
-        job_id=job_id,
+    async def _run_synthesis_with_fallback(
+        synth_question: str,
+        synth_cfg: dict,
+        perspective_name: str,
+    ) -> Any:
+        """Run synthesis, falling back to medium-tier model on first failure."""
+        try:
+            return await deep_think_passes(
+                question=synth_question, passes=1,
+                provider_config=synth_cfg,
+                task_class="synthesis",
+                data_policy=data_policy,
+                job_id=job_id,
+                perspective_name=perspective_name,
+            )
+        except Exception as primary_exc:
+            log.warning(
+                "Fan-out synthesis (%s) failed with primary config: %s — retrying with medium tier",
+                perspective_name, primary_exc,
+            )
+            fallback_cfg = dict(synth_cfg)
+            fallback_cfg["heavy"] = fallback_cfg.get("medium", "")
+            try:
+                return await deep_think_passes(
+                    question=synth_question, passes=1,
+                    provider_config=fallback_cfg,
+                    task_class="synthesis",
+                    data_policy=data_policy,
+                    job_id=job_id,
+                    perspective_name=f"{perspective_name}_fallback",
+                )
+            except Exception as fallback_exc:
+                log.error(
+                    "Fan-out synthesis (%s) fallback also failed: %s",
+                    perspective_name, fallback_exc,
+                )
+                return {"final_answer": "", "status": "failed", "error": str(fallback_exc)}
+
+    synthesis_result = await _run_synthesis_with_fallback(
+        synth_question=synthesis_question,
+        synth_cfg=synthesis_cfg_pc,
         perspective_name="synthesis",
     )
 
@@ -1564,11 +1601,10 @@ async def run_fan_out(
             synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
                 n=len(all_successes), question=question, perspectives=perspectives_text,
             )
-            synthesis_result = await deep_think_passes(
-                question=synthesis_question, passes=1,
-                provider_config=synthesis_cfg_pc,
-                task_class="synthesis", data_policy=data_policy,
-                job_id=job_id, perspective_name="synthesis_adaptive",
+            synthesis_result = await _run_synthesis_with_fallback(
+                synth_question=synthesis_question,
+                synth_cfg=synthesis_cfg_pc,
+                perspective_name="synthesis_adaptive",
             )
             raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
             synthesis_structured = _fan_out_parse_json(raw_answer)

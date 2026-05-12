@@ -501,6 +501,7 @@ def invoke_tools_and_digest(
                     results=tool_result.results,
                     error_message=getattr(tool_result, "error_message", ""),
                     execution_time_ms=timing_ms,
+                    confidence_impact=getattr(tool_result, "confidence_impact", 0.0),
                 )
             )
 

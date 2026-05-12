@@ -123,6 +123,10 @@ async def _run_job(job: dict) -> None:
                 topology = provider_config.pop("topology", "static")
                 adaptive_config = provider_config.pop("adaptive_config", None)
                 enable_tool_use = bool(provider_config.pop("enable_tool_use", False))
+                # enable_research=False overrides enable_tool_use: research tools must be
+                # disabled if the caller explicitly requested no research.
+                if not enable_research:
+                    enable_tool_use = False
                 tool_evidence_weight = float(
                     provider_config.pop("tool_evidence_weight", DEFAULT_TOOL_EVIDENCE_WEIGHT)
                 )
