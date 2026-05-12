@@ -1,10 +1,8 @@
 #!/bin/bash
 # Startup wrapper for deep_think_mcp in stdio mode.
-# Resolves GitHub Copilot OAuth token at launch (not stored in config files).
 # Copy .env.example to .env and fill in your values — this script loads it automatically.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export GITHUB_COPILOT_OAUTH_TOKEN=$(gh auth token 2>/dev/null || echo "")
 # Parent of the repo dir goes on PYTHONPATH so `import deep_think_mcp` resolves
 export PYTHONPATH="$(dirname "$SCRIPT_DIR"):${PYTHONPATH:-}"
 export DEEP_THINK_TRANSPORT=stdio

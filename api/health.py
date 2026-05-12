@@ -6,7 +6,7 @@ import os
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .. import health, store, mcp_help
+from .. import health, store, mcp_help, runtime_guard
 
 log = logging.getLogger(__name__)
 
@@ -108,5 +108,28 @@ def register(mcp):
             log.exception("Health hints endpoint error")
             return JSONResponse(
                 {"error": f"Failed to get health status: {str(e)}", "hints": []},
+                status_code=500,
+            )
+
+    @mcp.custom_route("/health/invariants", methods=["GET"])
+    async def health_invariants(request: Request) -> JSONResponse:
+        """Validate recent fan-out result contract invariants."""
+        try:
+            invariant = runtime_guard.check_recent_fanout_invariants(store._connect, limit=25)
+            fingerprint = runtime_guard.get_runtime_fingerprint().as_dict()
+            degraded = bool(invariant.get("violations_count", 0)) or bool(fingerprint.get("runtime_stale"))
+            return JSONResponse(
+                {
+                    "status": "degraded" if degraded else "healthy",
+                    "runtime_stale": bool(fingerprint.get("runtime_stale")),
+                    "runtime_fingerprint": fingerprint,
+                    "fanout_invariants": invariant,
+                },
+                status_code=503 if degraded else 200,
+            )
+        except Exception as e:
+            log.exception("Health invariants endpoint error")
+            return JSONResponse(
+                {"status": "degraded", "error": f"Failed to check invariants: {str(e)}"},
                 status_code=500,
             )

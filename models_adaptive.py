@@ -11,11 +11,18 @@ from typing import Optional, Any
 import re
 from enum import Enum
 
-from .defaults import (
-    AGGRESSIVE_TOOL_TIMEOUT_SECS,
-    CONSERVATIVE_TOOL_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS,
-)
+try:
+    from .defaults import (
+        AGGRESSIVE_TOOL_TIMEOUT_SECS,
+        CONSERVATIVE_TOOL_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from defaults import (
+        AGGRESSIVE_TOOL_TIMEOUT_SECS,
+        CONSERVATIVE_TOOL_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+    )
 
 # ============================================================================
 # ENUMS
@@ -227,7 +234,7 @@ class ToolDirective:
     
     def __post_init__(self):
         """Validate tool configuration."""
-        valid_tools = {"web_search", "code_search", "document_fetch", "verification"}
+        valid_tools = {"web_search", "code_search", "document_fetch", "nova_verify"}
         if self.tool_name not in valid_tools:
             raise ValueError(f"Tool must be one of {valid_tools}, got {self.tool_name}")
         if self.priority not in (0, 1, 2, 3):
@@ -422,7 +429,7 @@ class AdaptiveConfig:
             raise ValueError(f"tool_timeout must be > 0, got {self.tool_timeout}")
         
         # Validate allowed/forbidden tools
-        valid_tools = {"web_search", "code_search", "document_fetch", "verification"}
+        valid_tools = {"web_search", "code_search", "document_fetch", "nova_verify"}
         for tool in self.allowed_tools:
             if tool not in valid_tools:
                 raise ValueError(f"allowed_tools: {tool} not in {valid_tools}")
@@ -445,7 +452,7 @@ DEFAULT_ADAPTIVE_CONFIG = AdaptiveConfig(
         },
         "high_confidence": {
             "threshold": 0.85,
-            "tools": ["verification"],
+            "tools": ["nova_verify"],
             "action": "refute",
         },
         "contradiction": {
@@ -462,7 +469,7 @@ DEFAULT_ADAPTIVE_CONFIG = AdaptiveConfig(
     max_tool_calls_per_perspective=5,
     max_tool_calls_global=20,
     tool_timeout=DEFAULT_TOOL_TIMEOUT_SECS,
-    allowed_tools=["web_search", "code_search", "document_fetch", "verification"],
+    allowed_tools=["web_search", "code_search", "document_fetch", "nova_verify"],
     forbidden_tools=[],
     quality_score_weights={
         "confidence": 0.4,
@@ -514,12 +521,12 @@ AGGRESSIVE_CONFIG = AdaptiveConfig(
         },
         "high_confidence": {
             "threshold": 0.75,
-            "tools": ["verification"],
+            "tools": ["nova_verify"],
             "action": "refute",
         },
         "contradiction": {
             "threshold": 0.4,
-            "tools": ["web_search", "code_search", "document_fetch", "verification"],
+            "tools": ["web_search", "code_search", "document_fetch", "nova_verify"],
             "action": "resolve",
         },
     },
@@ -531,7 +538,7 @@ AGGRESSIVE_CONFIG = AdaptiveConfig(
     max_tool_calls_per_perspective=10,
     max_tool_calls_global=40,
     tool_timeout=AGGRESSIVE_TOOL_TIMEOUT_SECS,
-    allowed_tools=["web_search", "code_search", "document_fetch", "verification"],
+    allowed_tools=["web_search", "code_search", "document_fetch", "nova_verify"],
     forbidden_tools=[],
     quality_score_weights={
         "confidence": 0.3,

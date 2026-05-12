@@ -68,6 +68,7 @@ from .engine.provider import _tier_provider, refresh_ollama_models
 from .engine import build_provider_config
 from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
+from . import runtime_guard
 from .engine.mqtt_tasks import MQTTEngineAdapter
 from . import health
 from .adversarial_testing.implementation_pipeline import ImplementationPipeline
@@ -95,6 +96,7 @@ _local_provider: Optional[object] = None
 @asynccontextmanager
 async def _lifespan(app):
     log.info("[LIFESPAN] Starting initialization...")
+    strict_startup = os.getenv("DEEP_THINK_STRICT_STARTUP", "1") != "0"
     
     try:
         store.init_db()
@@ -102,6 +104,21 @@ async def _lifespan(app):
     except Exception as e:
         log.error("[LIFESPAN] Database init failed: %s", e)
         raise
+
+    fingerprint = runtime_guard.get_runtime_fingerprint().as_dict()
+    log.info(
+        "[LIFESPAN] Runtime fingerprint: sha=%s dirty=%s stale=%s started=%s newest=%s",
+        fingerprint.get("git_sha"),
+        fingerprint.get("git_dirty"),
+        fingerprint.get("runtime_stale"),
+        fingerprint.get("process_started_at"),
+        fingerprint.get("newest_code_mtime"),
+    )
+    if strict_startup and fingerprint.get("runtime_stale"):
+        raise RuntimeError(
+            "Runtime is stale at startup (code newer than process start). "
+            "Refusing to start without a clean restart."
+        )
     
     # Refresh Ollama model cache for validation (non-blocking with short timeout)
     try:

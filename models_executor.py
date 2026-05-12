@@ -14,13 +14,26 @@ from datetime import datetime
 from typing import Optional, Dict, List, Protocol, runtime_checkable
 from enum import Enum
 
-from .models_adaptive import PerspectiveAnalysis, RoutingDecision
-from .models_evidence import EvidenceDigest
-from .defaults import (
-    DEFAULT_PASS_TIMEOUT_SECS,
-    DEFAULT_REASONING_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS,
-)
+try:
+    from .models_adaptive import PerspectiveAnalysis, RoutingDecision
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_adaptive import PerspectiveAnalysis, RoutingDecision
+try:
+    from .models_evidence import EvidenceDigest
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_evidence import EvidenceDigest
+try:
+    from .defaults import (
+        DEFAULT_PASS_TIMEOUT_SECS,
+        DEFAULT_REASONING_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from defaults import (
+        DEFAULT_PASS_TIMEOUT_SECS,
+        DEFAULT_REASONING_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+    )
 
 
 # ============================================================================

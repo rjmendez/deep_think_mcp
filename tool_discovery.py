@@ -23,13 +23,22 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 import logging
 
-from .defaults import (
-    DEFAULT_CODE_SEARCH_TIMEOUT_SECS,
-    DEFAULT_DOCUMENT_FETCH_TIMEOUT_SECS,
-    DEFAULT_TOOL_TIMEOUT_SECS,
-    DEFAULT_NOVA_SEARCH_TIMEOUT_SECS,
-    DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
-)
+try:
+    from .defaults import (
+        DEFAULT_CODE_SEARCH_TIMEOUT_SECS,
+        DEFAULT_DOCUMENT_FETCH_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+        DEFAULT_NOVA_SEARCH_TIMEOUT_SECS,
+        DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from defaults import (
+        DEFAULT_CODE_SEARCH_TIMEOUT_SECS,
+        DEFAULT_DOCUMENT_FETCH_TIMEOUT_SECS,
+        DEFAULT_TOOL_TIMEOUT_SECS,
+        DEFAULT_NOVA_SEARCH_TIMEOUT_SECS,
+        DEFAULT_WEB_SEARCH_TIMEOUT_SECS,
+    )
 
 logger = logging.getLogger(__name__)
 

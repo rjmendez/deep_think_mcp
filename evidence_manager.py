@@ -14,14 +14,24 @@ from datetime import datetime
 from typing import Optional, Tuple, Dict
 from collections import OrderedDict, deque
 
-from .models_evidence import (
-    EvidenceEntry,
-    EvidenceDigest,
-    EvidenceCache,
-    ToolInvocationBatch,
-    ToolResult,
-    CacheStats,
-)
+try:
+    from .models_evidence import (
+        EvidenceEntry,
+        EvidenceDigest,
+        EvidenceCache,
+        ToolInvocationBatch,
+        ToolResult,
+        CacheStats,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_evidence import (
+        EvidenceEntry,
+        EvidenceDigest,
+        EvidenceCache,
+        ToolInvocationBatch,
+        ToolResult,
+        CacheStats,
+    )
 
 
 # ============================================================================
@@ -130,15 +140,24 @@ def add_to_cache(
         cache.access_order = deque()
     
     query_hash = entry.evidence_id
-    
-    # Add to cache
+
+    # Add/update cache entry and maintain unique access order marker.
     cache.entries[query_hash] = entry
+    try:
+        cache.access_order.remove(query_hash)
+    except ValueError:
+        pass
     cache.access_order.append(query_hash)
     
     # LRU eviction if at capacity
     while len(cache.entries) > cache.capacity:
-        # Remove least recently used (first in access_order) - O(1) with deque
+        # Remove least recently used (first in access_order) - O(1) with deque.
+        # Skip stale duplicates/missing keys to avoid KeyError under contention.
+        if not cache.access_order:
+            break
         lru_hash = cache.access_order.popleft()
+        if lru_hash not in cache.entries:
+            continue
         del cache.entries[lru_hash]
     
     return cache
@@ -240,14 +259,12 @@ def format_evidence_chain(digest: EvidenceDigest) -> str:
         lines.append(f"\n{i}. {entry.tool_name}: {entry.query[:50]}...")
         lines.append(f"   Status: {entry.tool_status}, Impact: {entry.confidence_impact:+.3f}")
         lines.append(f"   Cached: {entry.is_cached}")
+        if entry.results and entry.tool_status == "success":
+            truncated = entry.results[:500]
+            lines.append(f"   Result: {truncated}")
     
     if not digest.entries:
         lines.append("   (No evidence entries)")
-    
-    lines.extend([
-        "",
-        f"Summary: {digest.formatted_summary[:200]}..." if len(digest.formatted_summary) > 200 else f"Summary: {digest.formatted_summary}",
-    ])
     
     return "\n".join(lines)
 
@@ -504,12 +521,13 @@ class EvidenceManager:
             
             with self._cache_lock:
                 cached_entry = lookup_in_cache(tool_result.tool_name, tool_result.query, self.cache)
+                if cached_entry is not None:
+                    # Mutate inside the lock to prevent concurrent perspective races
+                    cached_entry.perspectives_used_by.append(batch.perspective_id)
+                    cached_entry.is_cached = True
             
             if cached_entry is not None:
-                # Reuse cached entry
                 entry = cached_entry
-                entry.perspectives_used_by.append(batch.perspective_id)
-                entry.is_cached = True
             else:
                 # New entry - calculate delta and create entry
                 confidence_delta = calculate_confidence_delta(tool_result, original_confidence)

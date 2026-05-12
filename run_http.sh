@@ -12,7 +12,6 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set +a
 fi
 
-export GITHUB_COPILOT_OAUTH_TOKEN="$(gh auth token 2>/dev/null || true)"
 export PYTHONPATH="$(dirname "$SCRIPT_DIR"):${PYTHONPATH:-}"
 export DEEP_THINK_TRANSPORT=streamable-http
 

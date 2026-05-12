@@ -61,3 +61,16 @@ def test_queue_indexes_created(test_db):
     assert "idx_thinking_jobs_status_created" in index_names
     assert "idx_thinking_jobs_status_claimed" in index_names
     assert "idx_thinking_jobs_status_completed" in index_names
+
+
+def test_create_job_persists_explicit_timeout(test_db):
+    """Job-level timeout should persist for worker-side enforcement."""
+    job_id = create_job(
+        "question",
+        passes=2,
+        provider="ollama",
+        model_summary="test-model",
+        timeout_secs=987,
+    )
+    job = get_job(job_id)
+    assert job["timeout_secs"] == 987

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import metrics as runtime_metrics
+from . import runtime_guard
 
 log = logging.getLogger(__name__)
 
@@ -194,9 +195,11 @@ def _build_health_response(metrics: dict, max_pending_threshold: int) -> dict:
     """Build health response from metrics."""
     pending_count = metrics["pending_count"]
     runtime = runtime_metrics.get_metrics()
+    fingerprint = runtime_guard.get_runtime_fingerprint().as_dict()
+    runtime_stale = bool(fingerprint.get("runtime_stale"))
     
     # Determine health status
-    is_healthy = pending_count < max_pending_threshold
+    is_healthy = pending_count < max_pending_threshold and not runtime_stale
     status = "healthy" if is_healthy else "degraded"
     http_status = 200 if is_healthy else 503
     
@@ -218,9 +221,13 @@ def _build_health_response(metrics: dict, max_pending_threshold: int) -> dict:
         "timeout_by_component": dict(runtime.timeout_by_component),
         "orphaned_jobs_detected": runtime.orphaned_jobs_detected,
         "orphaned_jobs_requeued": runtime.orphaned_jobs_requeued,
+        "runtime_stale": runtime_stale,
+        "runtime_fingerprint": fingerprint,
     }
     
-    if not is_healthy:
+    if runtime_stale:
+        response["reason"] = "Runtime is stale: code changed since process start; restart required"
+    elif not is_healthy:
         response["reason"] = f"Too many pending jobs ({pending_count} >= {max_pending_threshold})"
     
     return response

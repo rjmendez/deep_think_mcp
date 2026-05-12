@@ -13,16 +13,28 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import xml.etree.ElementTree as ET
 
-from .models_adaptive import (
-    Claim,
-    Uncertainty,
-    Contradiction,
-    PerspectiveAnalysis,
-    ContradictionType,
-    ClaimCategory,
-    ClaimSource,
-    DEFAULT_ADAPTIVE_CONFIG,
-)
+try:
+    from .models_adaptive import (
+        Claim,
+        Uncertainty,
+        Contradiction,
+        PerspectiveAnalysis,
+        ContradictionType,
+        ClaimCategory,
+        ClaimSource,
+        DEFAULT_ADAPTIVE_CONFIG,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_adaptive import (
+        Claim,
+        Uncertainty,
+        Contradiction,
+        PerspectiveAnalysis,
+        ContradictionType,
+        ClaimCategory,
+        ClaimSource,
+        DEFAULT_ADAPTIVE_CONFIG,
+    )
 
 
 # ============================================================================

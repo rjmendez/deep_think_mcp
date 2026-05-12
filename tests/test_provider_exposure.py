@@ -7,6 +7,10 @@ from fastmcp import FastMCP
 from deep_think_mcp.api import reasoning as reasoning_api
 from deep_think_mcp.engine import orchestrator
 from deep_think_mcp import discover
+from nova_factcheck import research_tools
+from tools.code_search import invoke_code_search
+from tools.web_search import invoke_web_search
+from tools.nova_verify import invoke_nova_verify
 
 
 def test_reasoning_tool_schema_exposes_provider_config_fields():
@@ -59,3 +63,95 @@ def test_grounding_gate_marks_failed_tool_calls_as_inference_only():
     )
     assert inference_only is True
     assert any("GROUNDING UNAVAILABLE" in w for w in warnings)
+
+
+def test_local_code_search_returns_repo_matches():
+    results, impact, error = invoke_code_search("tool_invoker", timeout=5)
+    assert error == ""
+    assert impact > 0
+    assert "tool_invoker" in results
+
+
+def test_local_code_search_no_match_is_success(monkeypatch):
+    monkeypatch.setattr("tools.code_search._search_local_repo", lambda _query, _timeout: {"results": []})
+    results, impact, error = invoke_code_search("query-that-does-not-exist-xyz", timeout=5)
+    assert "No code matches found" in results
+    assert impact == 0.0
+    assert error == ""
+
+
+def test_web_search_wrapper_uses_real_research_provider(monkeypatch):
+    async def fake_web_search(query, job_id="", task_class=""):
+        return research_tools.WebSearchResponse(
+            results=[
+                research_tools.WebResult(
+                    title="Python",
+                    url="https://python.org",
+                    snippet=f"Search for {query}",
+                    domain="python.org",
+                )
+            ],
+            total=1,
+            query=query,
+            latency_ms=12,
+        )
+
+    monkeypatch.setattr(research_tools, "web_search", fake_web_search)
+
+    results, impact, error = invoke_web_search("python", timeout=5)
+    assert error == ""
+    assert impact > 0
+    assert "Python" in results
+
+
+def test_nova_verify_wrapper_formats_verification_result(monkeypatch):
+    class FakeResult:
+        status = "TRUE"
+        nova_confidence = 0.88
+        reasoning = "supported"
+        evidence = [{"text": "evidence"}]
+        latency_ms = 15
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def verify(self, claim):
+            return FakeResult()
+
+    monkeypatch.setattr("nova_factcheck.nova_client.NovaVerificationClient", lambda timeout_s=10: FakeClient())
+
+    results, impact, error = invoke_nova_verify("Python is real", timeout=5)
+    assert error == ""
+    assert impact > 0
+    assert "GROUNDED" in results
+
+
+def test_nova_verify_wrapper_surfaces_error_state(monkeypatch):
+    class FakeErrorResult:
+        status = "ERROR"
+        nova_confidence = 0.0
+        reasoning = "Nova authentication failed"
+        evidence = []
+        error_kind = "auth_failed"
+        latency_ms = 10
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def verify(self, claim):
+            return FakeErrorResult()
+
+    monkeypatch.setattr("nova_factcheck.nova_client.NovaVerificationClient", lambda timeout_s=10: FakeClient())
+
+    results, impact, error = invoke_nova_verify("Python is real", timeout=5)
+    assert "ERROR" in results
+    assert impact < 0
+    assert "auth_failed" in error

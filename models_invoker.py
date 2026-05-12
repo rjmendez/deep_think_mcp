@@ -30,7 +30,7 @@ class ToolDirective:
         tool_name: str - Name of the tool (web_search, code_search, nova_verify, document_fetch)
         query: str - The query/claim to pass to the tool
         priority: int - Execution priority (0=must, 1=high, 2=medium, 3=exploratory)
-        purpose: str - Purpose of the tool call (ground, refute, resolve, validate)
+        purpose: str - Purpose of the tool call (ground, refute, resolve, validate, unknown)
         expected_impact: str - Description of expected confidence impact if successful
     """
     tool_name: str
@@ -46,7 +46,7 @@ class ToolDirective:
             raise ValueError(f"Invalid tool_name: {self.tool_name}. Must be one of {valid_tools}")
         if not 0 <= self.priority <= 3:
             raise ValueError(f"Invalid priority: {self.priority}. Must be 0-3")
-        valid_purposes = {"ground", "refute", "resolve", "validate"}
+        valid_purposes = {"ground", "refute", "resolve", "validate", "unknown"}
         if self.purpose not in valid_purposes:
             raise ValueError(f"Invalid purpose: {self.purpose}. Must be one of {valid_purposes}")
 

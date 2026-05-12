@@ -715,12 +715,12 @@ async def deep_think_passes(
     # Compute a run signature that locks in all execution inputs for pass cache keying.
     _run_sig = hashlib.sha256(
         "\n".join([
-            question,
+            str(question),
             str(passes),
-            task_class,
+            str(task_class),
             repr(directives),
-            mandate_prefix,
-            cfg.data_policy,
+            str(mandate_prefix),
+            str(cfg.data_policy),
         ]).encode()
     ).hexdigest()
 
@@ -891,6 +891,7 @@ def _validate_synthesis_grounding(
 
     if task_class == "code_review" and successful_tool_calls == 0:
         if not _FILE_CITATION_RE.search(synthesis_text):
+            inference_only = True
             if not any("GROUNDING UNAVAILABLE" in w for w in warnings):
                 warnings.append(
                     "CITATION WARNING: code_review synthesis contains no file-path:line "
@@ -1142,7 +1143,7 @@ async def run_fan_out(
         payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}"
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    async def _run_tool_phase(perspective_name: str, perspective_answer: str):
+    async def _run_tool_phase(perspective_name: str, perspective_answer: str, perspective_confidence: float = 0.5):
         """Run optional per-perspective tool loop. Returns (tools_invoked, tool_errors, evidence_summary)."""
         if not tool_mode_enabled or tool_budget <= 0:
             return [], [], ""
@@ -1155,7 +1156,10 @@ async def run_fan_out(
             return [], [f"import_error:{e}"], ""
 
         tool_name = "code_search" if resolved_class == "code_review" else "web_search"
-        tool_query = question if question else perspective_answer[:200]
+        if resolved_class == "code_review":
+            tool_query = "\n\n".join(part for part in [question, perspective_answer] if part)
+        else:
+            tool_query = question if question else perspective_answer[:200]
         if not tool_query:
             return [], ["missing tool query"], ""
 
@@ -1189,7 +1193,7 @@ async def run_fan_out(
             evidence_digest, _ = await asyncio.to_thread(
                 invoke_tools_and_digest,
                 queued_tools, perspective_name, run_budget,
-                evidence_confidence, exec_cfg, estimated_budget_cost,
+                perspective_confidence, exec_cfg, estimated_budget_cost,
             )
             tools_invoked = [tool["tool_name"] for tool in queued_tools]
             if evidence_digest is None:
@@ -1248,21 +1252,41 @@ async def run_fan_out(
                 device_id=device_id,
             )
 
-        final_answer = r.get("final_answer", "") if isinstance(r, dict) else str(r)
-        passes_run = len(r.get("pass_results", [])) if isinstance(r, dict) else height
+        child_status = "complete"
+        child_error = None
+        perspective_confidence = 0.5  # default mid-point sentinel
+        if isinstance(r, dict):
+            child_status = str(r.get("status") or "failed")
+            child_error = r.get("error")
+            final_answer = r.get("final_answer", "")
+            passes_run = len(r.get("pass_results", []))
+            raw_conf = r.get("confidence", 0.5)
+            perspective_confidence = max(0.0, min(1.0, float(raw_conf) if raw_conf else 0.5))
+        else:
+            final_answer = str(r)
+            passes_run = height
 
-        tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer)
+        if child_status == "complete" and isinstance(final_answer, str) and final_answer.strip():
+            tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer, perspective_confidence)
+            perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
+            await asyncio.to_thread(
+                store.set_perspective_cache,
+                cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
+            )
+        else:
+            tools_invoked, tool_errors, evidence_summary = [], [], ""
+            if child_error is None and child_status != "complete":
+                child_error = f"perspective returned status={child_status}"
 
-        perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
-        await asyncio.to_thread(
-            store.set_perspective_cache,
-            cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
-        )
         return {
-            "name": name, "status": "complete",
-            "final_answer": final_answer, "passes_run": passes_run,
+            "name": name,
+            "status": child_status,
+            "error": child_error,
+            "final_answer": final_answer,
+            "passes_run": passes_run,
             "cache_hit": False,
-            "tools_invoked": tools_invoked, "tool_errors": tool_errors,
+            "tools_invoked": tools_invoked,
+            "tool_errors": tool_errors,
             "evidence_summary": evidence_summary,
         }
 
@@ -1284,9 +1308,29 @@ async def run_fan_out(
         else:
             perspective_outputs.append(result)
 
+    def _format_perspective_output(p: dict) -> dict:
+        synthesis_text = p.get("final_answer")
+        if synthesis_text is None:
+            synthesis_text = ""
+        return {
+            "synthesis": synthesis_text,
+            "status": p.get("status", "failed"),
+            "error": p.get("error"),
+            "cache_hit": p.get("cache_hit", False),
+            "tools_invoked": p.get("tools_invoked", []),
+            "tool_errors": p.get("tool_errors", []),
+            "evidence_summary": p.get("evidence_summary", ""),
+        }
+
     successes = [p for p in perspective_outputs if p["status"] == "complete" and p["final_answer"]]
     if len(successes) < max(1, width // 2):
         duration = time.time() - start_time
+        cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
+        tools_invoked_total = sum(len(p.get("tools_invoked", [])) for p in perspective_outputs)
+        successful_tool_calls = sum(
+            max(len(p.get("tools_invoked", [])) - len(p.get("tool_errors", [])), 0)
+            for p in perspective_outputs
+        )
         log.error(
             "Fan-out failed: only %d/%d perspectives succeeded.",
             len(successes), width,
@@ -1300,18 +1344,41 @@ async def run_fan_out(
             "height": height,
             "perspectives_attempted": width,
             "perspectives_succeeded": len(successes),
+            "cache_hits": cache_hits,
+            "tools_invoked_total": tools_invoked_total,
+            "tool_successes_total": successful_tool_calls,
+            "inference_only": False,
+            "grounding_warnings": [],
+            "adaptive_triggered": False,
+            "adaptive_reason": "",
+            "final_width": width,
+            "alarm_signals": [],
+            "provider": pool_desc,
+            "confidence_score": None,
+            "converged_claims": [],
+            "contested_areas": [],
+            "gaps": [],
             "final_answer": "",
             "perspectives": [
                 {
                     "name": p["name"], "status": p["status"],
                     "final_answer": p.get("final_answer"),
+                    "cache_hit": p.get("cache_hit", False),
+                    "tools_invoked": p.get("tools_invoked", []),
+                    "tool_errors": p.get("tool_errors", []),
+                    "evidence_summary": p.get("evidence_summary", ""),
                     "error": p.get("error"),
                 }
                 for p in perspective_outputs
             ],
-            "perspective_outputs": {p["name"]: {"synthesis": "", "status": p["status"]} for p in perspective_outputs},
+            "claim_sets": [],
+            "topology": topology,
+            "adaptive_config": adaptive_config or {},
+            "enable_tool_use": enable_tool_use,
+            "tool_evidence_weight": tool_evidence_weight,
             "confidence": 0.0,
             "duration_secs": duration,
+            "perspective_outputs": {p["name"]: _format_perspective_output(p) for p in perspective_outputs},
         }
 
     # LLM-based contradiction scan
@@ -1336,6 +1403,7 @@ async def run_fan_out(
     if extract_claims and claim_sets:
         compact_parts = []
         for p, cs in zip(successes, claim_sets):
+            evidence_block = f"\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else ""
             claims_fmt = "\n".join(
                 f"  - [{(c.get('confidence') or 0):.0%}] {c.get('claim', '')} "
                 f"(basis: {c.get('evidence_basis', 'asserted') or 'asserted'})"
@@ -1350,11 +1418,13 @@ async def run_fan_out(
                 f"VERDICT: {cs.get('verdict', '(none)')}\n"
                 f"CLAIMS:\n{claims_fmt or '  (no claims extracted)'}\n"
                 f"UNCERTAINTIES:\n{uncertainties_fmt}"
+                f"{evidence_block}"
             )
         perspectives_text = "\n\n".join(compact_parts)
     else:
         perspectives_text = "\n\n".join(
             f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+            + (f"\n\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else "")
             for p in successes
         )
 
@@ -1376,11 +1446,29 @@ async def run_fan_out(
     )
 
     synthesis_cfg_pc = asdict(cfg)
+    synthesis_status = "failed"
+    synthesis_error: Optional[str] = None
+
+    def _assess_synthesis_health(result_obj: Any, synthesis_text_value: str) -> tuple[str, Optional[str], bool]:
+        status_value = "complete"
+        error_value = None
+        if isinstance(result_obj, dict):
+            status_value = str(result_obj.get("status") or "failed")
+            if result_obj.get("error") is not None:
+                error_value = str(result_obj.get("error"))
+        has_answer = isinstance(synthesis_text_value, str) and bool(synthesis_text_value.strip())
+        if not has_answer and error_value is None:
+            error_value = "synthesis returned empty final_answer"
+        is_healthy = status_value == "complete" and has_answer
+        return status_value, error_value, is_healthy
+
     synthesis_result = await deep_think_passes(
         question=synthesis_question, passes=1,
         provider_config=synthesis_cfg_pc,
         task_class="synthesis",
         data_policy=data_policy,
+        job_id=job_id,
+        perspective_name="synthesis",
     )
 
     raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
@@ -1395,6 +1483,10 @@ async def run_fan_out(
         log.warning("Fan-out: synthesis JSON parse failed — falling back to plain text")
         synthesis_text = raw_answer
 
+    synthesis_status, synthesis_error, synthesis_healthy = _assess_synthesis_health(
+        synthesis_result, synthesis_text
+    )
+
     confidence_score = synthesis_structured.get("confidence_score") if synthesis_structured else None
     converged_claims = synthesis_structured.get("converged_claims", []) if synthesis_structured else []
     contested_areas = synthesis_structured.get("contested_areas", []) if synthesis_structured else []
@@ -1404,6 +1496,7 @@ async def run_fan_out(
     adaptive_triggered = False
     adaptive_reason = ""
     final_width = width
+    all_successes = successes  # will grow if adaptive expansion runs
 
     _all_mandates_raw = directives_module.PERSPECTIVE_MANDATES.get(resolved_class, directives_module.PERSPECTIVE_MANDATES["general"])
     if isinstance(_all_mandates_raw, dict):
@@ -1455,6 +1548,7 @@ async def run_fan_out(
             alarm_signals = await _fan_out_alarm_scan(question, all_successes, cfg, resolved_class, _pc)
             perspectives_text = "\n\n".join(
                 f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+                + (f"\n\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else "")
                 for p in all_successes
             )
             if alarm_signals:
@@ -1474,6 +1568,7 @@ async def run_fan_out(
                 question=synthesis_question, passes=1,
                 provider_config=synthesis_cfg_pc,
                 task_class="synthesis", data_policy=data_policy,
+                job_id=job_id, perspective_name="synthesis_adaptive",
             )
             raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
             synthesis_structured = _fan_out_parse_json(raw_answer)
@@ -1485,6 +1580,9 @@ async def run_fan_out(
                 gaps = synthesis_structured.get("gaps", [])
             else:
                 synthesis_text = raw_answer
+            synthesis_status, synthesis_error, synthesis_healthy = _assess_synthesis_health(
+                synthesis_result, synthesis_text
+            )
 
     cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
     tools_invoked_total = sum(len(p.get("tools_invoked", [])) for p in perspective_outputs)
@@ -1508,15 +1606,23 @@ async def run_fan_out(
 
     duration = time.time() - start_time
 
+    overall_status = (
+        "complete"
+        if successes and synthesis_healthy
+        else "failed"
+    )
+
     return {
         "type": "fan_out",
-        "status": "complete" if successes else "failed",
+        "status": overall_status,
+        "synthesis_status": synthesis_status,
+        "synthesis_error": synthesis_error,
         "task_class": resolved_class,
         "skill": resolved_class,
         "width": width,
         "height": height,
-        "perspectives_attempted": width,
-        "perspectives_succeeded": len(successes),
+        "perspectives_attempted": final_width,
+        "perspectives_succeeded": len(all_successes),
         "cache_hits": cache_hits,
         "tools_invoked_total": tools_invoked_total,
         "tool_successes_total": successful_tool_calls,
@@ -1552,5 +1658,5 @@ async def run_fan_out(
         "final_answer": synthesis_text,
         "confidence": float(confidence_score) / 100.0 if confidence_score is not None else 0.7,
         "duration_secs": duration,
-        "perspective_outputs": {p["name"]: {"synthesis": p.get("final_answer", ""), "status": p["status"]} for p in perspective_outputs},
+        "perspective_outputs": {p["name"]: _format_perspective_output(p) for p in perspective_outputs},
     }

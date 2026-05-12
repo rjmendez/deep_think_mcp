@@ -31,8 +31,6 @@ def _load_credentials_at_startup():
                     # Convert anthropic.api_key -> ANTHROPIC_API_KEY
                     if key == "anthropic.api_key" and not os.getenv("ANTHROPIC_API_KEY"):
                         os.environ["ANTHROPIC_API_KEY"] = value
-                    elif key == "copilot.oauth_token" and not os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"):
-                        os.environ["GITHUB_COPILOT_OAUTH_TOKEN"] = value
                     elif key == "ollama.base_url" and not os.getenv("OLLAMA_BASE_URL"):
                         os.environ["OLLAMA_BASE_URL"] = value
         except Exception as e:
@@ -106,7 +104,13 @@ async def _run_job(job: dict) -> None:
             device_id=device_id or None,
         )
 
-        job_timeout_secs = max(int(job.get("timeout_secs") or 300), 60)
+        raw_timeout_secs = job.get("timeout_secs")
+        try:
+            job_timeout_secs = int(raw_timeout_secs) if raw_timeout_secs is not None else 300
+        except (TypeError, ValueError):
+            job_timeout_secs = 300
+        if job_timeout_secs <= 0:
+            job_timeout_secs = 300
 
         async def _execute_engine() -> dict:
             if provider_config.pop("fan_out", False):
@@ -217,7 +221,12 @@ async def _run_job(job: dict) -> None:
             )
             log.warning("Nova verification pipeline failed for job %s (non-fatal): %s", job_id, vexc)
 
-        await asyncio.to_thread(store.complete_job, job_id, json.dumps(result))
+        await asyncio.to_thread(
+            store.complete_job,
+            job_id,
+            json.dumps(result),
+            status=result.get("status") if isinstance(result, dict) else None,
+        )
         _log_job_event(
             "info",
             "job_completed",

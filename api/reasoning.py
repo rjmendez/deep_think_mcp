@@ -2,11 +2,12 @@
 
 import json
 import logging
+import math
 import os
 from datetime import datetime
 from typing import Optional, TypedDict
 
-from .. import store, discover as _discover
+from .. import store, discover as _discover, runtime_guard
 from .. import worker as _worker
 from ..engine import (
     build_provider_config,
@@ -22,6 +23,50 @@ from ..engine.directives import resolve_skill_selection
 from ..engine.validator import validate_passes, validate_width, validate_height, ValidationError
 
 log = logging.getLogger(__name__)
+
+
+def _estimate_fan_out_timeout_secs(
+    *,
+    width: int,
+    height: int,
+    max_parallel: int = 2,
+    max_width: int = 6,
+    task_class: str = "general",
+    topology: str = "static",
+    adaptive_config: Optional[dict] = None,
+    enable_tool_use: bool = False,
+) -> int:
+    """Estimate fan-out timeout based on workload shape and optional overhead."""
+    width = max(1, min(int(width), 6))
+    height = max(1, min(int(height), 5))
+    max_parallel = max(1, int(max_parallel or 1))
+    max_width = max(width, min(int(max_width or width), 6))
+    cfg = adaptive_config or {}
+    tool_timeout = max(1, int(cfg.get("tool_timeout", 30)))
+    max_tools_global = max(0, int(cfg.get("max_tool_calls_global", 20)))
+    max_tools_per_perspective = max(0, int(cfg.get("max_tool_calls_per_perspective", 5)))
+
+    perspective_waves = math.ceil(width / max_parallel) * height
+    synthesis_waves = 1
+    expansion_width = max(0, max_width - width)
+    expansion_waves = math.ceil(expansion_width / max_parallel) * height
+    expansion_synthesis = 1 if expansion_width > 0 else 0
+    extract_claim_waves = math.ceil(width / max_parallel)
+
+    llm_wave_secs = 90
+    timeout_secs = 120 + llm_wave_secs * (
+        perspective_waves + synthesis_waves + expansion_waves + expansion_synthesis
+    )
+    timeout_secs += 30 * extract_claim_waves
+
+    tool_mode_enabled = bool(enable_tool_use) and (
+        topology == "adaptive" or task_class == "code_review"
+    )
+    if tool_mode_enabled:
+        tool_budget = min(max_tools_global, max_tools_per_perspective)
+        timeout_secs += math.ceil(width / max_parallel) * tool_budget * tool_timeout
+
+    return max(300, min(int(timeout_secs), 3600))
 
 
 class ProviderConfigOverrides(TypedDict, total=False):
@@ -126,6 +171,10 @@ def register(mcp):
 
         Response includes proof_chain field when research tools were used.
         """
+        stale_error = runtime_guard.stale_runtime_error()
+        if stale_error:
+            return stale_error
+
         # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
         try:
             passes = validate_passes(passes)
@@ -141,8 +190,16 @@ def register(mcp):
             pc["data_policy"] = data_policy
 
         fan_out_enabled = width > 1
+        fan_out_timeout_secs = None
         if fan_out_enabled:
             total_passes = width * height + 1
+            fan_out_timeout_secs = _estimate_fan_out_timeout_secs(
+                width=width,
+                height=height,
+                max_parallel=2,
+                max_width=6,
+                task_class=task_class or "general",
+            )
         else:
             total_passes = max(2, min(passes, 6))
 
@@ -178,6 +235,7 @@ def register(mcp):
                 "height": height if fan_out_enabled else 1,
                 "extract_claims": extract_claims,
             }),
+            timeout_secs=fan_out_timeout_secs or 300,
         )
         _worker.notify_job_available()
 
@@ -237,63 +295,89 @@ def register(mcp):
 
         response: dict = {
             "job_id":        job["job_id"],
-            "status":        job["status"],
             "provider":      job.get("provider"),
             "model_summary": job.get("model_summary"),
             "created_at":    job.get("created_at"),
             "duration_secs": duration,
         }
+        runtime_fp = runtime_guard.get_runtime_fingerprint().as_dict()
+        response["runtime_stale"] = bool(runtime_fp.get("runtime_stale"))
+        response["runtime_fingerprint"] = runtime_fp
 
-        if job["status"] == "complete" and job.get("result"):
+        result = None
+        result_status = None
+        if job.get("result"):
             try:
                 result = json.loads(job["result"])
                 response["result"] = result
-                if isinstance(result, dict) and result.get("type") == "fan_out":
-                    if result.get("confidence_score") is not None:
-                        response["confidence_score"] = result["confidence_score"]
-                    if result.get("converged_claims"):
-                        response["converged_claims"] = result["converged_claims"]
-                    if result.get("contested_areas"):
-                        response["contested_areas"] = result["contested_areas"]
-                    if result.get("claim_sets"):
-                        response["claim_sets"] = result["claim_sets"]
-                    if result.get("inference_only") is not None:
-                        response["inference_only"] = result["inference_only"]
-                    if result.get("grounding_warnings") is not None:
-                        response["grounding_warnings"] = result["grounding_warnings"]
-                    if result.get("tools_invoked_total") is not None:
-                        response["tools_invoked_total"] = result["tools_invoked_total"]
-                    if result.get("tool_successes_total") is not None:
-                        response["tool_successes_total"] = result["tool_successes_total"]
-                    if result.get("topology") is not None:
-                        response["topology"] = result["topology"]
-                    if result.get("adaptive_config") is not None:
-                        response["adaptive_config"] = result["adaptive_config"]
-                    if result.get("enable_tool_use") is not None:
-                        response["enable_tool_use"] = result["enable_tool_use"]
-                    if result.get("tool_evidence_weight") is not None:
-                        response["tool_evidence_weight"] = result["tool_evidence_weight"]
-                    response["adaptive_triggered"] = result.get("adaptive_triggered", False)
-                    if result.get("adaptive_triggered"):
-                        response["adaptive_reason"] = result.get("adaptive_reason", "")
-                        response["final_width"] = result.get("final_width")
-                if isinstance(result, dict) and result.get("verification_pass") is not None:
-                    response["verification_pass"] = result["verification_pass"]
-                if isinstance(result, dict):
-                    if result.get("verification_status") is not None:
-                        response["verification_status"] = result["verification_status"]
-                    if result.get("verification_results") is not None:
-                        response["verification_results"] = result["verification_results"]
-                    if result.get("adjusted_final_confidence") is not None:
-                        response["adjusted_final_confidence"] = result["adjusted_final_confidence"]
-                    if result.get("verification_summary") is not None:
-                        response["verification_summary"] = result["verification_summary"]
-                    if result.get("escalated_claim_ids"):
-                        response["escalated_claim_ids"] = result["escalated_claim_ids"]
             except (json.JSONDecodeError, TypeError):
                 response["result"] = job["result"]
-        elif job["status"] == "failed":
-            response["error"] = job.get("error")
+
+        if isinstance(result, dict):
+            if result.get("status") is not None:
+                result_status = str(result.get("status"))
+            for key in (
+                "confidence_score",
+                "converged_claims",
+                "contested_areas",
+                "claim_sets",
+                "inference_only",
+                "grounding_warnings",
+                "tools_invoked_total",
+                "tool_successes_total",
+                "topology",
+                "adaptive_config",
+                "enable_tool_use",
+                "tool_evidence_weight",
+                "adaptive_triggered",
+                "adaptive_reason",
+                "final_width",
+                "cache_hits",
+                "alarm_signals",
+                "perspectives",
+                "perspective_outputs",
+            ):
+                if key in result:
+                    response[key] = result[key]
+            if "verification_pass" in result:
+                response["verification_pass"] = result["verification_pass"]
+            if result.get("verification_status") is not None:
+                response["verification_status"] = result["verification_status"]
+            if result.get("verification_results") is not None:
+                response["verification_results"] = result["verification_results"]
+            if result.get("adjusted_final_confidence") is not None:
+                response["adjusted_final_confidence"] = result["adjusted_final_confidence"]
+            if result.get("verification_summary") is not None:
+                response["verification_summary"] = result["verification_summary"]
+            if "escalated_claim_ids" in result:
+                response["escalated_claim_ids"] = result["escalated_claim_ids"]
+            if result.get("type") == "fan_out":
+                fan_out_defaults = {
+                    "tools_invoked_total": 0,
+                    "tool_successes_total": 0,
+                    "inference_only": False,
+                    "grounding_warnings": [],
+                    "adaptive_triggered": False,
+                    "converged_claims": [],
+                    "contested_areas": [],
+                    "claim_sets": [],
+                    "perspectives": [],
+                    "perspective_outputs": {},
+                }
+                for key, default_value in fan_out_defaults.items():
+                    response.setdefault(key, result.get(key, default_value))
+
+        job_status = str(job.get("status") or "failed")
+        effective_status = result_status or job_status
+        response["status"] = effective_status
+        response["job_status"] = job_status
+        response["result_status"] = result_status
+
+        if effective_status == "failed":
+            if isinstance(result, dict) and result.get("error"):
+                response["error"] = result.get("error")
+            elif job.get("error"):
+                response["error"] = job.get("error")
 
         if include_reasoning_chain:
             response["reasoning_chain"] = store.get_full_reasoning_chain(job_id)
@@ -420,6 +504,10 @@ def register(mcp):
         Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
         Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
         """
+        stale_error = runtime_guard.stale_runtime_error()
+        if stale_error:
+            return stale_error
+
         # Apply defaults
         width = width if width is not None else 3
         height = height if height is not None else 2
@@ -478,6 +566,16 @@ def register(mcp):
                 "enable_tool_use": enable_tool_use,
                 "tool_evidence_weight": tool_evidence_weight,
             }),
+            timeout_secs=_estimate_fan_out_timeout_secs(
+                width=width,
+                height=height,
+                max_parallel=max_parallel,
+                max_width=max_width,
+                task_class=resolved_class,
+                topology=topology,
+                adaptive_config=adaptive_config,
+                enable_tool_use=enable_tool_use,
+            ),
         )
         _worker.notify_job_available()
 

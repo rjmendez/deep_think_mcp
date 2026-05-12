@@ -13,10 +13,12 @@ This module is the data contract between Tool Invoker and Evidence Manager.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Dict, List, Deque
+from typing import Any, Optional, Dict, List, Deque
 import hashlib
 import json
 from collections import deque
+
+VALID_TOOL_PURPOSES = {"ground", "refute", "resolve", "validate", "unknown"}
 
 
 # ============================================================================
@@ -43,9 +45,8 @@ class ToolResult:
         if self.status not in valid_statuses:
             raise ValueError(f"Status must be one of {valid_statuses}, got {self.status}")
         
-        valid_purposes = {"ground", "refute", "resolve", "validate", "unknown"}
-        if self.purpose not in valid_purposes:
-            raise ValueError(f"Purpose must be one of {valid_purposes}, got {self.purpose}")
+        if self.purpose not in VALID_TOOL_PURPOSES:
+            raise ValueError(f"Purpose must be one of {VALID_TOOL_PURPOSES}, got {self.purpose}")
 
 
 @dataclass
@@ -53,7 +54,7 @@ class ToolInvocationBatch:
     """Batch of tool invocations for a single perspective."""
     
     perspective_id: str
-    directives: List[dict]            # Original ToolDirective dicts that were executed
+    directives: List[Any]             # Original ToolDirective objects or dicts that were executed
     results: List[ToolResult]         # Results from executing those directives
     total_time_ms: int = 0            # Total time spent invoking tools
     budget_consumed: int = 0          # Budget tokens/calls consumed

@@ -1,8 +1,9 @@
 """Nova verification tool wrapper for deep_think tool invoker.
 
-Wraps the nova_verify MCP tool (Great Library) and formats verification results.
+Wraps the Nova verification client and formats verification results.
 """
 
+import asyncio
 import logging
 import time
 from typing import Tuple
@@ -11,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 def invoke_nova_verify(claim: str, timeout: int = 10) -> Tuple[str, float, str]:
-    """Invoke nova_verify tool to ground claims against Great Library.
+    """Invoke Nova verification to ground claims against Great Library.
     
     Args:
         claim: Claim to verify
@@ -24,37 +25,32 @@ def invoke_nova_verify(claim: str, timeout: int = 10) -> Tuple[str, float, str]:
         TimeoutError: If tool call exceeds timeout
         Exception: On tool invocation errors
     """
-    import asyncio
-    from functools import partial
-    
     log.debug(f"Invoking nova_verify with claim: {claim[:100]}...")
     start_time = time.time()
     
     try:
-        # Try to import the nova_verify tool from available tools
-        try:
-            from nova_tools_nova_verify import nova_verify as nv_tool
-            result = nv_tool(claim)
-        except ImportError:
-            # Fallback: nova_verify not available as importable module
-            # Use the nova_verify MCP tool via available interface
-            log.warning("nova_verify module not found; using MCP fallback")
-            # In production, this would call the actual MCP nova_verify tool
-            # For now, return a structured mock result
-            result = {
-                "grounded": True,
-                "verdict": "claim is well-supported by evidence",
-                "confidence": 0.85,
-                "evidence": [
-                    {"source": "Great Library", "snippet": f"Evidence for: {claim}"}
-                ]
-            }
+        from nova_factcheck.nova_client import NovaVerificationClient
+
+        async def _run() -> object:
+            async with NovaVerificationClient(timeout_s=timeout) as client:
+                # Hard-cap the entire retry loop at `timeout` seconds.
+                # Without this, the client retries up to 3× before the outer
+                # asyncio.run() returns, holding a ThreadPoolExecutor slot for
+                # ~3× timeout even after tool_invoker has already recorded a timeout.
+                return await asyncio.wait_for(client.verify(claim), timeout=timeout)
+
+        result = asyncio.run(_run())
         
         elapsed_ms = int((time.time() - start_time) * 1000)
         
         # Format verification results
+        error_msg = _extract_nova_error(result)
         formatted, impact = _format_nova_results(result)
-        
+
+        if error_msg:
+            log.warning(f"nova_verify returned error state in {elapsed_ms}ms: {error_msg}")
+            return formatted, impact, error_msg
+
         log.info(f"nova_verify succeeded in {elapsed_ms}ms")
         return formatted, impact, ""
         
@@ -81,7 +77,24 @@ def _format_nova_results(result: any) -> Tuple[str, float]:
         - confidence_impact: Delta adjustment to confidence
     """
     try:
-        if isinstance(result, dict):
+        if hasattr(result, "status") and hasattr(result, "reasoning"):
+            status = getattr(result, "status", "ERROR")
+            status = status.value if hasattr(status, "value") else str(status)
+            if status == "TRUE":
+                grounding = "grounded"
+            elif status == "FALSE":
+                grounding = "contradicted"
+            elif status == "ERROR":
+                grounding = "error"
+            else:
+                grounding = "ungrounded"
+            evidence = getattr(result, "evidence", [])
+            grounding_score = float(getattr(result, "nova_confidence", 0.0))
+            if grounding == "error" and not evidence:
+                reasoning = str(getattr(result, "reasoning", "")).strip()
+                if reasoning:
+                    evidence = [reasoning]
+        elif isinstance(result, dict):
             grounding = result.get("grounding", "ungrounded")
             evidence = result.get("evidence", [])
             grounding_score = result.get("grounding_score", 0.5)
@@ -106,6 +119,8 @@ def _format_nova_results(result: any) -> Tuple[str, float]:
             impact = -0.25  # Direct contradiction
         elif grounding == "partially_grounded":
             impact = 0.10  # Partial support
+        elif grounding == "error":
+            impact = -0.10  # Verification unavailable (auth/network/etc)
         else:  # ungrounded
             impact = -0.05  # No supporting evidence found
         
@@ -126,3 +141,38 @@ def _format_nova_results(result: any) -> Tuple[str, float]:
     except Exception as e:
         log.warning(f"Error formatting nova results: {e}")
         return str(result), 0.0
+
+
+def _extract_nova_error(result: any) -> str:
+    """Extract tool-level error message from Nova verify response objects."""
+    try:
+        if hasattr(result, "status"):
+            status = getattr(result, "status", "")
+            status = status.value if hasattr(status, "value") else str(status)
+            if status.upper() == "ERROR":
+                error_kind = str(getattr(result, "error_kind", "")).strip()
+                reasoning = str(getattr(result, "reasoning", "")).strip()
+                if error_kind and reasoning:
+                    return f"Nova verify {error_kind}: {reasoning}"
+                if error_kind:
+                    return f"Nova verify {error_kind}"
+                if reasoning:
+                    return reasoning
+                return "Nova verify returned ERROR"
+
+        if isinstance(result, dict):
+            status = str(result.get("status", "")).upper()
+            if status == "ERROR":
+                error_kind = str(result.get("error_kind", "")).strip()
+                reason = str(result.get("reason", result.get("reasoning", ""))).strip()
+                if error_kind and reason:
+                    return f"Nova verify {error_kind}: {reason}"
+                if error_kind:
+                    return f"Nova verify {error_kind}"
+                if reason:
+                    return reason
+                return "Nova verify returned ERROR"
+    except Exception:
+        pass
+
+    return ""

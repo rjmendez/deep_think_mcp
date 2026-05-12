@@ -97,6 +97,7 @@ def init_db() -> None:
                 status               TEXT NOT NULL DEFAULT 'queued',
                 question             TEXT NOT NULL,
                 passes               INTEGER NOT NULL DEFAULT 3,
+                timeout_secs         INTEGER NOT NULL DEFAULT 300,
                 provider             TEXT,
                 model_summary        TEXT,
                 provider_config_json TEXT DEFAULT '{}',
@@ -131,6 +132,37 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_thinking_jobs_status_completed "
             "ON thinking_jobs(status, completed_at)"
         )
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(thinking_jobs)").fetchall()
+        }
+        if "timeout_secs" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE thinking_jobs ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300"
+            )
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(thinking_jobs)").fetchall()
+            }
+        required_columns = {
+            "job_id",
+            "status",
+            "question",
+            "passes",
+            "timeout_secs",
+            "provider",
+            "model_summary",
+            "provider_config_json",
+            "created_at",
+            "result",
+            "error",
+        }
+        missing_required = sorted(required_columns - existing_columns)
+        if missing_required:
+            raise RuntimeError(
+                "thinking_jobs schema missing required columns: "
+                + ", ".join(missing_required)
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS model_cache (
@@ -465,21 +497,40 @@ def create_job(
     provider: str,
     model_summary: str,
     provider_config_json: str = "{}",
+    timeout_secs: int = 300,
 ) -> str:
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    timeout_secs = max(int(timeout_secs or 300), 60)
     conn = _connect()
     try:
-        conn.execute(
-            """
-            INSERT INTO thinking_jobs
-                (job_id, status, question, passes, provider,
-                 model_summary, provider_config_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (job_id, "queued", question, passes, provider,
-             model_summary, provider_config_json, now),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO thinking_jobs
+                    (job_id, status, question, passes, provider,
+                     model_summary, provider_config_json, timeout_secs, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, "queued", question, passes, provider,
+                 model_summary, provider_config_json, timeout_secs, now),
+            )
+        except sqlite3.OperationalError as exc:
+            if "timeout_secs" not in str(exc):
+                raise
+            conn.execute(
+                "ALTER TABLE thinking_jobs ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300"
+            )
+            conn.execute(
+                """
+                INSERT INTO thinking_jobs
+                    (job_id, status, question, passes, provider,
+                     model_summary, provider_config_json, timeout_secs, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, "queued", question, passes, provider,
+                 model_summary, provider_config_json, timeout_secs, now),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -538,6 +589,7 @@ def complete_job(
     job_id: str,
     result: str,
     cache_entries: Optional[list[dict]] = None,
+    status: Optional[str] = None,
 ) -> None:
     """Mark job as complete with optional atomic cache writes.
     
@@ -547,12 +599,29 @@ def complete_job(
     Args:
         job_id: Job ID
         result: Job result JSON string
+        status: Optional explicit terminal status override ("complete" | "failed")
         cache_entries: Optional list of cache entry dicts with keys:
                       job_id, perspective, pass_num, run_sig, framing, tier,
                       model_used, provider, output
     """
     now = datetime.now(timezone.utc).isoformat()
     _validate_result_size(result)
+    payload_status: Optional[str] = None
+    payload_error: Optional[str] = None
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        raw_payload_status = parsed.get("status")
+        payload_status = str(raw_payload_status) if raw_payload_status is not None else None
+        raw_payload_error = parsed.get("error")
+        payload_error = str(raw_payload_error) if raw_payload_error is not None else None
+
+    effective_status = str(status or payload_status or "complete").strip().lower()
+    terminal_status = "complete" if effective_status == "complete" else "failed"
+    terminal_error = payload_error if terminal_status == "failed" else None
+
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -595,8 +664,8 @@ def complete_job(
         
         # Update job status
         conn.execute(
-            "UPDATE thinking_jobs SET status='complete', result=?, completed_at=? WHERE job_id=?",
-            (result, now, job_id),
+            "UPDATE thinking_jobs SET status=?, result=?, error=?, completed_at=? WHERE job_id=?",
+            (terminal_status, result, terminal_error, now, job_id),
         )
         
         # All-or-nothing commit

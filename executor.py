@@ -16,32 +16,69 @@ import logging
 from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass
 
-from .models_executor import (
-    PerspectiveExecutionState,
-    ExecutionPass,
-    ExecutionConfig,
-    ExecutionStatus,
-)
-from .models_adaptive import (
-    PerspectiveAnalysis,
-    RoutingDecision,
-    RoutingAction,
-)
-from .models_evidence import (
-    EvidenceDigest,
-    EvidenceCache,
-    ToolResult,
-    ToolInvocationBatch,
-)
+try:
+    from .models_executor import (
+        PerspectiveExecutionState,
+        ExecutionPass,
+        ExecutionConfig,
+        ExecutionStatus,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_executor import (
+        PerspectiveExecutionState,
+        ExecutionPass,
+        ExecutionConfig,
+        ExecutionStatus,
+    )
+try:
+    from .models_adaptive import (
+        PerspectiveAnalysis,
+        RoutingDecision,
+        RoutingAction,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_adaptive import (
+        PerspectiveAnalysis,
+        RoutingDecision,
+        RoutingAction,
+    )
+try:
+    from .models_evidence import (
+        EvidenceDigest,
+        EvidenceCache,
+        ToolResult,
+        ToolInvocationBatch,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_evidence import (
+        EvidenceDigest,
+        EvidenceCache,
+        ToolResult,
+        ToolInvocationBatch,
+    )
 
-from .analyzer import analyze_perspective
-from .router import (
-    route_reasoning_perspective,
-    GlobalReasoningState,
-    extract_quality_signals,
-    PerspectiveQualityClassifier,
-)
-from .defaults import DEFAULT_REASONING_TIMEOUT_SECS
+try:
+    from .analyzer import analyze_perspective
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from analyzer import analyze_perspective
+try:
+    from .router import (
+        route_reasoning_perspective,
+        GlobalReasoningState,
+        extract_quality_signals,
+        PerspectiveQualityClassifier,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from router import (
+        route_reasoning_perspective,
+        GlobalReasoningState,
+        extract_quality_signals,
+        PerspectiveQualityClassifier,
+    )
+try:
+    from .defaults import DEFAULT_REASONING_TIMEOUT_SECS
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from defaults import DEFAULT_REASONING_TIMEOUT_SECS
 
 
 # ============================================================================
@@ -319,6 +356,8 @@ def invoke_tools_and_digest(
         logger.info(f"[ACT] No tools to invoke for perspective={perspective_id}")
         return None, 0
     
+    # Track whether we created the ToolInvoker so we close it on exit.
+    _invoker_owned = tool_invoker is None
     try:
         logger.info(f"[ACT] Invoking {len(tools_queued)} tools for perspective={perspective_id}, estimated_cost={estimated_budget_cost}")
         
@@ -326,24 +365,62 @@ def invoke_tools_and_digest(
         if tool_invoker is None:
             try:
                 from .tool_invoker import ToolInvoker
-                tool_invoker = ToolInvoker()
             except ImportError:
-                logger.warning("tool_invoker not available; using fallback mock")
-                tool_invoker = None
-        
+                try:
+                    from tool_invoker import ToolInvoker
+                except ImportError:
+                    logger.warning("tool_invoker not available; using fallback mock")
+                    tool_invoker = None
+                else:
+                    try:
+                        from .models_invoker import ToolInvocationConfig as InvokerConfig
+                    except ImportError:
+                        from models_invoker import ToolInvocationConfig as InvokerConfig
+                    tool_invoker = ToolInvoker(
+                        config=InvokerConfig(
+                            min_budget_remaining=1,
+                            tool_timeout_seconds=config.tool_timeout,
+                        )
+                    )
+            else:
+                try:
+                    from .models_invoker import ToolInvocationConfig as InvokerConfig
+                except ImportError:
+                    from models_invoker import ToolInvocationConfig as InvokerConfig
+                tool_invoker = ToolInvoker(
+                    config=InvokerConfig(
+                        min_budget_remaining=1,
+                        tool_timeout_seconds=config.tool_timeout,
+                    )
+                )
+
         if evidence_manager is None:
             try:
                 from .evidence_manager import EvidenceManager
-                evidence_manager = EvidenceManager()
             except ImportError:
-                logger.warning("evidence_manager not available; returning no evidence digest")
-                return None, estimated_budget_cost
-        
+                try:
+                    from evidence_manager import EvidenceManager
+                except ImportError:
+                    logger.warning("evidence_manager not available; returning no evidence digest")
+                    return None, estimated_budget_cost
+                else:
+                    evidence_manager = EvidenceManager()
+            else:
+                evidence_manager = EvidenceManager()
+
+        try:
+            from .models_evidence import ToolResult as EvidenceToolResult, ToolInvocationBatch as EvidenceToolInvocationBatch
+        except ImportError:
+            from models_evidence import ToolResult as EvidenceToolResult, ToolInvocationBatch as EvidenceToolInvocationBatch
+
         # Convert tool directives dict to ToolDirective objects for invoker
         # Try to use real ToolDirective if models_invoker available
         tool_directives = None
         try:
-            from models_invoker import ToolDirective as InvokerToolDirective
+            try:
+                from .models_invoker import ToolDirective as InvokerToolDirective
+            except ImportError:
+                from models_invoker import ToolDirective as InvokerToolDirective
             tool_directives = [
                 InvokerToolDirective(
                     tool_name=td["tool_name"],
@@ -374,7 +451,7 @@ def invoke_tools_and_digest(
         tool_results = []
         try:
             if tool_invoker:
-                batch = tool_invoker.invoke_tools_batch(
+                batch = tool_invoker.invoke_tools(
                     directives=tool_directives,
                     budget_remaining=budget_remaining,
                     perspective_id=perspective_id,
@@ -397,24 +474,44 @@ def invoke_tools_and_digest(
             return None, 0
         
         # Phase 4.2: Process batch via evidence_manager to get EvidenceDigest
-        evidence_digest = None
-        try:
-            from models_invoker import ToolInvocationBatch as InvokerToolInvocationBatch
-            batch_cls = InvokerToolInvocationBatch
-        except ImportError:
-            batch_cls = ToolInvocationBatch
+        evidence_tool_results = []
+        for index, tool_result in enumerate(tool_results):
+            directive = tool_directives[index] if index < len(tool_directives) else {}
+            if hasattr(directive, "purpose"):
+                purpose = directive.purpose
+            else:
+                purpose = directive.get("purpose", "unknown")
+            if hasattr(tool_result, "tool_status"):
+                raw_status = tool_result.tool_status
+                timing_ms = getattr(tool_result, "timing_ms", 0)
+            else:
+                raw_status = getattr(tool_result, "status", "error")
+                timing_ms = getattr(tool_result, "execution_time_ms", 0)
+            # Remap invoker-only statuses to evidence-valid ones to prevent
+            # EvidenceToolResult.__post_init__ from raising and dropping the entire batch.
+            _EVIDENCE_STATUS_MAP = {"not_callable": "error", "skipped": "error"}
+            status = _EVIDENCE_STATUS_MAP.get(raw_status, raw_status)
+            evidence_tool_results.append(
+                EvidenceToolResult(
+                    directive_id=f"{perspective_id}:{index}",
+                    tool_name=tool_result.tool_name,
+                    query=tool_result.query,
+                    purpose=purpose,
+                    status=status,
+                    results=tool_result.results,
+                    error_message=getattr(tool_result, "error_message", ""),
+                    execution_time_ms=timing_ms,
+                )
+            )
 
-        if tool_results:
-            total_time_ms = sum(r.execution_time_ms for r in tool_results)
-        else:
-            total_time_ms = 0
+        total_time_ms = sum(r.execution_time_ms for r in evidence_tool_results)
 
-        batch = batch_cls(
+        batch = EvidenceToolInvocationBatch(
             perspective_id=perspective_id,
             directives=tool_directives,
-            results=tool_results,
+            results=evidence_tool_results,
             total_time_ms=total_time_ms,
-            budget_consumed=len(tool_results),
+            budget_consumed=len(evidence_tool_results),
         )
         evidence_digest = evidence_manager.process_batch(batch, original_confidence)
         
@@ -435,6 +532,13 @@ def invoke_tools_and_digest(
     except Exception as e:
         logger.error(f"[ACT ERROR] Failed to invoke tools for perspective={perspective_id}: {str(e)}")
         return None, 0
+    finally:
+        # Close the ThreadPoolExecutor if we created it; avoids resource leak (30 threads per fan-out).
+        if _invoker_owned and tool_invoker is not None and hasattr(tool_invoker, "close"):
+            try:
+                tool_invoker.close()
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -554,6 +658,9 @@ class ExecutionOrchestrator:
                 state.timing_ms = int((time.time() - start_time) * 1000)
                 logger.info(f"[EXECUTOR] Perspective eliminated: {state.elimination_reason}")
                 return state
+            
+            # Persist routing decision for hysteresis on subsequent passes
+            global_state.prior_routes[perspective_id] = state.routing_decision.action
             
             # ========== PHASE 3: DECIDE ==========
             decide_start = time.time()

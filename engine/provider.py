@@ -780,8 +780,8 @@ async def classify_task(question: str, override: Optional[str] = None, provider:
             return override
         log.warning(f"Override task class '{override}' not recognized; auto-classifying instead")
     
-    # Try requested provider first, then fall back to others
-    providers_to_try = [provider] if provider else ["anthropic", "copilot", "ollama"]
+    # Try requested provider first; implicit fallback never defaults to Copilot.
+    providers_to_try = [provider] if provider else ["anthropic", "ollama"]
     
     for prov in providers_to_try:
         if not prov:
@@ -843,7 +843,8 @@ async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool,
     Returns:
         (safe, reason) tuple. safe=True if request passed checks.
     """
-    providers_to_try = [provider] if provider else ["anthropic", "copilot", "ollama"]
+    # Explicit provider can still be copilot, but implicit fallback excludes it.
+    providers_to_try = [provider] if provider else ["anthropic", "ollama"]
     
     for prov in providers_to_try:
         if not prov:
@@ -885,10 +886,9 @@ def _read_copilot_token() -> str:
     """Read GitHub Copilot OAuth token.
 
     Checks (in order):
-      1. GITHUB_COPILOT_OAUTH_TOKEN env var (set by run.sh via `gh auth token`)
-      2. GITHUB_TOKEN env var (fallback)
+      1. GITHUB_COPILOT_OAUTH_TOKEN env var
     """
-    for var in ("GITHUB_COPILOT_OAUTH_TOKEN", "GITHUB_TOKEN"):
+    for var in ("GITHUB_COPILOT_OAUTH_TOKEN",):
         val = os.getenv(var, "").strip()
         if val and val not in ("not-set", ""):
             return val

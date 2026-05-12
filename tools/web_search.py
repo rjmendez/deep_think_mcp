@@ -1,8 +1,9 @@
 """Web search tool wrapper for deep_think tool invoker.
 
-Wraps the web_search MCP tool and formats results for reasoning context.
+Wraps the grounded web search provider and formats results for reasoning context.
 """
 
+import asyncio
 import logging
 import time
 from typing import Tuple
@@ -11,7 +12,7 @@ log = logging.getLogger(__name__)
 
 
 def invoke_web_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
-    """Invoke web_search MCP tool with timeout.
+    """Invoke the grounded web search provider with timeout.
     
     Args:
         query: Search query string
@@ -24,33 +25,19 @@ def invoke_web_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
         TimeoutError: If tool call exceeds timeout
         Exception: On tool invocation errors
     """
-    import asyncio
-    from functools import partial
-    
     log.debug(f"Invoking web_search with query: {query[:100]}...")
     start_time = time.time()
     
     try:
-        # Try to import the web_search tool from the available tools
-        # If not available, return mock results (for testing)
-        try:
-            from web_search import web_search as ws_tool
-            result = ws_tool(query)
-        except ImportError:
-            # Fallback: web_search not available as importable module
-            # Use the web_search MCP tool via available interface
-            log.warning("web_search module not found; using MCP fallback")
-            # In production, this would call the actual MCP web_search tool
-            # For now, return a structured mock result
-            result = {
-                "results": [
-                    {
-                        "title": f"Search result for: {query}",
-                        "snippet": f"This is a mock result for query: {query}",
-                        "url": "https://example.com/search"
-                    }
-                ]
-            }
+        from nova_factcheck.research_tools import web_search as research_web_search
+
+        async def _run() -> object:
+            return await asyncio.wait_for(
+                research_web_search(query, job_id="", task_class=""),
+                timeout=timeout,
+            )
+
+        result = asyncio.run(_run())
         
         elapsed_ms = int((time.time() - start_time) * 1000)
         
@@ -82,7 +69,9 @@ def _format_web_search_results(result: any) -> str:
         Formatted string with top results (title, snippet, url)
     """
     try:
-        if isinstance(result, dict):
+        if hasattr(result, "results") and hasattr(result, "query"):
+            items = getattr(result, "results", [])
+        elif isinstance(result, dict):
             # Handle dict response
             if "results" in result:
                 items = result["results"]
@@ -103,7 +92,16 @@ def _format_web_search_results(result: any) -> str:
         formatted_lines = ["Web search results:"]
         
         for i, item in enumerate(top_results, 1):
-            if isinstance(item, dict):
+            if hasattr(item, "title") and hasattr(item, "url"):
+                title = getattr(item, "title", "No title")
+                snippet = getattr(item, "snippet", "")[:200]
+                url = getattr(item, "url", "")
+                formatted_lines.append(f"{i}. {title}")
+                if snippet:
+                    formatted_lines.append(f"   {snippet}...")
+                if url:
+                    formatted_lines.append(f"   URL: {url}")
+            elif isinstance(item, dict):
                 title = item.get("title", "No title")
                 snippet = item.get("snippet", "")[:200]  # Limit snippet length
                 url = item.get("url", "")

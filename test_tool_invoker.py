@@ -146,7 +146,7 @@ class TestDirectiveValidation:
     
     def test_all_valid_purposes(self):
         """All valid purposes can be created."""
-        for purpose in ["ground", "refute", "resolve", "validate"]:
+        for purpose in ["ground", "refute", "resolve", "validate", "unknown"]:
             directive = ToolDirective(
                 tool_name="web_search",
                 query="test",
@@ -488,6 +488,27 @@ class TestErrorHandling:
         )
         assert result.confidence_impact == -0.05
         assert "Network" in result.error_message
+
+    def test_code_search_no_match_maps_to_success(self, invoker):
+        """No-match code_search is a successful call with neutral impact."""
+        directive = ToolDirective("code_search", "unlikely query", priority=1)
+
+        with patch("tools.code_search.invoke_code_search", return_value=("No code matches found", -0.05, "code_search returned no local matches")):
+            result = invoker._invoke_single_tool(directive, 10)
+
+        assert result.tool_status == "success"
+        assert result.error_message == ""
+        assert result.confidence_impact == 0.0
+
+    def test_nova_verify_error_state_maps_to_error(self, invoker):
+        """Nova verify ERROR state should not be classified as success."""
+        directive = ToolDirective("nova_verify", "claim", priority=1)
+
+        with patch("tools.nova_verify.invoke_nova_verify", return_value=("Nova Verification: ERROR", -0.10, "Nova verify auth_failed: unauthorized")):
+            result = invoker._invoke_single_tool(directive, 10)
+
+        assert result.tool_status == "error"
+        assert "auth_failed" in result.error_message
 
 
 # ═════════════════════════════════════════════════════════════════════════════

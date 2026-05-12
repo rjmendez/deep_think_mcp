@@ -61,8 +61,8 @@ def register(mcp):
             # Check provider availability
             providers = {}
             
-            # Check Anthropic/Copilot availability
-            if os.getenv("ANTHROPIC_API_KEY") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"):
+            # Check Anthropic availability
+            if os.getenv("ANTHROPIC_API_KEY"):
                 providers["anthropic"] = {
                     "available": True,
                     "models": [
@@ -71,13 +71,14 @@ def register(mcp):
                         "claude-opus-4-7",
                     ]
                 }
-                providers["copilot"] = {
-                    "available": True,
-                    "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
-                }
             else:
                 providers["anthropic"] = {"available": False, "models": []}
-                providers["copilot"] = {"available": False, "models": []}
+            providers["copilot"] = {
+                "available": bool(os.getenv("GITHUB_COPILOT_OAUTH_TOKEN")),
+                "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+                if os.getenv("GITHUB_COPILOT_OAUTH_TOKEN")
+                else [],
+            }
             
             # Check Ollama availability
             ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -235,7 +236,7 @@ def register(mcp):
                 passes = 1
             
             # Determine provider
-            has_api_key = bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"))
+            has_api_key = bool(os.getenv("ANTHROPIC_API_KEY"))
             provider = "cloud" if (has_api_key and not prefer_local) else "local"
             
             if not has_api_key:

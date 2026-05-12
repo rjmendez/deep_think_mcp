@@ -19,15 +19,28 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
-from .models_adaptive import (
-    PerspectiveAnalysis,
-    ToolDirective,
-    RoutingDecision,
-    RoutingAction,
-    AdaptiveConfig,
-    DEFAULT_ADAPTIVE_CONFIG,
-)
-from .defaults import DEFAULT_TOOL_TIMEOUT_SECS
+try:
+    from .models_adaptive import (
+        PerspectiveAnalysis,
+        ToolDirective,
+        RoutingDecision,
+        RoutingAction,
+        AdaptiveConfig,
+        DEFAULT_ADAPTIVE_CONFIG,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_adaptive import (
+        PerspectiveAnalysis,
+        ToolDirective,
+        RoutingDecision,
+        RoutingAction,
+        AdaptiveConfig,
+        DEFAULT_ADAPTIVE_CONFIG,
+    )
+try:
+    from .defaults import DEFAULT_TOOL_TIMEOUT_SECS
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from defaults import DEFAULT_TOOL_TIMEOUT_SECS
 
 
 # ============================================================================

@@ -14,12 +14,20 @@ import time
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
-from models_invoker import (
-    ToolDirective,
-    ToolResult,
-    ToolInvocationBatch,
-    ToolInvocationConfig,
-)
+try:
+    from .models_invoker import (
+        ToolDirective,
+        ToolResult,
+        ToolInvocationBatch,
+        ToolInvocationConfig,
+    )
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    from models_invoker import (
+        ToolDirective,
+        ToolResult,
+        ToolInvocationBatch,
+        ToolInvocationConfig,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +42,6 @@ class ToolInvoker:
             config: ToolInvocationConfig with safety constraints
         """
         self.config = config or ToolInvocationConfig()
-        self.tool_calls_this_pass = 0
         self.executor = ThreadPoolExecutor(max_workers=5)
     
     def invoke_tools(
@@ -240,16 +247,28 @@ class ToolInvoker:
         try:
             # Route to appropriate tool wrapper
             if directive.tool_name == "web_search":
-                from tools.web_search import invoke_web_search
+                try:
+                    from .tools.web_search import invoke_web_search
+                except ImportError:  # pragma: no cover - support direct module imports in tests
+                    from tools.web_search import invoke_web_search
                 results, impact, error = invoke_web_search(directive.query, timeout)
             elif directive.tool_name == "code_search":
-                from tools.code_search import invoke_code_search
+                try:
+                    from .tools.code_search import invoke_code_search
+                except ImportError:  # pragma: no cover - support direct module imports in tests
+                    from tools.code_search import invoke_code_search
                 results, impact, error = invoke_code_search(directive.query, timeout)
             elif directive.tool_name == "nova_verify":
-                from tools.nova_verify import invoke_nova_verify
+                try:
+                    from .tools.nova_verify import invoke_nova_verify
+                except ImportError:  # pragma: no cover - support direct module imports in tests
+                    from tools.nova_verify import invoke_nova_verify
                 results, impact, error = invoke_nova_verify(directive.query, timeout)
             elif directive.tool_name == "document_fetch":
-                from tools.document_fetch import invoke_document_fetch
+                try:
+                    from .tools.document_fetch import invoke_document_fetch
+                except ImportError:  # pragma: no cover - support direct module imports in tests
+                    from tools.document_fetch import invoke_document_fetch
                 results, impact, error = invoke_document_fetch(directive.query, timeout)
             else:
                 return ToolResult(
@@ -266,7 +285,15 @@ class ToolInvoker:
             
             # Determine status
             if error:
-                if "timed out" in error.lower():
+                normalized_error = error.lower()
+                if (
+                    directive.tool_name == "code_search"
+                    and "no local matches" in normalized_error
+                ):
+                    status = "success"
+                    impact = max(impact, 0.0)
+                    error = ""
+                elif "timed out" in normalized_error:
                     status = "timeout"
                     impact = -0.10
                 else:
