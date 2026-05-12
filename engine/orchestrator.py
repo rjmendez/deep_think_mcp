@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace as dataclasses_replace
 from typing import Optional, Any
 
 try:
@@ -29,6 +29,7 @@ from .task_class_enforcer import enforce_task_class
 from .validator import validate_passes, validate_width, validate_height, ValidationError
 from deep_think_mcp import store
 from deep_think_mcp import discover
+from deep_think_mcp.defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
 
 log = logging.getLogger(__name__)
 
@@ -465,57 +466,95 @@ async def _run_alarm_scan(
 # Fan-out prompts (from engine.py lines 1000-1090)
 # ---------------------------------------------------------------------------
 
-_FAN_OUT_ALARM_PROMPT = """You are a factuality auditor. Review this reasoning pass output and identify:
+_FAN_OUT_ALARM_PROMPT = """\
+You are a contradiction detector. Below are {n} independent analyses of the same question.
+Your ONLY task: identify explicit factual contradictions — cases where two perspectives make
+directly incompatible claims about the same specific fact.
 
-1. Claims that lack sufficient grounding in the input
-2. Logical jumps without justification
-3. Assertions presented as fact that are actually opinion
-4. Numerical claims that seem implausible
+IGNORE: differences in emphasis, framing, confidence level, or opinion.
+ONLY flag: direct factual contradictions (A says X is true, B says X is false).
 
-For each concern, cite the exact text from the pass output and explain why it's problematic.
+Question analyzed: {question}
 
-**PASS OUTPUT:**
-{pass_output}
+{perspectives}
 
-**AUDIT REPORT:**
-"""
-
-_CLAIM_EXTRACTION_PROMPT = """Extract all key claims from this reasoning output in JSON format:
-
+Return ONLY valid JSON — no other text:
 {{
-  "claims": [
-    {{"text": "...", "confidence": 0.8, "category": "inference"}},
-    {{"text": "...", "confidence": 0.6, "category": "opinion"}}
+  "contradictions": [
+    {{
+      "claim": "<the specific fact in dispute>",
+      "perspective_a": "<name>",
+      "says_a": "<what A claims>",
+      "perspective_b": "<name>",
+      "says_b": "<what B claims>"
+    }}
   ]
 }}
 
-Confidence: 0.0 (speculative) to 1.0 (definite).
-Category: fact|inference|opinion|assumption.
+If no factual contradictions exist, return: {{"contradictions": []}}"""
 
-**OUTPUT:**
-{pass_output}
+_CLAIM_EXTRACTION_PROMPT = """\
+Extract the key claims from this analysis. Be precise and concise.
 
-**JSON:**
-"""
+Analysis to extract from:
+{analysis}
 
-_FAN_OUT_SYNTHESIS_PROMPT = """Synthesize these perspectives into a coherent final answer.
+Return ONLY valid JSON — no other text:
+{{
+  "claims": [
+    {{
+      "claim": "<specific factual or analytical claim, one sentence>",
+      "confidence": <0.0-1.0, how confident the analysis seems in this claim>,
+      "evidence_basis": "<brief note on what supports this claim, or 'asserted' if no support given>"
+    }}
+  ],
+  "verdict": "<the analysis's overall conclusion in one sentence>",
+  "key_uncertainties": ["<thing the analysis flagged as uncertain or unknown>"]
+}}
 
-Each perspective analyzed the question using different mandates (defense/prosecution/forensics/compliance/red_team/timeline).
+Extract 3-7 claims. Focus on claims that are specific, falsifiable, and central to the verdict.
+Do not include meta-commentary about the analysis process itself."""
 
-**QUESTION:**
+_FAN_OUT_SYNTHESIS_PROMPT = """You are the synthesis analyst integrating {n} independent perspective analyses of the following question.
+
+ORIGINAL QUESTION:
 {question}
 
-**PERSPECTIVE OUTPUTS:**
-{perspective_outputs}
+PERSPECTIVE ANALYSES:
+{perspectives}
 
-**SYNTHESIS TASK:**
-1. Identify converged claims (all perspectives agree)
-2. Identify contested claims (perspectives disagree)
-3. Resolve contradictions by weighing evidence and mandates
-4. Produce a unified answer that acknowledges uncertainty
+---
+Analyze convergence and divergence across these perspectives, then produce your output as a JSON block.
 
-**FINAL ANSWER:**
-"""
+INSTRUCTIONS:
+1. CONVERGED CLAIMS: Identify claims where different perspectives independently reached the same conclusion through different reasoning paths. These are the highest-confidence findings.
+2. CONTESTED AREAS: Identify claims where perspectives explicitly contradict each other — not just different emphasis, but actually conflicting factual assertions or conclusions.
+3. CONFIDENCE SCORE: Rate overall confidence 0-100 based on: how many perspectives converged (more=higher), how many contested areas exist (more=lower), evidence quality, and internal consistency.
+   - 80-100: Strong convergence, few or no contested areas
+   - 60-79: Moderate convergence, some contested areas
+   - 40-59: Mixed — significant divergence or uncertainty
+   - 0-39: High divergence, contradictory evidence, or insufficient basis for conclusions
+4. FINAL ANSWER: Integrate all perspectives into a concrete answer. Lead with converged high-confidence findings. Clearly mark contested claims. Note gaps.
+
+Respond with ONLY this JSON (no other text before or after):
+```json
+{{
+  "confidence_score": <integer 0-100>,
+  "converged_claims": [
+    "<specific claim that multiple perspectives independently agreed on>",
+    "..."
+  ],
+  "contested_areas": [
+    "<description of explicit conflict between perspectives, naming which perspectives disagree>",
+    "..."
+  ],
+  "gaps": [
+    "<important angle not addressed or insufficient evidence>",
+    "..."
+  ],
+  "final_answer": "<full integrated synthesis — lead with convergence, mark contested areas, note remaining unknowns, give concrete conclusion>"
+}}
+```"""
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +823,7 @@ Use the mandate to structure your response. Be precise and evidence-based."""
                 job_id=job_id,
                 task_class=task_class,
                 provider_config=provider_config,
+                perspective=perspective_name if perspective_name else None,
             )
             log.error(f"Pass {pass_num} failed: {error_msg}", exc_info=True)
             validation_results.append(None)
@@ -821,6 +861,130 @@ Use the mandate to structure your response. Be precise and evidence-based."""
 
 
 # ---------------------------------------------------------------------------
+# Fan-out helpers
+# ---------------------------------------------------------------------------
+
+_FILE_CITATION_RE = re.compile(r"\b[\w./\-]+\.\w{1,10}:\d+\b")
+
+
+def _validate_synthesis_grounding(
+    synthesis_text: str,
+    tools_invoked_total: int,
+    enable_tool_use: bool,
+    task_class: str,
+) -> tuple[bool, list[str]]:
+    """Return (inference_only, grounding_warnings).
+
+    inference_only=True means no real file/tool evidence backed the synthesis.
+    grounding_warnings contains human-readable messages for each failure.
+    """
+    warnings: list[str] = []
+    inference_only = False
+
+    if enable_tool_use and tools_invoked_total == 0:
+        inference_only = True
+        warnings.append(
+            "GROUNDING UNAVAILABLE: enable_tool_use=True but no tools were invoked. "
+            "All findings are model inference only — not backed by file evidence."
+        )
+
+    if task_class == "code_review" and tools_invoked_total == 0:
+        if not _FILE_CITATION_RE.search(synthesis_text):
+            if not any("GROUNDING UNAVAILABLE" in w for w in warnings):
+                warnings.append(
+                    "CITATION WARNING: code_review synthesis contains no file-path:line "
+                    "citations. Findings may be fabricated. Do not treat as verified."
+                )
+
+    return inference_only, warnings
+
+
+def _fan_out_parse_json(text: str) -> dict | None:
+    """Extract a JSON object from model output, stripping markdown fences."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    if "```json" in text:
+        inner = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            pass
+    if "```" in text:
+        inner = text.split("```", 1)[1].split("```", 1)[0].strip()
+        try:
+            return json.loads(inner)
+        except Exception:
+            pass
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except Exception:
+                        break
+    return None
+
+
+async def _fan_out_alarm_scan(question, successes, cfg, task_class, provider_config):
+    """LLM-based contradiction scan across perspective outputs."""
+    if len(successes) < 2:
+        return []
+    perspectives_text = "\n\n".join(
+        f"=== {p['name'].upper()} ===\n{p['final_answer']}"
+        for p in successes
+    )
+    prompt = _FAN_OUT_ALARM_PROMPT.format(n=len(successes), question=question, perspectives=perspectives_text)
+    try:
+        provider = provider_module._tier_provider(cfg, "medium")
+        model = provider_module._model_for_tier(cfg, "medium", task_class)
+        raw = await provider_module._call_provider(
+            provider=provider, model=model,
+            system="You are a factual contradiction detector. Return only valid JSON.",
+            user_prompt=prompt,
+            tier="medium", provider_config=provider_config,
+        )
+        parsed = _fan_out_parse_json(raw)
+        if parsed and isinstance(parsed.get("contradictions"), list):
+            return parsed["contradictions"]
+        return []
+    except Exception as exc:
+        log.warning("Fan-out alarm scan failed (non-fatal): %s", exc)
+        return []
+
+
+async def _fan_out_extract_claims(perspective_name, analysis_text, cfg, task_class, provider_config):
+    """Distil perspective prose into structured claim set for synthesis compression."""
+    if not analysis_text or not analysis_text.strip():
+        return {"claims": [], "verdict": "", "key_uncertainties": []}
+    prompt = _CLAIM_EXTRACTION_PROMPT.format(analysis=analysis_text[:4000])
+    try:
+        provider = provider_module._tier_provider(cfg, "light")
+        model = provider_module._model_for_tier(cfg, "light", "extraction")
+        raw = await provider_module._call_provider(
+            provider=provider, model=model,
+            system="Extract claims in JSON format. Return only valid JSON.",
+            user_prompt=prompt,
+            tier="light", provider_config=provider_config,
+        )
+        parsed = _fan_out_parse_json(raw)
+        if parsed and isinstance(parsed.get("claims"), list):
+            return parsed
+        return {"claims": [], "verdict": raw[:200], "key_uncertainties": []}
+    except Exception as exc:
+        log.warning("Claim extraction failed for %s (non-fatal): %s", perspective_name, exc)
+        return {"claims": [], "verdict": "", "key_uncertainties": []}
+
+
+# ---------------------------------------------------------------------------
 # Fan-out reasoning (from engine.py lines 2036-2488)
 # ---------------------------------------------------------------------------
 
@@ -828,260 +992,558 @@ async def run_fan_out(
     question: str,
     width: int = 3,
     height: int = 2,
+    provider_cfg: Optional[ProviderConfig] = None,
+    provider_cfgs: Optional[list] = None,
+    provider_config: Optional[dict] = None,
     task_class: Optional[str] = None,
     data_policy: str = "any",
     model: Optional[str] = None,
-    provider_config: Optional[dict] = None,
-    ground_truth_provider: Optional[Any] = None,
+    max_parallel: int = 2,
+    job_id: str = "",
+    max_width: int = 6,
+    confidence_threshold: int = 50,
+    extract_claims: bool = False,
+    topology: str = "static",
+    adaptive_config: Optional[dict] = None,
+    enable_tool_use: bool = False,
+    tool_evidence_weight: float = DEFAULT_TOOL_EVIDENCE_WEIGHT,
     force_local_models: bool = False,
     device_id: str = "",
+    ground_truth_provider: Optional[Any] = None,
 ) -> dict:
-    """Fan-out reasoning with multiple perspectives.
-    
+    """Fan-out reasoning with parallel perspectives and synthesis.
+
+    Runs `width` parallel mandate-driven agents x `height` passes each.
+    Final heavy synthesis pass integrates all perspectives.
+
+    Adaptive expansion: if confidence_score < confidence_threshold OR contested_areas > 2,
+    dispatches remaining unused mandates and re-synthesizes (max 1 expansion).
+
     Args:
-        question: Question to analyze
-        width: Number of parallel perspectives (1-6)
-        height: Passes per perspective (1-5)
-        task_class: Optional task class routing
-        data_policy: "any" | "local" | "cloud"
-        model: Override model for all tiers
-        provider_config: Per-call provider overrides
-        ground_truth_provider: Optional ground truth validator
-        force_local_models: When True, enforce local-only Ollama, block cloud providers.
-                            Used for MQTT operations to prevent data leakage.
-        device_id: Device ID for logging. Used to tag MQTT enforcement logs.
-    
+        question:             The question or content to analyze.
+        width:                Parallel perspectives (1-6).
+        height:               Sequential passes per perspective (1-5).
+        provider_cfg:         ProviderConfig object (preferred).
+        provider_cfgs:        List of ProviderConfig for round-robin.
+        provider_config:      Dict provider overrides (legacy fallback when provider_cfg is None).
+        task_class:           Mandate set to use.
+        data_policy:          "any" | "local" | "cloud"
+        max_parallel:         Max concurrent perspectives (default 2).
+        job_id:               Job ID for pass caching.
+        max_width:            Expansion ceiling (default 6).
+        confidence_threshold: Adaptive expansion trigger (default 50).
+        extract_claims:       Compress perspectives to claim sets before synthesis.
+        topology:             "static" (default) or "adaptive" (enables tool use).
+        adaptive_config:      Tool loop configuration dict.
+        enable_tool_use:      If True and topology=="adaptive" or task_class=="code_review", run tools.
+        tool_evidence_weight: Evidence weight for tool results (0.0-1.0).
+        force_local_models:   MQTT safety: force Ollama-only.
+        device_id:            MQTT device ID for logging.
+        ground_truth_provider: Optional ground truth validator.
+
     Returns:
-        Dict with final_answer, perspective_outputs, synthesis, confidence, duration_secs
+        dict with type="fan_out", perspectives, synthesis fields, quality metrics.
     """
     import time
-    import os
-    
     start_time = time.time()
-    
-    # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
+
     try:
         width = validate_width(width)
         height = validate_height(height)
     except ValidationError as e:
-        error_msg = str(e) or type(e).__qualname__
-        log.error(f"Parameter validation failed: {error_msg}")
         return {
-            "error": str(e),
-            "status": "validation_error",
-            "final_answer": None,
-            "perspective_outputs": {},
-            "synthesis": None,
-            "confidence": 0,
-            "duration_secs": 0,
+            "error": str(e), "status": "validation_error",
+            "final_answer": None, "perspective_outputs": {},
+            "synthesis": None, "confidence": 0, "duration_secs": 0,
         }
-    
-    # Check environment override for force_local_models (security gate)
+
     env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
     force_local_models = force_local_models or env_force_local
-    
-    # Check for production security lock (strictest mode)
-    ollama_only_mode = os.getenv("OLLAMA_ONLY_MODE", "0") != "0"
-    if ollama_only_mode:
+    if os.getenv("OLLAMA_ONLY_MODE", "0") != "0":
         force_local_models = True
-    
-    # Enforce local-only models on all configs
-    if provider_config is None:
-        provider_config = {}
-    else:
-        provider_config = dict(provider_config)
 
-    # Auto-classify if not provided
+    _pc = dict(provider_config or {})
+    if force_local_models:
+        _pc.setdefault("provider", "ollama")
+        _pc["light_provider"] = "ollama"
+        _pc["medium_provider"] = "ollama"
+        _pc["heavy_provider"] = "ollama"
+        _pc["data_policy"] = "local"
+        data_policy = "local"
+    elif data_policy and data_policy != "any":
+        _pc["data_policy"] = data_policy
+
+    # Build provider pool
+    _cfg_pool: list
+    if provider_cfgs and len(provider_cfgs) > 0:
+        _cfg_pool = provider_cfgs
+    elif provider_cfg is not None:
+        _cfg_pool = [provider_cfg]
+    else:
+        _cfg_pool = [provider_module.build_provider_config(_pc)]
+
+    if data_policy != "any":
+        _cfg_pool = [dataclasses_replace(c, data_policy=data_policy) for c in _cfg_pool]
+
+    cfg = _cfg_pool[0]
+
+    width = max(1, min(width, 6))
+    height = max(1, min(height, 5))
+
     if not task_class:
-        task_class = await provider_module.classify_task(
-            question,
-            provider=provider_config.get("provider", ""),
-        )
+        task_class = await provider_module.classify_task(question, provider=_pc.get("provider", ""))
 
     if task_class not in directives_module.TASK_CLASS_PROFILES:
-        log.warning(f"Unknown task class '{task_class}'; using 'general'")
         task_class = "general"
 
     task_profile = directives_module.TASK_CLASS_PROFILES[task_class]
     base_task_class = task_profile.get("task_class", task_class)
+    resolved_class = task_class
 
     if task_profile.get("force_local"):
         force_local_models = True
-        provider_config.setdefault("provider", "ollama")
-        provider_config["light_provider"] = "ollama"
-        provider_config["medium_provider"] = "ollama"
-        provider_config["heavy_provider"] = "ollama"
-        provider_config["data_policy"] = "local"
+        _pc.setdefault("provider", "ollama")
+        _pc["light_provider"] = "ollama"
+        _pc["medium_provider"] = "ollama"
+        _pc["heavy_provider"] = "ollama"
+        _pc["data_policy"] = "local"
 
-    cfg = provider_module.build_provider_config(provider_config)
-    
     if force_local_models:
         await provider_module._validate_and_enforce_local_models(cfg, force_local_models, device_id)
         if device_id:
-            log.info(f"[MQTT] Running local-only fan-out for device {device_id}")
-    
-    # Apply data_policy override
-    if force_local_models:
-        cfg.data_policy = "local"
-        provider_config["data_policy"] = "local"
-    elif data_policy and data_policy != "any":
-        cfg.data_policy = data_policy
-        provider_config["data_policy"] = data_policy
+            log.info("[MQTT] Running local-only fan-out for device %s", device_id)
 
-    for tier_name in ("light", "medium", "heavy"):
-        tier_provider = provider_module._tier_provider(cfg, tier_name)
-        tier_model = model or provider_module._model_for_tier(cfg, tier_name, task_class)
-        enforce_task_class(base_task_class, tier_provider, [tier_model], "")
-    
-    # Get mandates for this task class
-    mandates = directives_module.PERSPECTIVE_MANDATES.get(
-        task_class,
-        directives_module.PERSPECTIVE_MANDATES.get(base_task_class, {}),
+    _mandates_raw = directives_module.PERSPECTIVE_MANDATES.get(resolved_class, directives_module.PERSPECTIVE_MANDATES["general"])
+    if isinstance(_mandates_raw, dict):
+        _mandates_raw = [{"name": k, "mandate": v} for k, v in _mandates_raw.items()]
+    mandates = _mandates_raw[:width]
+
+    tool_mode_enabled = bool(enable_tool_use) and (
+        topology == "adaptive" or resolved_class == "code_review"
     )
-    mandate_names = list(mandates.keys())[:width]
-    
-    if not mandate_names:
-        mandates = directives_module.PERSPECTIVE_MANDATES.get("general", {})
-        mandate_names = list(mandates.keys())[:width]
-    
-    log.info(f"Fan-out: {len(mandate_names)} perspectives × {height} passes each")
-    
-    # Execute perspectives in parallel
-    perspective_outputs = {}
-    
-    async def run_perspective(mandate_name: str) -> tuple[str, dict]:
-        """Run one perspective with its mandate."""
-        mandate = mandates.get(mandate_name, "")
-        
-        pass_results = []
-        for pass_num in range(1, height + 1):
-            system_prompt = f"""Adopt this perspective: {mandate_name}
+    adaptive_cfg = adaptive_config or {}
+    max_tools_global = int(adaptive_cfg.get("max_tool_calls_global", 20))
+    max_tools_per_perspective = int(adaptive_cfg.get("max_tool_calls_per_perspective", 5))
+    tool_budget = max(0, min(max_tools_global, max_tools_per_perspective))
+    tool_timeout = int(adaptive_cfg.get("tool_timeout", 30))
+    evidence_confidence = max(0.0, min(float(tool_evidence_weight), 1.0))
 
-{mandate}
+    pool_desc = (
+        "+".join(c.provider for c in _cfg_pool) if len(_cfg_pool) > 1 else _cfg_pool[0].provider
+    )
+    log.info("Fan-out: width=%d height=%d task_class=%s providers=%s topology=%s",
+             width, height, resolved_class, pool_desc, topology)
 
-Use this perspective to analyze the question. Be consistent with your assigned viewpoint."""
-            
-            user_prompt = f"Question: {question}"
-            perspective_provider = provider_module._tier_provider(cfg, "medium")
-            perspective_model = model or provider_module._model_for_tier(cfg, "medium", task_class)
-            
-            try:
-                output = await provider_module._call_provider(
-                    provider=perspective_provider,
-                    model=perspective_model,
-                    system=system_prompt,
-                    user_prompt=user_prompt,
-                    tier="medium",
-                    provider_config=provider_config,
-                )
-                pass_results.append(
-                    _build_pass_result(
-                        pass_num=pass_num,
-                        framing=mandate_name,
-                        tier="medium",
-                        provider=perspective_provider,
-                        model=perspective_model,
-                        output=output,
+    sem = asyncio.Semaphore(max(1, min(max_parallel, width)))
+
+    def _perspective_cache_key(mandate_text: str, perspective_cfg: ProviderConfig) -> str:
+        sig = provider_module.model_summary(perspective_cfg, resolved_class)
+        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def _run_tool_phase(perspective_name: str, perspective_answer: str):
+        """Run optional per-perspective tool loop. Returns (tools_invoked, tool_errors, evidence_summary)."""
+        if not tool_mode_enabled or tool_budget <= 0:
+            return [], [], ""
+        try:
+            from deep_think_mcp.executor import queue_tools, invoke_tools_and_digest
+            from deep_think_mcp.models_adaptive import RoutingAction, RoutingDecision, ToolDirective
+            from deep_think_mcp.models_executor import ExecutionConfig
+        except ImportError as e:
+            log.warning("Tool phase unavailable (import error): %s", e)
+            return [], [f"import_error:{e}"], ""
+
+        tool_name = "code_search" if resolved_class == "code_review" else "web_search"
+        tool_query = question if question else perspective_answer[:200]
+        if not tool_query:
+            return [], ["missing tool query"], ""
+
+        try:
+            routing_decision = RoutingDecision(
+                perspective_id=perspective_name,
+                action=RoutingAction.CONTINUE_WITH_TOOLS.value,
+                recommended_tools=[
+                    ToolDirective(
+                        tool_name=tool_name,
+                        query=tool_query,
+                        reason="fan_out_tool_loop",
+                        priority=1,
+                        max_results=5,
+                        timeout=tool_timeout,
                     )
+                ],
+                decision_basis=["fan_out_tool_loop_integration"],
+            )
+            run_budget = max(tool_budget, 2)
+            exec_cfg = ExecutionConfig(
+                tool_timeout=tool_timeout,
+                min_budget_to_invoke_tools=1,
+            )
+            queued_tools, estimated_budget_cost = await asyncio.to_thread(
+                queue_tools, routing_decision, run_budget, exec_cfg,
+            )
+            if not queued_tools or estimated_budget_cost <= 0:
+                return [], [], ""
+
+            evidence_digest, _ = await asyncio.to_thread(
+                invoke_tools_and_digest,
+                queued_tools, perspective_name, run_budget,
+                evidence_confidence, exec_cfg, estimated_budget_cost,
+            )
+            tools_invoked = [tool["tool_name"] for tool in queued_tools]
+            if evidence_digest is None:
+                return tools_invoked, ["tool invocation failed"], ""
+
+            tool_errors = [
+                f"{entry.tool_name}:{entry.tool_status}"
+                for entry in evidence_digest.entries
+                if entry.tool_status != "success"
+            ]
+            return tools_invoked, tool_errors, (evidence_digest.formatted_summary or "")
+        except Exception as exc:
+            log.warning("Tool phase failed for %s (non-fatal): %s", perspective_name, exc)
+            return [], [f"tool_phase_error:{exc}"], ""
+
+    async def run_perspective(mandate: dict, slot: int) -> dict:
+        perspective_cfg = _cfg_pool[slot % len(_cfg_pool)]
+        name = mandate["name"]
+        mandate_text = f"[Perspective: {name.upper()}]\n{mandate['mandate']}"
+        cache_key = _perspective_cache_key(mandate_text, perspective_cfg)
+
+        cached = await asyncio.to_thread(store.get_perspective_cache, cache_key)
+        if cached and cached.get("final_answer"):
+            log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
+            if job_id:
+                await asyncio.to_thread(
+                    store.set_pass_cache,
+                    job_id, name, 1, cache_key,
+                    "perspective_cache_hit", "cached", "cached", "cached",
+                    cached["final_answer"],
                 )
-            except Exception as e:
-                error_msg = str(e) or type(e).__qualname__ or f"Exception: {repr(e)}"
-                _log_pass_exception(
-                    pass_num=pass_num,
-                    framing=mandate_name,
-                    tier="medium",
-                    provider=perspective_provider,
-                    model=perspective_model,
-                    error=error_msg,
-                    exception_type=type(e).__qualname__,
-                    task_class=task_class,
-                    provider_config=provider_config,
-                    perspective=mandate_name,
-                )
-                log.error(f"Perspective {mandate_name} pass {pass_num} failed: {error_msg}", exc_info=True)
-                pass_results.append(
-                    _build_pass_result(
-                        pass_num=pass_num,
-                        framing=mandate_name,
-                        tier="medium",
-                        provider=perspective_provider,
-                        model=perspective_model,
-                        error=error_msg,
-                    )
-                )
-        
-        # Synthesize perspective
-        outputs = _successful_outputs(pass_results)
-        perspective_synthesis = "\n\n".join(outputs)
-        return (
-            mandate_name,
-            {
-                "status": _result_status(pass_results),
-                "outputs": outputs,
-                "pass_results": pass_results,
-                "synthesis": perspective_synthesis,
-            },
+            return {
+                "name": name, "status": "complete",
+                "final_answer": cached["final_answer"],
+                "passes_run": cached["passes_run"],
+                "cache_hit": True,
+                "tools_invoked": [], "tool_errors": [], "evidence_summary": "",
+            }
+
+        async with sem:
+            log.debug("Fan-out perspective starting: %s (slot=%d provider=%s)",
+                      name, slot, perspective_cfg.provider)
+
+            perspective_pc = asdict(perspective_cfg)
+
+            r = await deep_think_passes(
+                question=question,
+                passes=height,
+                provider_config=perspective_pc,
+                task_class=resolved_class,
+                data_policy=data_policy,
+                mandate_prefix=mandate_text,
+                job_id=job_id,
+                perspective_name=name,
+                force_local_models=force_local_models,
+                device_id=device_id,
+            )
+
+        final_answer = r.get("final_answer", "") if isinstance(r, dict) else str(r)
+        passes_run = len(r.get("pass_results", [])) if isinstance(r, dict) else height
+
+        tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer)
+
+        perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
+        await asyncio.to_thread(
+            store.set_perspective_cache,
+            cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
         )
-    
-    # Run all perspectives concurrently
-    tasks = [run_perspective(name) for name in mandate_names]
-    results = await asyncio.gather(*tasks)
-    
-    for name, output in results:
-        perspective_outputs[name] = output
-    
-    # Synthesize across perspectives
-    perspective_texts = "\n\n---\n\n".join([
-        f"[{name}]\n{output['synthesis']}"
-        for name, output in perspective_outputs.items()
-        if output.get("synthesis")
-    ])
-
-    if not perspective_texts:
-        duration = time.time() - start_time
         return {
+            "name": name, "status": "complete",
+            "final_answer": final_answer, "passes_run": passes_run,
+            "cache_hit": False,
+            "tools_invoked": tools_invoked, "tool_errors": tool_errors,
+            "evidence_summary": evidence_summary,
+        }
+
+    # Run all perspectives
+    raw_results = await asyncio.gather(
+        *[run_perspective(m, slot=i) for i, m in enumerate(mandates)],
+        return_exceptions=True,
+    )
+
+    perspective_outputs: list = []
+    for mandate, result in zip(mandates, raw_results):
+        if isinstance(result, Exception):
+            log.error("Fan-out perspective %s failed: %s", mandate["name"], result)
+            perspective_outputs.append({
+                "name": mandate["name"], "status": "failed",
+                "error": str(result), "final_answer": None,
+                "tools_invoked": [], "tool_errors": [], "evidence_summary": "",
+            })
+        else:
+            perspective_outputs.append(result)
+
+    successes = [p for p in perspective_outputs if p["status"] == "complete" and p["final_answer"]]
+    if len(successes) < max(1, width // 2):
+        duration = time.time() - start_time
+        log.error(
+            "Fan-out failed: only %d/%d perspectives succeeded.",
+            len(successes), width,
+        )
+        return {
+            "type": "fan_out",
             "status": "failed",
-            "skill": task_class,
-            "task_class": base_task_class,
+            "task_class": resolved_class,
+            "skill": resolved_class,
+            "width": width,
+            "height": height,
+            "perspectives_attempted": width,
+            "perspectives_succeeded": len(successes),
             "final_answer": "",
-            "perspective_outputs": perspective_outputs,
-            "synthesis": "",
-            "synthesis_error": "No successful perspective outputs available for synthesis.",
+            "perspectives": [
+                {
+                    "name": p["name"], "status": p["status"],
+                    "final_answer": p.get("final_answer"),
+                    "error": p.get("error"),
+                }
+                for p in perspective_outputs
+            ],
+            "perspective_outputs": {p["name"]: {"synthesis": "", "status": p["status"]} for p in perspective_outputs},
             "confidence": 0.0,
             "duration_secs": duration,
         }
-    
-    synthesis_prompt = _FAN_OUT_SYNTHESIS_PROMPT.format(
-        question=question,
-        perspective_outputs=perspective_texts,
-    )
-    
-    try:
-        final_answer = await provider_module._call_provider(
-            provider=provider_module._tier_provider(cfg, "heavy"),
-            model=model or provider_module._model_for_tier(cfg, "heavy", task_class),
-            system="You are a synthesis expert. Integrate all perspectives into a coherent answer.",
-            user_prompt=synthesis_prompt,
-            tier="heavy",
-            provider_config=provider_config,
+
+    # LLM-based contradiction scan
+    alarm_signals = await _fan_out_alarm_scan(question, successes, cfg, resolved_class, _pc)
+
+    # Optional claim extraction before synthesis
+    claim_sets: list = []
+    if extract_claims and len(successes) >= 1:
+        extract_tasks = [
+            _fan_out_extract_claims(p["name"], p["final_answer"] or "", cfg, resolved_class, _pc)
+            for p in successes
+        ]
+        claim_sets = list(await asyncio.gather(*extract_tasks, return_exceptions=False))
+        claim_sets = [
+            cs if isinstance(cs, dict) else {"claims": [], "verdict": "", "key_uncertainties": []}
+            for cs in claim_sets
+        ]
+        log.info("Claim extraction: %d perspectives, total claims=%d",
+                 len(claim_sets), sum(len(cs.get("claims", [])) for cs in claim_sets))
+
+    # Build synthesis prompt
+    if extract_claims and claim_sets:
+        compact_parts = []
+        for p, cs in zip(successes, claim_sets):
+            claims_fmt = "\n".join(
+                f"  - [{(c.get('confidence') or 0):.0%}] {c.get('claim', '')} "
+                f"(basis: {c.get('evidence_basis', 'asserted') or 'asserted'})"
+                for c in cs.get("claims", [])
+            )
+            uncertainties_fmt = (
+                "\n".join(f"  ? {u}" for u in cs.get("key_uncertainties", []))
+                or "  (none flagged)"
+            )
+            compact_parts.append(
+                f"=== {p['name'].upper()} PERSPECTIVE ===\n"
+                f"VERDICT: {cs.get('verdict', '(none)')}\n"
+                f"CLAIMS:\n{claims_fmt or '  (no claims extracted)'}\n"
+                f"UNCERTAINTIES:\n{uncertainties_fmt}"
+            )
+        perspectives_text = "\n\n".join(compact_parts)
+    else:
+        perspectives_text = "\n\n".join(
+            f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+            for p in successes
         )
-        synthesis_error = None
-    except Exception as e:
-        error_msg = str(e) or type(e).__qualname__
-        log.error(f"Synthesis failed: {error_msg}")
-        final_answer = ""
-        synthesis_error = error_msg
-    
+
+    if alarm_signals:
+        alarm_preamble = (
+            "⚠️ CONTRADICTION ALERTS — the following factual conflicts were detected "
+            "between perspectives. Address each explicitly in your synthesis:\n"
+        )
+        for i, sig in enumerate(alarm_signals, 1):
+            alarm_preamble += (
+                f"\n{i}. CLAIM: {sig.get('claim', '?')}\n"
+                f"   {sig.get('perspective_a', '?')} says: {sig.get('says_a', '?')}\n"
+                f"   {sig.get('perspective_b', '?')} says: {sig.get('says_b', '?')}\n"
+            )
+        perspectives_text = alarm_preamble + "\n\n" + perspectives_text
+
+    synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
+        n=len(successes), question=question, perspectives=perspectives_text,
+    )
+
+    synthesis_cfg_pc = asdict(cfg)
+    synthesis_result = await deep_think_passes(
+        question=synthesis_question, passes=1,
+        provider_config=synthesis_cfg_pc,
+        task_class="synthesis",
+        data_policy=data_policy,
+    )
+
+    raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
+    synthesis_structured = _fan_out_parse_json(raw_answer)
+    if synthesis_structured:
+        synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+        log.debug("Fan-out synthesis parsed: confidence=%s contested=%d converged=%d",
+                  synthesis_structured.get("confidence_score"),
+                  len(synthesis_structured.get("contested_areas", [])),
+                  len(synthesis_structured.get("converged_claims", [])))
+    else:
+        log.warning("Fan-out: synthesis JSON parse failed — falling back to plain text")
+        synthesis_text = raw_answer
+
+    confidence_score = synthesis_structured.get("confidence_score") if synthesis_structured else None
+    converged_claims = synthesis_structured.get("converged_claims", []) if synthesis_structured else []
+    contested_areas = synthesis_structured.get("contested_areas", []) if synthesis_structured else []
+    gaps = synthesis_structured.get("gaps", []) if synthesis_structured else []
+
+    # Adaptive expansion
+    adaptive_triggered = False
+    adaptive_reason = ""
+    final_width = width
+
+    _all_mandates_raw = directives_module.PERSPECTIVE_MANDATES.get(resolved_class, directives_module.PERSPECTIVE_MANDATES["general"])
+    if isinstance(_all_mandates_raw, dict):
+        _all_mandates_raw = [{"name": k, "mandate": v} for k, v in _all_mandates_raw.items()]
+    all_mandates = _all_mandates_raw
+    unused_mandates = [m for m in all_mandates if m not in mandates]
+
+    should_expand = (
+        unused_mandates
+        and width < max_width
+        and (
+            (confidence_score is not None and confidence_score < confidence_threshold)
+            or len(contested_areas) > 2
+        )
+    )
+
+    if should_expand:
+        expansion_width = min(len(unused_mandates), max_width - width)
+        expansion_mandates = unused_mandates[:expansion_width]
+        log.info("Adaptive expansion: confidence=%s contested=%d — adding %d perspectives",
+                 confidence_score, len(contested_areas), expansion_width)
+        adaptive_triggered = True
+        adaptive_reason = (
+            f"confidence_score={confidence_score} < threshold={confidence_threshold}"
+            if confidence_score is not None and confidence_score < confidence_threshold
+            else f"contested_areas={len(contested_areas)} > 2"
+        )
+
+        expansion_start_slot = len(mandates)
+        extra_results = await asyncio.gather(
+            *[run_perspective(m, slot=expansion_start_slot + i)
+              for i, m in enumerate(expansion_mandates)],
+            return_exceptions=True,
+        )
+        extra_outputs = []
+        for mandate, result in zip(expansion_mandates, extra_results):
+            if isinstance(result, Exception):
+                log.error("Adaptive perspective %s failed: %s", mandate["name"], result)
+                extra_outputs.append({"name": mandate["name"], "status": "failed", "error": str(result), "final_answer": None})
+            else:
+                extra_outputs.append(result)
+
+        extra_successes = [p for p in extra_outputs if p["status"] == "complete" and p["final_answer"]]
+        all_successes = successes + extra_successes
+        perspective_outputs = perspective_outputs + extra_outputs
+        final_width = width + len(extra_outputs)
+
+        if extra_successes:
+            alarm_signals = await _fan_out_alarm_scan(question, all_successes, cfg, resolved_class, _pc)
+            perspectives_text = "\n\n".join(
+                f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
+                for p in all_successes
+            )
+            if alarm_signals:
+                alarm_preamble = "⚠️ CONTRADICTION ALERTS:\n"
+                for i, sig in enumerate(alarm_signals, 1):
+                    alarm_preamble += (
+                        f"{i}. {sig.get('claim','?')}: "
+                        f"{sig.get('perspective_a','?')} says '{sig.get('says_a','?')}' vs "
+                        f"{sig.get('perspective_b','?')} says '{sig.get('says_b','?')}'\n"
+                    )
+                perspectives_text = alarm_preamble + "\n\n" + perspectives_text
+
+            synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
+                n=len(all_successes), question=question, perspectives=perspectives_text,
+            )
+            synthesis_result = await deep_think_passes(
+                question=synthesis_question, passes=1,
+                provider_config=synthesis_cfg_pc,
+                task_class="synthesis", data_policy=data_policy,
+            )
+            raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
+            synthesis_structured = _fan_out_parse_json(raw_answer)
+            if synthesis_structured:
+                synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+                confidence_score = synthesis_structured.get("confidence_score")
+                converged_claims = synthesis_structured.get("converged_claims", [])
+                contested_areas = synthesis_structured.get("contested_areas", [])
+                gaps = synthesis_structured.get("gaps", [])
+            else:
+                synthesis_text = raw_answer
+
+    cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
+    tools_invoked_total = sum(len(p.get("tools_invoked", [])) for p in perspective_outputs)
+
+    # Grounding gate
+    inference_only, grounding_warnings = _validate_synthesis_grounding(
+        synthesis_text=synthesis_text,
+        tools_invoked_total=tools_invoked_total,
+        enable_tool_use=enable_tool_use,
+        task_class=resolved_class,
+    )
+    if grounding_warnings:
+        warning_block = "\n".join(f"⚠️  {w}" for w in grounding_warnings)
+        synthesis_text = f"{warning_block}\n\n{synthesis_text}"
+        log.warning("Fan-out grounding gate: inference_only=%s warnings=%s", inference_only, grounding_warnings)
+
     duration = time.time() - start_time
-    
+
     return {
-        "status": "complete" if final_answer else "partial",
-        "skill": task_class,
-        "task_class": base_task_class,
-        "final_answer": final_answer,
-        "perspective_outputs": perspective_outputs,
-        "synthesis": final_answer,
-        "synthesis_error": synthesis_error,
-        "confidence": 0.7,  # Placeholder
+        "type": "fan_out",
+        "status": "complete" if successes else "failed",
+        "task_class": resolved_class,
+        "skill": resolved_class,
+        "width": width,
+        "height": height,
+        "perspectives_attempted": width,
+        "perspectives_succeeded": len(successes),
+        "cache_hits": cache_hits,
+        "tools_invoked_total": tools_invoked_total,
+        "inference_only": inference_only,
+        "grounding_warnings": grounding_warnings,
+        "adaptive_triggered": adaptive_triggered,
+        "adaptive_reason": adaptive_reason,
+        "final_width": final_width,
+        "alarm_signals": alarm_signals,
+        "provider": pool_desc,
+        "confidence_score": confidence_score,
+        "converged_claims": converged_claims,
+        "contested_areas": contested_areas,
+        "gaps": gaps,
+        "perspectives": [
+            {
+                "name": p["name"],
+                "status": p["status"],
+                "final_answer": p.get("final_answer"),
+                "error": p.get("error"),
+                "cache_hit": p.get("cache_hit", False),
+                "tools_invoked": p.get("tools_invoked", []),
+                "tool_errors": p.get("tool_errors", []),
+                "evidence_summary": p.get("evidence_summary", ""),
+            }
+            for p in perspective_outputs
+        ],
+        "claim_sets": claim_sets if extract_claims else [],
+        "topology": topology,
+        "adaptive_config": adaptive_config or {},
+        "enable_tool_use": enable_tool_use,
+        "tool_evidence_weight": tool_evidence_weight,
+        "final_answer": synthesis_text,
+        "confidence": float(confidence_score) / 100.0 if confidence_score is not None else 0.7,
         "duration_secs": duration,
+        "perspective_outputs": {p["name"]: {"synthesis": p.get("final_answer", ""), "status": p["status"]} for p in perspective_outputs},
     }

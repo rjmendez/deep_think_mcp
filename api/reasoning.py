@@ -17,6 +17,7 @@ from ..engine import (
     CREATIVE_MODES,
     get_metrics_snapshot,
 )
+from ..defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
 from ..engine.directives import resolve_skill_selection
 from ..engine.validator import validate_passes, validate_width, validate_height, ValidationError
 
@@ -256,6 +257,20 @@ def register(mcp):
                         response["contested_areas"] = result["contested_areas"]
                     if result.get("claim_sets"):
                         response["claim_sets"] = result["claim_sets"]
+                    if result.get("inference_only") is not None:
+                        response["inference_only"] = result["inference_only"]
+                    if result.get("grounding_warnings") is not None:
+                        response["grounding_warnings"] = result["grounding_warnings"]
+                    if result.get("tools_invoked_total") is not None:
+                        response["tools_invoked_total"] = result["tools_invoked_total"]
+                    if result.get("topology") is not None:
+                        response["topology"] = result["topology"]
+                    if result.get("adaptive_config") is not None:
+                        response["adaptive_config"] = result["adaptive_config"]
+                    if result.get("enable_tool_use") is not None:
+                        response["enable_tool_use"] = result["enable_tool_use"]
+                    if result.get("tool_evidence_weight") is not None:
+                        response["tool_evidence_weight"] = result["tool_evidence_weight"]
                     response["adaptive_triggered"] = result.get("adaptive_triggered", False)
                     if result.get("adaptive_triggered"):
                         response["adaptive_reason"] = result.get("adaptive_reason", "")
@@ -341,6 +356,10 @@ def register(mcp):
         max_width: Optional[int] = None,
         confidence_threshold: Optional[int] = None,
         extract_claims: bool = False,
+        topology: str = "static",
+        adaptive_config: Optional[dict] = None,
+        enable_tool_use: bool = False,
+        tool_evidence_weight: float = DEFAULT_TOOL_EVIDENCE_WEIGHT,
         provider_config: Optional[ProviderConfigOverrides] = None,
     ) -> dict:
         """Queue a perspective fan-out reasoning job and return a job_id immediately.
@@ -391,6 +410,10 @@ def register(mcp):
                 medium_provider Per-tier provider override (e.g. "abliteration")
                 heavy_provider  Per-tier provider override (e.g. "anthropic")
                 temperature/top_p/top_k/max_tokens/seed/custom_params/options
+            topology:             "static" (default) or "adaptive" (enables tool use per perspective).
+            adaptive_config:      Tool loop configuration dict (max_tool_calls_global, max_tool_calls_per_perspective, tool_timeout).
+            enable_tool_use:      If True and topology=="adaptive" or task_class=="code_review", run tools per perspective.
+            tool_evidence_weight: Evidence weight for tool results (0.0-1.0, default 0.7).
 
         Total LLM calls = (width × height) + 1 synthesis pass (+ adaptive expansion if triggered).
         Example: width=3, height=2 → 7 total calls (6 perspective passes + 1 synthesis).
@@ -448,6 +471,10 @@ def register(mcp):
                 "max_width": max_width,
                 "confidence_threshold": confidence_threshold,
                 "extract_claims": extract_claims,
+                "topology": topology,
+                "adaptive_config": adaptive_config,
+                "enable_tool_use": enable_tool_use,
+                "tool_evidence_weight": tool_evidence_weight,
             }),
         )
         _worker.notify_job_available()
@@ -469,6 +496,10 @@ def register(mcp):
             "data_policy": data_policy,
             "provider": cfg.provider,
             "model_summary": summary,
+            "topology": topology,
+            "adaptive_enabled": topology == "adaptive",
+            "enable_tool_use": enable_tool_use,
+            "tool_evidence_weight": tool_evidence_weight,
             "message": f"Call get_thinking_result('{job_id}') to poll for results.",
         }
 

@@ -14,6 +14,8 @@ import json
 import logging
 import os
 
+from .defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
+
 # Load credentials from ~/.copilot/credentials at startup if not already in env
 def _load_credentials_at_startup():
     """Load credentials from file into environment variables at worker startup."""
@@ -110,17 +112,36 @@ async def _run_job(job: dict) -> None:
             if provider_config.pop("fan_out", False):
                 width = int(provider_config.pop("width", 3))
                 height = int(provider_config.pop("height", 2))
+                max_parallel = int(provider_config.pop("max_parallel", 2))
+                max_width = int(provider_config.pop("max_width", 6))
+                confidence_threshold = int(provider_config.pop("confidence_threshold", 50))
+                extract_claims = bool(provider_config.pop("extract_claims", False))
+                topology = provider_config.pop("topology", "static")
+                adaptive_config = provider_config.pop("adaptive_config", None)
+                enable_tool_use = bool(provider_config.pop("enable_tool_use", False))
+                tool_evidence_weight = float(
+                    provider_config.pop("tool_evidence_weight", DEFAULT_TOOL_EVIDENCE_WEIGHT)
+                )
+                cfg = engine.build_provider_config(provider_config)
                 r = await engine.run_fan_out(
                     question=job["question"],
                     width=width,
                     height=height,
-                    provider_config=provider_config,
+                    provider_cfg=cfg,
                     task_class=task_class,
                     data_policy=data_policy,
+                    max_parallel=max_parallel,
+                    job_id=job_id,
+                    max_width=max_width,
+                    confidence_threshold=confidence_threshold,
+                    extract_claims=extract_claims,
+                    topology=topology,
+                    adaptive_config=adaptive_config,
+                    enable_tool_use=enable_tool_use,
+                    tool_evidence_weight=tool_evidence_weight,
                     force_local_models=force_local_models,
                     device_id=device_id,
                 )
-                cfg = engine.build_provider_config(provider_config)
                 log.info(
                     "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
                     job_id, width, height, task_class, cfg.provider,
