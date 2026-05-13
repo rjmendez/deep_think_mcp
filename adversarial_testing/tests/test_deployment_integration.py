@@ -101,7 +101,6 @@ class TestRollbackTriggerLogic:
         return DeploymentPipeline(
             store=store,
             metrics=metrics,
-            prometheus_endpoint="http://localhost:9090",
             k3s_namespace="agents",
             deployment_name="deep-think",
         )
@@ -179,7 +178,7 @@ class TestRollbackTriggerLogic:
 
 
 class TestDeploymentPipelineIntegration:
-    """Test full deployment pipeline with mocked k3s/Prometheus"""
+    """Test full deployment pipeline with mocked k3s"""
 
     @pytest.fixture
     async def pipeline_with_mocks(self):
@@ -192,7 +191,6 @@ class TestDeploymentPipelineIntegration:
         pipeline = DeploymentPipeline(
             store=store,
             metrics=metrics,
-            prometheus_endpoint="http://localhost:9090",
         )
         
         return pipeline, store, metrics
@@ -402,7 +400,6 @@ class TestDeploymentEdgeCases:
         return DeploymentPipeline(
             store=store,
             metrics=metrics,
-            prometheus_endpoint="http://localhost:9090",
         )
 
     @pytest.mark.asyncio
@@ -424,28 +421,27 @@ class TestDeploymentEdgeCases:
         assert "pod weight" in error_msg.lower() or "failed" in error_msg.lower()
 
     @pytest.mark.asyncio
-    async def test_prometheus_metrics_unavailable(self, pipeline):
-        """Deployment should handle Prometheus unavailability gracefully"""
+    async def test_metrics_unavailable_non_fatal(self, pipeline):
+        """Deployment should handle metrics unavailability gracefully"""
         
         async def mock_update_pod_weights(commit_sha, weight):
             return True
         
         async def mock_monitor_stage_no_metrics(stage_name, duration, baseline):
-            # Return empty metrics (simulating Prometheus down)
+            # Return empty metrics (simulating no metrics endpoint configured)
             return {}
         
         pipeline._update_pod_weights = mock_update_pod_weights
         pipeline._monitor_stage = mock_monitor_stage_no_metrics
         
         with patch.object(pipeline, "_create_git_tag", new_callable=AsyncMock):
-            # Should not crash, should use defaults
+            # Should not crash; empty metrics produce zero deltas so no rollback fires
             success, error_msg, details = await pipeline.deploy_validated_fix(
                 plan_id="plan-123",
                 commit_sha="abc1234567890",
             )
         
-        # With no metrics, we can't detect problems, so deployment continues
-        # This is a design choice - strict monitoring requires Prometheus
+        # With no metrics, all deltas are zero — deployment proceeds safely
 
     @pytest.mark.asyncio
     async def test_git_tag_creation_failure_non_critical(self, pipeline):

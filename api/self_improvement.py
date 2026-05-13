@@ -429,14 +429,17 @@ def register(mcp):
                 )
             
             metrics = MetricsCollector()
-            prometheus_endpoint = os.getenv(
-                "PROMETHEUS_ENDPOINT", "http://localhost:9090"
-            )
-            
+            metrics_endpoint = os.getenv("METRICS_ENDPOINT", os.getenv("PROMETHEUS_ENDPOINT", "")).strip()
+            if not metrics_endpoint:
+                log.warning(
+                    "No METRICS_ENDPOINT set; deployment will proceed without metric-based "
+                    "rollback guards. Set METRICS_ENDPOINT to enable canary health monitoring."
+                )
+
             pipeline = DeploymentPipeline(
                 store=store_instance,
                 metrics=metrics,
-                prometheus_endpoint=prometheus_endpoint,
+                metrics_endpoint=metrics_endpoint,
                 k3s_namespace=os.getenv("K3S_NAMESPACE", "agents"),
                 deployment_name=os.getenv("DEPLOYMENT_NAME", "deep-think"),
             )

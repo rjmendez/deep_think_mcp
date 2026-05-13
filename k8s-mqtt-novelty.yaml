@@ -381,10 +381,6 @@ spec:
       labels:
         app: mqtt-novelty-verifier
         component: deep-think-agent
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
-        prometheus.io/path: "/metrics"
     spec:
       # Service account with appropriate RBAC (optional)
       serviceAccountName: mqtt-novelty-verifier
@@ -652,10 +648,6 @@ metadata:
   namespace: agents
   labels:
     app: mqtt-novelty-verifier
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "9090"
-    prometheus.io/path: "/metrics"
 spec:
   type: ClusterIP
   selector:

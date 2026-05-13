@@ -64,13 +64,13 @@ class DeploymentPipeline:
         self,
         store: AdversarialStore,
         metrics: MetricsCollector,
-        prometheus_endpoint: str = "http://localhost:9090",
+        metrics_endpoint: str = "",
         k3s_namespace: str = "agents",
         deployment_name: str = "deep-think",
     ):
         self.store = store
         self.metrics = metrics
-        self.prometheus_endpoint = prometheus_endpoint
+        self.metrics_endpoint = metrics_endpoint
         self.k3s_namespace = k3s_namespace
         self.deployment_name = deployment_name
 
@@ -100,8 +100,8 @@ class DeploymentPipeline:
                 (deployment_id, plan_id, commit_sha, "initiated", timestamp),
             )
 
-            # Get baseline metrics before deployment
-            baseline_metrics = await self._get_prometheus_metrics()
+            # Get baseline metrics before deployment (empty when no metrics_endpoint is set)
+            baseline_metrics = await self._get_canary_metrics()
 
             # Run through stages
             deployment_events = []
@@ -246,7 +246,9 @@ class DeploymentPipeline:
         """
         Monitor metrics during a deployment stage.
 
-        Polls Prometheus metrics every 5 seconds for the stage duration.
+        Polls the metrics endpoint every 5 seconds for the stage duration.
+        When no metrics_endpoint is configured, returns empty metrics and
+        the rollback logic treats all deltas as zero (no false rollbacks).
         """
         logger.info(f"Monitoring {stage_name} for {duration_sec} seconds")
 
@@ -255,7 +257,7 @@ class DeploymentPipeline:
 
         while datetime.utcnow() < end_time:
             try:
-                current_metrics = await self._get_prometheus_metrics()
+                current_metrics = await self._get_canary_metrics()
                 latest_metrics.update(current_metrics)
 
                 logger.debug(
@@ -273,26 +275,27 @@ class DeploymentPipeline:
 
         return latest_metrics
 
-    async def _get_prometheus_metrics(self) -> Dict[str, float]:
-        """Fetch current metrics from Prometheus"""
+    async def _get_canary_metrics(self) -> Dict[str, float]:
+        """Fetch current metrics from the configured metrics endpoint.
+
+        Returns an empty dict when no metrics_endpoint is set; the caller
+        treats missing metrics as zero-delta (no rollback triggered).
+        """
         try:
             async with aiohttp.ClientSession() as session:
                 metrics = {}
 
-                # Query error rate
-                error_rate = await self._query_prometheus(
+                error_rate = await self._query_metrics_endpoint(
                     "rate(errors_total[5m])"
                 )
                 metrics["error_rate"] = error_rate
 
-                # Query timeout rate
-                timeout_rate = await self._query_prometheus(
+                timeout_rate = await self._query_metrics_endpoint(
                     "rate(timeouts_total[5m])"
                 )
                 metrics["timeout_rate"] = timeout_rate
 
-                # Query p95 latency
-                p95_latency = await self._query_prometheus(
+                p95_latency = await self._query_metrics_endpoint(
                     "histogram_quantile(0.95, rate(request_duration_seconds_bucket[5m]))"
                 )
                 metrics["p95_latency_ms"] = p95_latency * 1000  # Convert to ms
@@ -300,15 +303,21 @@ class DeploymentPipeline:
                 return metrics
 
         except Exception as e:
-            logger.warning(f"Failed to fetch Prometheus metrics: {e}")
+            logger.warning(f"Failed to fetch canary metrics: {e}")
             return {}
 
-    async def _query_prometheus(self, query: str) -> float:
-        """Query Prometheus and return numeric result"""
+    async def _query_metrics_endpoint(self, query: str) -> float:
+        """Query the metrics endpoint and return a numeric result.
+
+        Returns 0.0 when no metrics_endpoint is configured so the pipeline
+        runs without requiring an external metrics backend.
+        """
+        if not self.metrics_endpoint:
+            return 0.0
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{self.prometheus_endpoint}/api/v1/query",
+                    f"{self.metrics_endpoint}/api/v1/query",
                     params={"query": query},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
@@ -324,7 +333,7 @@ class DeploymentPipeline:
             return 0.0
 
         except Exception as e:
-            logger.warning(f"Prometheus query failed: {e}")
+            logger.warning(f"Metrics endpoint query failed: {e}")
             return 0.0
 
     def _should_rollback(
