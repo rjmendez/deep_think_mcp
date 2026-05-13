@@ -4,10 +4,46 @@ Fetches and summarizes documents from web or file paths.
 """
 
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Tuple
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
+
+
+def _allowed_local_roots() -> list[Path]:
+    raw = os.getenv("DEEP_THINK_DOCUMENT_FETCH_ROOTS", "").strip()
+    if raw:
+        return [Path(p).expanduser().resolve() for p in raw.split(":") if p.strip()]
+    # Safe default: repository root (deep_think_mcp)
+    return [Path(__file__).resolve().parents[1]]
+
+
+def _is_allowed_local_path(path: Path, roots: list[Path]) -> bool:
+    path_resolved = path.expanduser().resolve()
+    for root in roots:
+        try:
+            path_resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _allowed_domains() -> list[str]:
+    raw = os.getenv("DEEP_THINK_DOCUMENT_FETCH_DOMAIN_WHITELIST", "").strip()
+    if not raw:
+        return []
+    return [d.strip().lower().lstrip("www.") for d in raw.split(",") if d.strip()]
+
+
+def _domain_allowed(url: str, allowed: list[str]) -> bool:
+    if not allowed:
+        return True
+    domain = urlparse(url).netloc.lower().lstrip("www.")
+    return any(domain == d or domain.endswith("." + d) for d in allowed)
 
 
 def invoke_document_fetch(url: str, timeout: int = 5) -> Tuple[str, float, str]:
@@ -33,8 +69,15 @@ def invoke_document_fetch(url: str, timeout: int = 5) -> Tuple[str, float, str]:
     try:
         # Try to fetch document
         if url.startswith("http://") or url.startswith("https://"):
+            allowed_domains = _allowed_domains()
+            if not _domain_allowed(url, allowed_domains):
+                return "", -0.05, "Domain blocked by document fetch policy"
             result = _fetch_web_document(url, timeout)
         else:
+            roots = _allowed_local_roots()
+            local_path = Path(url)
+            if not _is_allowed_local_path(local_path, roots):
+                return "", -0.05, "Local path blocked by document fetch policy"
             result = _fetch_local_document(url, timeout)
         
         elapsed_ms = int((time.time() - start_time) * 1000)

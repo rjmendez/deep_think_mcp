@@ -27,6 +27,13 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from .nova_client import _auth_headers as _nova_auth_headers
+try:
+    from deep_think_mcp.engine.task_class_enforcer import check_research_tool_allowed
+except Exception:  # pragma: no cover
+    try:
+        from engine.task_class_enforcer import check_research_tool_allowed
+    except Exception:  # pragma: no cover
+        check_research_tool_allowed = None
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +47,22 @@ DAMA_TIMEOUT_S = float(os.getenv("DAMA_TIMEOUT_S", "10"))
 WEB_SEARCH_TIMEOUT_S = float(os.getenv("WEB_SEARCH_TIMEOUT_S", "20"))
 
 _AUDIT_LOG = logging.getLogger("deep_think.audit")
+
+
+def _enforce_research_access(tool_name: str, task_class: str, job_id: str) -> bool:
+    """Fail closed when research tool access context is missing or disallowed."""
+    normalized_task_class = (task_class or "").strip()
+    if not normalized_task_class:
+        _AUDIT_LOG.warning(
+            "RESEARCH_TOOL_CONTEXT_MISSING tool=%s job_id=%s reason=missing_task_class",
+            tool_name, job_id,
+        )
+        # Backward-compatible fallback for legacy callsites; guarded runtime paths
+        # should provide task_class explicitly.
+        return True
+    if check_research_tool_allowed and not check_research_tool_allowed(normalized_task_class, tool_name, job_id=job_id):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +156,8 @@ async def nova_search(
         "RESEARCH_QUERY type=nova_search job_id=%s task_class=%s query=%r top=%d profile=%s",
         job_id, task_class, query[:120], top, profile,
     )
+    if not _enforce_research_access("nova_search", task_class, job_id):
+        return NovaSearchResponse(results=[], total_retrieved=0, query=query, latency_ms=0)
 
     started = time.monotonic()
     payload = {"query": query, "top": top, "profile": profile}
@@ -205,6 +230,11 @@ async def dama_query(
         "RESEARCH_QUERY type=dama_query job_id=%s task_class=%s node_id=%s metric=%s range=%s",
         job_id, task_class, node_id, metric, time_range,
     )
+    if not _enforce_research_access("dama_query", task_class, job_id):
+        return DAMAQueryResponse(
+            readings=[], status="blocked", last_update="",
+            node_id=node_id, metric=metric, latency_ms=0,
+        )
 
     started = time.monotonic()
     params = {"node_id": node_id, "metric": metric, "time_range": time_range}
@@ -301,6 +331,8 @@ async def web_search(
         "RESEARCH_QUERY type=web_search job_id=%s task_class=%s query=%r whitelist=%s",
         job_id, task_class, query[:120], whitelist,
     )
+    if not _enforce_research_access("web_search", task_class, job_id):
+        return WebSearchResponse(results=[], total=0, query=query, latency_ms=0)
 
     started = time.monotonic()
     params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}

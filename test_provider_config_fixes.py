@@ -338,6 +338,28 @@ class TestTemperatureKnobPropagation:
             assert payload["options"]["num_predict"] == 321
             assert result == "test"
 
+    @pytest.mark.asyncio
+    async def test_call_provider_blocks_ollama_when_data_policy_cloud(self):
+        with pytest.raises(provider_module.SecurityError, match="data_policy=cloud"):
+            await provider_module._call_provider(
+                provider="ollama",
+                model="llama3",
+                system="system",
+                user_prompt="prompt",
+                provider_config={"data_policy": "cloud", "base_url": "http://localhost:11434"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_call_provider_blocks_cloud_when_data_policy_local(self):
+        with pytest.raises(provider_module.SecurityError, match="data_policy=local"):
+            await provider_module._call_provider(
+                provider="anthropic",
+                model="claude-sonnet-4-6",
+                system="system",
+                user_prompt="prompt",
+                provider_config={"data_policy": "local", "anthropic_api_key": "sk-ant-test"},
+            )
+
 
 class TestAnthropicOfficialDefaults:
     """Guard against reintroducing date-coded Anthropic defaults."""

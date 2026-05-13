@@ -268,7 +268,7 @@ class ToolRegistry:
                         }
                     }
                 },
-                requires_auth=True,
+                requires_auth=False,
                 timeout_seconds=DEFAULT_CODE_SEARCH_TIMEOUT_SECS,
                 cost_estimate=1.5,
                 examples=[
@@ -284,7 +284,7 @@ class ToolRegistry:
                         ]
                     }
                 ],
-                safety_notes="Requires GitHub authentication token. Respects GitHub API rate limits (60 req/min for authenticated)."
+                safety_notes="Searches local repository context in this runtime. No external API auth required."
             )
         )
         

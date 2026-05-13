@@ -663,6 +663,15 @@ async def _call_provider(
 ) -> str:
     """Route to appropriate provider call."""
     provider_config = provider_config or {}
+    policy = _normalize_data_policy(provider_config.get("data_policy"))
+    if policy == "local" and provider != "ollama":
+        raise SecurityError(
+            f"data_policy=local blocks provider '{provider}'. Use ollama-only routing."
+        )
+    if policy == "cloud" and provider == "ollama":
+        raise SecurityError(
+            "data_policy=cloud blocks provider 'ollama'. Use a cloud provider."
+        )
     custom_params = _custom_params_from_provider_config(provider, provider_config)
     
     if provider == "anthropic":
@@ -762,7 +771,12 @@ def _classifier_model_for_provider(provider: str) -> str:
     return _default_for_provider(provider, "light")
 
 
-async def classify_task(question: str, override: Optional[str] = None, provider: str = "") -> str:
+async def classify_task(
+    question: str,
+    override: Optional[str] = None,
+    provider: str = "",
+    data_policy: str = "any",
+) -> str:
     """Auto-classify task to a task class.
     
     If override is provided and is a valid task class, return it without calling LLM.
@@ -780,8 +794,16 @@ async def classify_task(question: str, override: Optional[str] = None, provider:
             return override
         log.warning(f"Override task class '{override}' not recognized; auto-classifying instead")
     
-    # Try requested provider first; implicit fallback never defaults to Copilot.
-    providers_to_try = [provider] if provider else ["anthropic", "ollama"]
+    # Try requested provider first; implicit fallback respects effective data policy.
+    policy = _normalize_data_policy(data_policy)
+    if provider:
+        providers_to_try = [provider]
+    elif policy == "local":
+        providers_to_try = ["ollama"]
+    elif policy == "cloud":
+        providers_to_try = ["anthropic"]
+    else:
+        providers_to_try = ["anthropic", "ollama"]
     
     for prov in providers_to_try:
         if not prov:
@@ -896,6 +918,17 @@ def _read_copilot_token() -> str:
 
 
 _CLOUD_ONLY_PROVIDERS = {"anthropic", "copilot", "azure", "openai", "abliteration"}
+_VALID_DATA_POLICIES = {"any", "local", "cloud"}
+
+
+def _normalize_data_policy(value: Any) -> str:
+    """Normalize data policy to one of {any, local, cloud}."""
+    if value is None:
+        return "any"
+    normalized = str(value).strip().lower()
+    if normalized in _VALID_DATA_POLICIES:
+        return normalized
+    return "any"
 
 
 def _tier_provider(cfg: ProviderConfig, tier: str) -> str:
@@ -1072,7 +1105,7 @@ def _discovered_tier_model(provider: str, tier: str) -> str:
 def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
     """Build a ProviderConfig by merging env defaults with per-call overrides."""
     ov = overrides or {}
-    data_policy = ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any"))
+    data_policy = _normalize_data_policy(ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any")))
     
     # Determine default provider based on data_policy if not explicitly set
     default_provider = ov.get("provider", "")

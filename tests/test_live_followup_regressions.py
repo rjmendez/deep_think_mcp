@@ -310,3 +310,165 @@ async def test_worker_honors_job_timeout_from_record(monkeypatch):
     await worker._run_job(job)
 
     assert captured_timeouts[0] == 777
+
+
+@pytest.mark.asyncio
+async def test_deep_think_async_code_review_auto_enables_grounded_fanout(monkeypatch):
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_async = fake_mcp.tools["deep_think_async"]
+
+    captured: dict[str, object] = {}
+
+    def fake_create_job(**kwargs):
+        captured.update(kwargs)
+        return "job-grounded-async"
+
+    monkeypatch.setattr(reasoning_api.store, "create_job", fake_create_job)
+    monkeypatch.setattr(reasoning_api, "build_provider_config", lambda _pc: SimpleNamespace(provider="anthropic"))
+    monkeypatch.setattr(reasoning_api, "model_summary", lambda _cfg, _cls: "summary")
+    monkeypatch.setattr(
+        reasoning_api,
+        "resolve_skill_selection",
+        lambda _requested: ("code_review", {"task_class": "code_review", "version": 1}),
+    )
+
+    result = await deep_think_async(question="review deep_think_mcp", task_class="code_review")
+
+    provider_config = json.loads(captured["provider_config_json"])
+    assert result["status"] == "queued"
+    assert result["auto_grounded"] is True
+    assert provider_config["fan_out"] is True
+    assert provider_config["width"] == 3
+    assert provider_config["height"] == 2
+    assert provider_config["topology"] == "adaptive"
+    assert provider_config["enable_tool_use"] is True
+    assert provider_config["extract_claims"] is True
+
+
+@pytest.mark.asyncio
+async def test_deep_think_fan_out_code_review_forces_grounded_defaults(monkeypatch):
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_fan_out = fake_mcp.tools["deep_think_fan_out"]
+
+    captured: dict[str, object] = {}
+
+    def fake_create_job(**kwargs):
+        captured.update(kwargs)
+        return "job-grounded-fanout"
+
+    monkeypatch.setattr(reasoning_api.store, "create_job", fake_create_job)
+    monkeypatch.setattr(reasoning_api, "build_provider_config", lambda _pc: SimpleNamespace(provider="anthropic"))
+    monkeypatch.setattr(reasoning_api, "model_summary", lambda _cfg, _cls: "summary")
+    monkeypatch.setattr(
+        reasoning_api,
+        "resolve_skill_selection",
+        lambda _requested: ("code_review", {"task_class": "code_review", "version": 1}),
+    )
+
+    result = await deep_think_fan_out(
+        question="review deep_think_mcp",
+        task_class="code_review",
+        topology="static",
+        enable_tool_use=False,
+        extract_claims=False,
+    )
+
+    provider_config = json.loads(captured["provider_config_json"])
+    assert result["status"] == "queued"
+    assert result["auto_grounded"] is True
+    assert provider_config["topology"] == "adaptive"
+    assert provider_config["enable_tool_use"] is True
+    assert provider_config["extract_claims"] is True
+    assert isinstance(provider_config["adaptive_config"], dict)
+
+
+@pytest.mark.asyncio
+async def test_deep_think_creative_blocks_when_runtime_stale(monkeypatch):
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_creative = fake_mcp.tools["deep_think_creative"]
+
+    monkeypatch.setattr(
+        reasoning_api.runtime_guard,
+        "stale_runtime_error",
+        lambda: {
+            "status": "failed",
+            "error": "RUNTIME_STALE",
+            "restart_required": True,
+        },
+    )
+
+    result = await deep_think_creative(question="creative stale check")
+    assert result["status"] == "failed"
+    assert result["error"] == "RUNTIME_STALE"
+    assert result["restart_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_deep_think_async_auto_classify_respects_local_policy(monkeypatch):
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_async = fake_mcp.tools["deep_think_async"]
+
+    captured_provider: dict[str, str] = {}
+
+    async def fake_classify_task(_question, provider="", **_kwargs):
+        captured_provider["provider"] = provider
+        return "general"
+
+    monkeypatch.setattr(reasoning_api, "classify_task", fake_classify_task)
+    monkeypatch.setattr(reasoning_api.store, "create_job", lambda **_kwargs: "job-local-policy")
+    monkeypatch.setattr(reasoning_api, "build_provider_config", lambda _pc: SimpleNamespace(provider="ollama"))
+    monkeypatch.setattr(reasoning_api, "model_summary", lambda _cfg, _cls: "summary")
+
+    result = await deep_think_async(
+        question="classify this",
+        task_class="auto",
+        data_policy="local",
+    )
+    assert result["status"] == "queued"
+    assert captured_provider["provider"] == "ollama"
+
+
+@pytest.mark.asyncio
+async def test_worker_passes_web_whitelist_into_fanout(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def fake_run_fan_out(**kwargs):
+        captured.update(kwargs)
+        return {"status": "complete", "type": "fan_out", "final_answer": "ok", "perspective_outputs": []}
+
+    async def fake_pipeline_run(result, job_id=""):
+        return result
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(worker.engine, "run_fan_out", fake_run_fan_out)
+    monkeypatch.setattr(worker.engine, "build_provider_config", lambda cfg: SimpleNamespace(provider=cfg.get("provider", "")))
+    monkeypatch.setattr(worker, "_verification_pipeline", SimpleNamespace(run=fake_pipeline_run))
+    monkeypatch.setattr(worker.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(worker.store, "complete_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.store, "fail_job", lambda *_args, **_kwargs: None)
+
+    job = {
+        "job_id": "job-fanout-whitelist",
+        "question": "review",
+        "passes": 4,
+        "provider_config_json": json.dumps(
+            {
+                "provider": "anthropic",
+                "data_policy": "cloud",
+                "task_class": "general",
+                "fan_out": True,
+                "width": 2,
+                "height": 1,
+                "web_domain_whitelist": ["python.org", "docs.python.org"],
+            }
+        ),
+    }
+
+    await worker._run_job(job)
+    assert captured["web_domain_whitelist"] == ["python.org", "docs.python.org"]

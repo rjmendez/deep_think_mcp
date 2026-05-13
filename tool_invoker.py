@@ -11,7 +11,8 @@ Orchestrates tool directive execution with:
 import asyncio
 import logging
 import time
-from typing import List, Dict, Tuple, Optional
+import os
+from typing import List, Dict, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 try:
@@ -35,14 +36,36 @@ log = logging.getLogger(__name__)
 class ToolInvoker:
     """Executes ToolDirective batches with safety constraints."""
     
-    def __init__(self, config: Optional[ToolInvocationConfig] = None):
+    def __init__(
+        self,
+        config: Optional[ToolInvocationConfig] = None,
+        task_class: str = "",
+        job_id: str = "",
+        web_domain_whitelist: Optional[list[str]] = None,
+    ):
         """Initialize tool invoker with configuration.
         
         Args:
             config: ToolInvocationConfig with safety constraints
         """
         self.config = config or ToolInvocationConfig()
+        self.task_class = task_class
+        self.job_id = job_id
+        self.web_domain_whitelist = web_domain_whitelist or []
         self.executor = ThreadPoolExecutor(max_workers=5)
+        self._tool_registry = None
+        try:
+            from .tool_discovery import get_tool_registry
+        except ImportError:  # pragma: no cover
+            try:
+                from tool_discovery import get_tool_registry
+            except ImportError:
+                get_tool_registry = None
+        if get_tool_registry:
+            try:
+                self._tool_registry = get_tool_registry()
+            except Exception:
+                self._tool_registry = None
     
     def invoke_tools(
         self,
@@ -204,6 +227,7 @@ class ToolInvoker:
                 results.append(result)
                 log.debug(f"Tool {directive.tool_name} completed: {result.tool_status}")
             except FutureTimeoutError:
+                future.cancel()
                 log.warning(f"Tool {directive.tool_name} timed out in parallel batch")
                 results.append(ToolResult(
                     tool_name=directive.tool_name,
@@ -245,13 +269,33 @@ class ToolInvoker:
         start_time = time.time()
         
         try:
+            # Guardrail: enforce tool registry + auth requirements before invocation.
+            known_tools = {"web_search", "code_search", "nova_verify", "document_fetch"}
+            guard_error = self._validate_tool_guardrails(directive) if directive.tool_name in known_tools else ""
+            if guard_error:
+                return ToolResult(
+                    tool_name=directive.tool_name,
+                    query=directive.query,
+                    results="",
+                    tool_status="error",
+                    timing_ms=0,
+                    confidence_impact=-0.05,
+                    error_message=guard_error,
+                )
+
             # Route to appropriate tool wrapper
             if directive.tool_name == "web_search":
                 try:
                     from .tools.web_search import invoke_web_search
                 except ImportError:  # pragma: no cover - support direct module imports in tests
                     from tools.web_search import invoke_web_search
-                results, impact, error = invoke_web_search(directive.query, timeout)
+                results, impact, error = invoke_web_search(
+                    directive.query,
+                    timeout,
+                    job_id=self.job_id,
+                    task_class=self.task_class,
+                    domain_whitelist=self.web_domain_whitelist,
+                )
             elif directive.tool_name == "code_search":
                 try:
                     from .tools.code_search import invoke_code_search
@@ -325,6 +369,47 @@ class ToolInvoker:
                 confidence_impact=-0.05,
                 error_message=str(e),
             )
+
+    def _validate_tool_guardrails(self, directive: ToolDirective) -> str:
+        """Validate tool directives against registry/auth guardrails."""
+        if self._tool_registry is None:
+            return ""
+
+        # Legacy tool currently executed by invoker but not yet modeled in ToolRegistry.
+        if directive.tool_name == "nova_verify":
+            return ""
+
+        if not self._tool_registry.has_tool(directive.tool_name):
+            return f"Tool '{directive.tool_name}' is not registered"
+
+        schema = self._tool_registry.get_tool_schema(directive.tool_name)
+        if schema and schema.requires_auth and not self._has_auth_for_tool(directive.tool_name):
+            return f"Tool '{directive.tool_name}' requires authentication"
+
+        args: dict[str, Any]
+        if directive.tool_name == "document_fetch":
+            args = {"url": directive.query}
+        else:
+            args = {"query": directive.query}
+
+        try:
+            from .tool_discovery import ToolDirective as RegistryToolDirective
+        except ImportError:  # pragma: no cover
+            from tool_discovery import ToolDirective as RegistryToolDirective
+        is_valid, error = self._tool_registry.validate_tool_directive(
+            RegistryToolDirective(tool_name=directive.tool_name, arguments=args)
+        )
+        if not is_valid:
+            return error or "Invalid tool directive"
+        return ""
+
+    def _has_auth_for_tool(self, tool_name: str) -> bool:
+        """Check whether auth prerequisites for a tool are present."""
+        if tool_name == "code_search":
+            return bool(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"))
+        if tool_name == "nova_search":
+            return bool(os.getenv("NOVA_TOKEN"))
+        return True
     
     def close(self):
         """Clean up thread pool executor."""

@@ -8,9 +8,10 @@ from deep_think_mcp.api import reasoning as reasoning_api
 from deep_think_mcp.engine import orchestrator
 from deep_think_mcp import discover
 from nova_factcheck import research_tools
-from tools.code_search import invoke_code_search
+from tools.code_search import invoke_code_search, _search_local_repo
 from tools.web_search import invoke_web_search
 from tools.nova_verify import invoke_nova_verify
+from tools.document_fetch import invoke_document_fetch
 
 
 def test_reasoning_tool_schema_exposes_provider_config_fields():
@@ -78,6 +79,36 @@ def test_local_code_search_no_match_is_success(monkeypatch):
     assert "No code matches found" in results
     assert impact == 0.0
     assert error == ""
+
+
+def test_local_code_search_uses_perspective_specific_terms():
+    base = (
+        "Perform a deep whole-repository review for correctness security reliability "
+        "of /home/USER/development/deep_think_mcp."
+    )
+    query_a = (
+        f"{base} Focus on sql injection in api/reasoning.py and data_policy precedence in provider."
+    )
+    query_b = (
+        f"{base} Focus on timeout cancellation in tool_invoker and race handling in worker."
+    )
+
+    result_a = _search_local_repo(query_a, timeout=5)["results"]
+    result_b = _search_local_repo(query_b, timeout=5)["results"]
+    paths_a = {item["path"] for item in result_a}
+    paths_b = {item["path"] for item in result_b}
+
+    assert result_a and result_b
+    assert paths_a != paths_b
+
+
+def test_build_tool_query_prioritizes_perspective_context():
+    query = orchestrator._build_tool_query(
+        question="Base question about policy enforcement.",
+        perspective_answer="Perspective-specific evidence about timeout handling.",
+    )
+    assert query.startswith("Perspective-specific evidence")
+    assert "Base question about policy enforcement." in query
 
 
 def test_web_search_wrapper_uses_real_research_provider(monkeypatch):
@@ -155,3 +186,22 @@ def test_nova_verify_wrapper_surfaces_error_state(monkeypatch):
     assert "ERROR" in results
     assert impact < 0
     assert "auth_failed" in error
+
+
+def test_document_fetch_blocks_local_path_outside_allowlist(monkeypatch, tmp_path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    blocked_file = tmp_path / "blocked.txt"
+    blocked_file.write_text("secret", encoding="utf-8")
+    monkeypatch.setenv("DEEP_THINK_DOCUMENT_FETCH_ROOTS", str(allowed))
+
+    _results, impact, error = invoke_document_fetch(str(blocked_file), timeout=5)
+    assert impact < 0
+    assert "blocked by document fetch policy" in error
+
+
+def test_document_fetch_blocks_domain_not_in_whitelist(monkeypatch):
+    monkeypatch.setenv("DEEP_THINK_DOCUMENT_FETCH_DOMAIN_WHITELIST", "python.org,docs.python.org")
+    _results, impact, error = invoke_document_fetch("https://example.com", timeout=5)
+    assert impact < 0
+    assert "Domain blocked by document fetch policy" in error

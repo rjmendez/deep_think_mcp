@@ -322,6 +322,9 @@ def invoke_tools_and_digest(
     evidence_cache: Optional[EvidenceCache] = None,
     tool_invoker=None,
     evidence_manager=None,
+    task_class: str = "",
+    job_id: str = "",
+    web_domain_whitelist: Optional[List[str]] = None,
 ) -> Tuple[Optional[EvidenceDigest], int]:
     """
     Phase 4 ACT: Invoke tools and process results into evidence.
@@ -380,7 +383,10 @@ def invoke_tools_and_digest(
                         config=InvokerConfig(
                             min_budget_remaining=1,
                             tool_timeout_seconds=config.tool_timeout,
-                        )
+                        ),
+                        task_class=task_class,
+                        job_id=job_id,
+                        web_domain_whitelist=web_domain_whitelist or [],
                     )
             else:
                 try:
@@ -391,7 +397,10 @@ def invoke_tools_and_digest(
                     config=InvokerConfig(
                         min_budget_remaining=1,
                         tool_timeout_seconds=config.tool_timeout,
-                    )
+                    ),
+                    task_class=task_class,
+                    job_id=job_id,
+                    web_domain_whitelist=web_domain_whitelist or [],
                 )
 
         if evidence_manager is None:

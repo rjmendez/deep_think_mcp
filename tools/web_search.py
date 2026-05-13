@@ -6,12 +6,18 @@ Wraps the grounded web search provider and formats results for reasoning context
 import asyncio
 import logging
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
 
 
-def invoke_web_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
+def invoke_web_search(
+    query: str,
+    timeout: int = 10,
+    job_id: str = "",
+    task_class: str = "",
+    domain_whitelist: Optional[list[str]] = None,
+) -> Tuple[str, float, str]:
     """Invoke the grounded web search provider with timeout.
     
     Args:
@@ -32,10 +38,24 @@ def invoke_web_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
         from nova_factcheck.research_tools import web_search as research_web_search
 
         async def _run() -> object:
-            return await asyncio.wait_for(
-                research_web_search(query, job_id="", task_class=""),
-                timeout=timeout,
-            )
+            try:
+                return await asyncio.wait_for(
+                    research_web_search(
+                        query,
+                        domain_whitelist=domain_whitelist or [],
+                        job_id=job_id,
+                        task_class=task_class,
+                    ),
+                    timeout=timeout,
+                )
+            except TypeError as exc:
+                # Backward compatibility for monkeypatched stubs that only accept query/job_id/task_class.
+                if "domain_whitelist" not in str(exc):
+                    raise
+                return await asyncio.wait_for(
+                    research_web_search(query, job_id=job_id, task_class=task_class),
+                    timeout=timeout,
+                )
 
         result = asyncio.run(_run())
         

@@ -24,6 +24,27 @@ from ..engine.validator import validate_passes, validate_width, validate_height,
 
 log = logging.getLogger(__name__)
 
+_VALID_DATA_POLICIES = {"any", "local", "cloud"}
+
+
+def _normalize_data_policy(value: Optional[str]) -> str:
+    """Normalize incoming data policy values to known-safe options."""
+    if value is None:
+        return "any"
+    normalized = str(value).strip().lower()
+    if normalized in _VALID_DATA_POLICIES:
+        return normalized
+    return "any"
+
+
+def _classification_provider_for_policy(policy: str, cfg_provider: str) -> str:
+    """Pick a classifier provider that respects the effective data policy."""
+    if policy == "local":
+        return "ollama"
+    if policy == "cloud":
+        return cfg_provider if cfg_provider and cfg_provider != "ollama" else "anthropic"
+    return cfg_provider or ""
+
 
 def _estimate_fan_out_timeout_secs(
     *,
@@ -186,10 +207,47 @@ def register(mcp):
         pc: dict = dict(provider_config or {})
         if model:
             pc.setdefault("model", model)
-        if data_policy and data_policy != "any":
-            pc["data_policy"] = data_policy
+        effective_data_policy = _normalize_data_policy(data_policy or pc.get("data_policy"))
+        pc["data_policy"] = effective_data_policy
 
+        cfg = build_provider_config(pc)
+        classifier_provider = _classification_provider_for_policy(effective_data_policy, cfg.provider)
+        requested_selection = skill or task_class
+        if not skill and task_class == "auto":
+            requested_selection = await classify_task(question, provider=classifier_provider)
+
+        selected_skill, skill_profile = resolve_skill_selection(requested_selection)
+        resolved_class = skill_profile.get("task_class", selected_skill)
+        summary = model_summary(cfg, selected_skill)
+
+        # Grounding guardrail: code_review should run through fan-out + tool loop by default.
+        auto_grounded = False
         fan_out_enabled = width > 1
+        fan_out_topology = "static"
+        fan_out_enable_tool_use = False
+        fan_out_tool_evidence_weight = DEFAULT_TOOL_EVIDENCE_WEIGHT
+        fan_out_adaptive_config = None
+        if resolved_class == "code_review":
+            if not enable_research:
+                return {
+                    "status": "validation_error",
+                    "error": "code_review requires enable_research=True to keep grounded evidence enabled",
+                }
+            if not fan_out_enabled:
+                width = 3
+                height = max(height, 2)
+                fan_out_enabled = True
+                auto_grounded = True
+            fan_out_topology = "adaptive"
+            fan_out_enable_tool_use = True
+            extract_claims = True
+            if fan_out_adaptive_config is None:
+                fan_out_adaptive_config = {
+                    "max_tool_calls_global": 20,
+                    "max_tool_calls_per_perspective": 5,
+                    "tool_timeout": 30,
+                }
+
         fan_out_timeout_secs = None
         if fan_out_enabled:
             total_passes = width * height + 1
@@ -198,19 +256,13 @@ def register(mcp):
                 height=height,
                 max_parallel=2,
                 max_width=6,
-                task_class=task_class or "general",
+                task_class=resolved_class,
+                topology=fan_out_topology,
+                adaptive_config=fan_out_adaptive_config,
+                enable_tool_use=fan_out_enable_tool_use,
             )
         else:
             total_passes = max(2, min(passes, 6))
-
-        requested_selection = skill or task_class
-        if not skill and task_class == "auto":
-            requested_selection = await classify_task(question, provider=pc.get("provider", ""))
-
-        cfg = build_provider_config(pc)
-        selected_skill, skill_profile = resolve_skill_selection(requested_selection)
-        resolved_class = skill_profile.get("task_class", selected_skill)
-        summary = model_summary(cfg, selected_skill)
 
         job_id = store.create_job(
             question=question,
@@ -223,7 +275,7 @@ def register(mcp):
                 "skill": selected_skill,
                 "base_task_class": resolved_class,
                 "skill_version": skill_profile.get("version", 1),
-                "data_policy": data_policy,
+                "data_policy": effective_data_policy,
                 "verify": verify,
                 "enable_research": enable_research,
                 "research_query": research_query,
@@ -234,6 +286,11 @@ def register(mcp):
                 "width": width if fan_out_enabled else 1,
                 "height": height if fan_out_enabled else 1,
                 "extract_claims": extract_claims,
+                "topology": fan_out_topology,
+                "adaptive_config": fan_out_adaptive_config,
+                "enable_tool_use": fan_out_enable_tool_use,
+                "tool_evidence_weight": fan_out_tool_evidence_weight,
+                "auto_grounded": auto_grounded,
             }),
             timeout_secs=fan_out_timeout_secs or 300,
         )
@@ -245,16 +302,19 @@ def register(mcp):
             "task_class": resolved_class,
             "skill": selected_skill,
             "skill_version": skill_profile.get("version", 1),
-            "data_policy": data_policy,
+            "data_policy": effective_data_policy,
             "provider": cfg.provider,
             "model_summary": summary,
             "research_enabled": enable_research and not skill_profile.get("block_research_tools", False),
+            "auto_grounded": auto_grounded,
         }
         
         if fan_out_enabled:
             response["fan_out"] = True
             response["width"] = width
             response["height"] = height
+            response["topology"] = fan_out_topology
+            response["enable_tool_use"] = fan_out_enable_tool_use
             response["message"] = f"Fan-out job with {width} perspectives × {height} passes. Call get_thinking_result('{job_id}') to poll."
         else:
             response["message"] = f"Call get_thinking_result('{job_id}') to poll for results."
@@ -447,6 +507,7 @@ def register(mcp):
         enable_tool_use: bool = False,
         tool_evidence_weight: float = DEFAULT_TOOL_EVIDENCE_WEIGHT,
         provider_config: Optional[ProviderConfigOverrides] = None,
+        web_domain_whitelist: Optional[list] = None,
     ) -> dict:
         """Queue a perspective fan-out reasoning job and return a job_id immediately.
 
@@ -512,7 +573,7 @@ def register(mcp):
         width = width if width is not None else 3
         height = height if height is not None else 2
         task_class = task_class if task_class is not None else "general"
-        data_policy = data_policy if data_policy is not None else "any"
+        data_policy = _normalize_data_policy(data_policy)
         
         # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
         try:
@@ -526,17 +587,36 @@ def register(mcp):
         confidence_threshold = confidence_threshold if confidence_threshold is not None else 50
         
         pc: dict = dict(provider_config or {})
-        if data_policy and data_policy != "any":
-            pc["data_policy"] = data_policy
-
-        requested_selection = skill or task_class
-        if not skill and task_class == "auto":
-            requested_selection = await classify_task(question, provider=pc.get("provider", ""))
+        pc["data_policy"] = data_policy
 
         cfg = build_provider_config(pc)
+        classifier_provider = _classification_provider_for_policy(data_policy, cfg.provider)
+        requested_selection = skill or task_class
+        if not skill and task_class == "auto":
+            requested_selection = await classify_task(question, provider=classifier_provider)
+
         selected_skill, skill_profile = resolve_skill_selection(requested_selection)
         resolved_class = skill_profile.get("task_class", selected_skill)
         summary = model_summary(cfg, selected_skill)
+
+        auto_grounded = False
+        if resolved_class == "code_review":
+            if not enable_tool_use:
+                enable_tool_use = True
+                auto_grounded = True
+            if topology != "adaptive":
+                topology = "adaptive"
+                auto_grounded = True
+            if not extract_claims:
+                extract_claims = True
+                auto_grounded = True
+            if adaptive_config is None:
+                adaptive_config = {
+                    "max_tool_calls_global": 20,
+                    "max_tool_calls_per_perspective": 5,
+                    "tool_timeout": 30,
+                }
+                auto_grounded = True
 
         width = max(1, min(width, 6))
         height = max(1, min(height, 5))
@@ -565,6 +645,8 @@ def register(mcp):
                 "adaptive_config": adaptive_config,
                 "enable_tool_use": enable_tool_use,
                 "tool_evidence_weight": tool_evidence_weight,
+                "auto_grounded": auto_grounded,
+                "web_domain_whitelist": web_domain_whitelist or [],
             }),
             timeout_secs=_estimate_fan_out_timeout_secs(
                 width=width,
@@ -600,6 +682,7 @@ def register(mcp):
             "adaptive_enabled": topology == "adaptive",
             "enable_tool_use": enable_tool_use,
             "tool_evidence_weight": tool_evidence_weight,
+            "auto_grounded": auto_grounded,
             "message": f"Call get_thinking_result('{job_id}') to poll for results.",
         }
 
@@ -659,6 +742,10 @@ def register(mcp):
             impact_score      (0-1): potential significance
             combined_score    = novelty × feasibility × impact
         """
+        stale_error = runtime_guard.stale_runtime_error()
+        if stale_error:
+            return stale_error
+
         if mode not in CREATIVE_MODES:
             return {
                 "error": f"Unknown creative mode '{mode}'. Valid modes: {list(CREATIVE_MODES)}",

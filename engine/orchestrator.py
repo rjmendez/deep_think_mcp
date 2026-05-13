@@ -25,13 +25,28 @@ except ImportError:
 from .types import ProviderConfig, PassResult, ValidationData
 from . import provider as provider_module
 from . import directives as directives_module
-from .task_class_enforcer import enforce_task_class
+from .task_class_enforcer import (
+    enforce_task_class,
+    check_research_tool_allowed,
+    filter_adversarial_output,
+)
 from .validator import validate_passes, validate_width, validate_height, ValidationError
 from deep_think_mcp import store
 from deep_think_mcp import discover
 from deep_think_mcp.defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
 
 log = logging.getLogger(__name__)
+
+
+def _build_tool_query(question: str, perspective_answer: str, max_chars: int = 1800) -> str:
+    """Build a tool query that prioritizes perspective-specific context."""
+    perspective = (perspective_answer or "").strip()
+    base_question = (question or "").strip()
+    parts = [part for part in (perspective, base_question) if part]
+    if not parts:
+        return ""
+    query = "\n\n".join(parts)
+    return query[:max_chars]
 
 
 def _log_pass_exception(
@@ -645,9 +660,11 @@ async def deep_think_passes(
     
     # Auto-classify if not provided
     if not task_class:
+        policy_for_classification = str(data_policy).strip().lower() if data_policy else "any"
         task_class = await provider_module.classify_task(
             question,
-            provider=provider_config.get("provider", "") if provider_config else ""
+            provider=provider_config.get("provider", "") if provider_config else "",
+            data_policy=policy_for_classification,
         )
     
     # Get task profile
@@ -843,6 +860,8 @@ Use the mandate to structure your response. Be precise and evidence-based."""
     # Synthesize final answer
     pass_outputs = _successful_outputs(pass_results)
     final_answer = pass_outputs[-1] if pass_outputs else ""
+    if base_task_class == "adversarial" and final_answer:
+        final_answer = filter_adversarial_output(final_answer, job_id=job_id)
     
     # Calculate confidence
     confidences = [v.overall_confidence for v in validation_results if v]
@@ -1013,6 +1032,7 @@ async def run_fan_out(
     tool_evidence_weight: float = DEFAULT_TOOL_EVIDENCE_WEIGHT,
     force_local_models: bool = False,
     device_id: str = "",
+    web_domain_whitelist: Optional[list[str]] = None,
     ground_truth_provider: Optional[Any] = None,
 ) -> dict:
     """Fan-out reasoning with parallel perspectives and synthesis.
@@ -1158,10 +1178,9 @@ async def run_fan_out(
             return [], [f"import_error:{e}"], ""
 
         tool_name = "code_search" if resolved_class == "code_review" else "web_search"
-        if resolved_class == "code_review":
-            tool_query = "\n\n".join(part for part in [question, perspective_answer] if part)
-        else:
-            tool_query = question if question else perspective_answer[:200]
+        if not check_research_tool_allowed(resolved_class, tool_name, job_id=job_id):
+            return [], [f"blocked_tool:{tool_name}"], ""
+        tool_query = _build_tool_query(question, perspective_answer)
         if not tool_query:
             return [], ["missing tool query"], ""
 
@@ -1196,6 +1215,9 @@ async def run_fan_out(
                 invoke_tools_and_digest,
                 queued_tools, perspective_name, run_budget,
                 perspective_confidence, exec_cfg, estimated_budget_cost,
+                task_class=resolved_class,
+                job_id=job_id,
+                web_domain_whitelist=web_domain_whitelist or [],
             )
             tools_invoked = [tool["tool_name"] for tool in queued_tools]
             if evidence_digest is None:

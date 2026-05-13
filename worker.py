@@ -77,7 +77,10 @@ async def _run_job(job: dict) -> None:
         
         # Extract job control params while preserving routing-critical overrides.
         task_class = provider_config.pop("task_class", job.get("task_class", "general"))
-        data_policy = provider_config.get("data_policy", job.get("data_policy", "any"))
+        data_policy_raw = provider_config.get("data_policy", job.get("data_policy", "any"))
+        data_policy = str(data_policy_raw).strip().lower() if data_policy_raw is not None else "any"
+        if data_policy not in {"any", "local", "cloud"}:
+            data_policy = "any"
         device_id = job.get("device_id", "")
         force_local_models = job.get("force_local_models", False)
 
@@ -149,6 +152,7 @@ async def _run_job(job: dict) -> None:
                     tool_evidence_weight=tool_evidence_weight,
                     force_local_models=force_local_models,
                     device_id=device_id,
+                    web_domain_whitelist=web_domain_whitelist,
                 )
                 log.info(
                     "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
