@@ -218,6 +218,7 @@ def create_tool_directive(
         tool_name=tool_name,
         query=query,
         reason=reason,
+        perspective_id=analysis.perspective_id,
         priority=priority,
         expected_impact=search_intent,
         max_results=max_results,
@@ -425,8 +426,21 @@ def _route_by_tier(
     elif quality_tier == "apprentice":
         # Phase 3: Apprentice tier
         reason_codes = ["apprentice_perspective"]
-        
-        if analysis.aggregate_confidence < 0.50:
+
+        # Contradiction check mirrors master/expert: severity > 0.60 → resolve with tools
+        if analysis.contradiction_severity > 0.60:
+            directive = create_tool_directive(
+                reason="resolve_contradiction_apprentice",
+                analysis=analysis,
+                priority=1,
+                search_intent="evidence",
+            )
+            return (
+                ROUTING_ACTION_MAP["resolve_contradiction"],
+                directive,
+                reason_codes + ["contradiction_severity_high"],
+            )
+        elif analysis.aggregate_confidence < 0.50:
             directive = create_tool_directive(
                 reason="ground_uncertain_apprentice",
                 analysis=analysis,
