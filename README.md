@@ -1,5 +1,7 @@
 # deep_think_mcp
 
+Licensed under the [MIT License](LICENSE).
+
 Standalone async multi-pass reasoning MCP server with automatic model routing.
 
 The server selects specialist models for each task type — code review uses code-tuned models, security investigations use evidence-weighing directives, and safety tasks run a guardian pre-check — without the caller needing to know model names.
