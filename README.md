@@ -152,7 +152,7 @@ All configuration via environment variables.
 |---|---|
 | `ANTHROPIC_API_KEY` | Anthropic API key — enables `anthropic` provider |
 | `GITHUB_COPILOT_OAUTH_TOKEN` | GitHub Copilot OAuth token — enables `copilot` provider |
-| `OLLAMA_BASE_URL` | Ollama endpoint (default: `http://localhost:11434`) |
+| `OLLAMA_BASE_URL` | Ollama endpoint (required) |
 
 Provider is auto-detected: Anthropic key → Anthropic; Copilot token → Copilot; otherwise Ollama.
 

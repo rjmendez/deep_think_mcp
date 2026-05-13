@@ -161,7 +161,7 @@ def register(mcp):
             model:           Override all tiers with a single model ID (shorthand).
             provider_config: Optional per-call overrides (no secrets — use env vars for those):
                 provider        "anthropic" | "copilot" | "ollama" | "abliteration"
-                base_url        Ollama endpoint, e.g. "http://localhost:11434"
+                base_url        Ollama endpoint, provided via OLLAMA_BASE_URL
                 model           Single model ID for all tiers
                 light           Light-tier model ID override
                 medium          Medium-tier model ID override
@@ -186,7 +186,7 @@ def register(mcp):
         Provider secrets via environment variables only:
             ANTHROPIC_API_KEY              Anthropic API key
             GITHUB_COPILOT_OAUTH_TOKEN     GitHub Copilot OAuth token
-            OLLAMA_BASE_URL                Ollama base URL (default: http://localhost:11434)
+            OLLAMA_BASE_URL                Ollama base URL (required)
             ABLITERATION_API_KEY           Abliteration API key
             ABLITERATION_BASE_URL          Abliteration base URL (default: https://api.abliteration.ai/v1)
 
@@ -460,7 +460,7 @@ def register(mcp):
 
         Returns a summary of discovered models grouped by provider and tier.
         """
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        base_url = os.getenv("OLLAMA_BASE_URL", "")
         result = await _discover.run_discovery(base_url, force=force, benchmark=benchmark)
 
         by_provider: dict[str, list[dict]] = {}

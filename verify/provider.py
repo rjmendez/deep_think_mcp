@@ -169,7 +169,7 @@ class LocalProvider(LLMProvider):
 
     def __init__(
         self,
-        url: str = "http://localhost:11434",
+        url: str = "",
         model: str = "neural-chat",
         timeout: int = 180,
     ):

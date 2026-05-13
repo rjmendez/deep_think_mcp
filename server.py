@@ -125,7 +125,7 @@ async def _lifespan(app):
     # Refresh Ollama model cache for validation (non-blocking with short timeout)
     try:
         log.info("[LIFESPAN] Refreshing Ollama model cache...")
-        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "")
         # Use asyncio.wait_for to prevent hanging if Ollama is unavailable
         try:
             await asyncio.wait_for(refresh_ollama_models(ollama_url), timeout=5)

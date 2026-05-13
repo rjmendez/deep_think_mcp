@@ -13,7 +13,7 @@ class MQTTConfig:
     def __init__(self) -> None:
         """Load MQTT configuration from environment variables."""
         self.enabled: bool = os.getenv("MQTT_ENABLE", "false").lower() in ("true", "1", "yes")
-        self.broker_host: str = os.getenv("MQTT_HOST", "localhost")
+        self.broker_host: str = os.getenv("MQTT_HOST", "")
         self.broker_port: int = int(os.getenv("MQTT_PORT", "1883"))
         self.broker_user: str = os.getenv("MQTT_USERNAME", "dama")
         self.broker_password: str = os.getenv("MQTT_PASSWORD", "")

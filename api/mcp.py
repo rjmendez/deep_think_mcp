@@ -42,7 +42,7 @@ def register(mcp):
                 },
                 "ollama": {
                     "available": true,
-                    "url": "http://localhost:11434",
+                    "url": "<required>",
                     "models": ["phi4-mini:latest", "qwen3.5:27b", "qwen2.5-coder:7b"]
                 }
             },
@@ -81,7 +81,7 @@ def register(mcp):
             }
             
             # Check Ollama availability
-            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            ollama_url = os.getenv("OLLAMA_BASE_URL", "")
             ollama_available = False
             ollama_models = []
             

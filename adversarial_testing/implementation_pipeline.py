@@ -61,8 +61,8 @@ class ImplementationPipeline:
     def __init__(
         self,
         git_repo_root: str = _DEFAULT_REPO_ROOT,
-        code_review_agent_endpoint: str = "http://localhost:8000/code-review",
-        impl_agent_endpoint: str = "http://localhost:8000/general-purpose",
+        code_review_agent_endpoint: str = "",
+        impl_agent_endpoint: str = "",
     ):
         self.git_repo_root = git_repo_root
         self.code_review_endpoint = code_review_agent_endpoint

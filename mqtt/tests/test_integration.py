@@ -37,7 +37,7 @@ class TestMQTTConfig:
             config = MQTTConfig()
             
             assert config.enabled == False  # Default disabled
-            assert config.broker_host == "localhost"
+            assert config.broker_host == ""
             assert config.broker_port == 1883
             assert config.broker_user == "dama"
             assert config.batch_size == 10
@@ -73,7 +73,7 @@ class TestMQTTConfig:
     
     def test_config_validation_ok(self) -> None:
         """Test valid configuration passes validation."""
-        with patch.dict(os.environ, {"MQTT_ENABLE": "true"}):
+        with patch.dict(os.environ, {"MQTT_ENABLE": "true", "MQTT_HOST": "example.com"}):
             config = MQTTConfig()
             error = config.validate()
             assert error is None
@@ -89,6 +89,7 @@ class TestMQTTConfig:
         """Test invalid port fails validation."""
         with patch.dict(os.environ, {
             "MQTT_ENABLE": "true",
+            "MQTT_HOST": "example.com",
             "MQTT_PORT": "99999",
         }):
             config = MQTTConfig()
@@ -100,6 +101,7 @@ class TestMQTTConfig:
         """Test invalid batch size fails validation."""
         with patch.dict(os.environ, {
             "MQTT_ENABLE": "true",
+            "MQTT_HOST": "example.com",
             "MQTT_BATCH_SIZE": "0",
         }):
             config = MQTTConfig()
@@ -111,13 +113,14 @@ class TestMQTTConfig:
         """Test config string representation hides password."""
         with patch.dict(os.environ, {
             "MQTT_ENABLE": "true",
+            "MQTT_HOST": "example.com",
             "MQTT_PASSWORD": "secret123",
         }):
             config = MQTTConfig()
             repr_str = repr(config)
             
             assert "secret123" not in repr_str
-            assert "localhost" in repr_str
+            assert "host=" in repr_str
             assert "enabled=True" in repr_str
 
 
@@ -284,10 +287,11 @@ class TestConfigIntegration:
     def test_dotenv_loading(self) -> None:
         """Test .env configuration is loaded correctly."""
         # Load actual .env
-        config = MQTTConfig()
+        with patch.dict(os.environ, {"MQTT_HOST": "example.com"}):
+            config = MQTTConfig()
         
         # Should load from .env without error
-        assert config.broker_host == "localhost"
+        assert config.broker_host == "example.com"
         assert config.broker_port == 1883
         assert config.broker_user == "dama"
 

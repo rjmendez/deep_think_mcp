@@ -50,7 +50,7 @@ data:
   password: Y2hhbmdlbWU=
 stringData:
   # Plain text values (will be base64 encoded when stored)
-  mqtt-host: "localhost"
+  mqtt-host: ""
   mqtt-port: "1883"
   mqtt-user: "dama"
 
@@ -95,7 +95,7 @@ data:
 
     class MQTTNoveltyHandler:
         def __init__(self):
-            self.mqtt_host = os.getenv('MQTT_HOST', 'localhost')
+            self.mqtt_host = os.getenv('MQTT_HOST', '')
             self.mqtt_port = int(os.getenv('MQTT_PORT', 1883))
             self.mqtt_user = os.getenv('MQTT_USER', 'nova-agent')
             self.mqtt_password = os.getenv('MQTT_PASSWORD', '')
@@ -506,7 +506,7 @@ spec:
         
         # Service URLs
         - name: NOVA_URL
-          value: "http://localhost:8000"
+          value: ""
         - name: OLLAMA_URL
           valueFrom:
             secretKeyRef:

@@ -49,7 +49,7 @@ def load_config() -> VerifyConfig:
     verify_job_retention = int(os.getenv("VERIFY_JOB_RETENTION", "300"))
     verify_max_queue_size = int(os.getenv("VERIFY_MAX_QUEUE_SIZE", "100"))
     verify_max_concurrency = int(os.getenv("VERIFY_MAX_CONCURRENCY", "2"))
-    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    ollama_url = os.getenv("OLLAMA_URL", "")
 
     config = VerifyConfig(
         anthropic_api_key=anthropic_api_key,

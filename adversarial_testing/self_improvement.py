@@ -62,7 +62,7 @@ async def _auto_review_finding(finding: Finding) -> None:
     so they never block the primary test execution path.
     """
     try:
-        deep_think_base = os.getenv("DEEP_THINK_BASE_URL", "http://localhost:8080")
+        deep_think_base = os.getenv("DEEP_THINK_BASE_URL", "")
         review_question = (
             f"Adversarial security finding detected.\n\n"
             f"Severity: {finding.severity.value}\n"

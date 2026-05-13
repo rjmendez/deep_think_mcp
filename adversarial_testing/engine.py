@@ -52,7 +52,7 @@ from .self_improvement import on_finding
 
 log = logging.getLogger(__name__)
 
-_DEEP_THINK_BASE = os.getenv("DEEP_THINK_BASE_URL", "http://localhost:8080")
+_DEEP_THINK_BASE = os.getenv("DEEP_THINK_BASE_URL", "")
 _HTTP_TIMEOUT = float(os.getenv("ADVERSARIAL_TIMEOUT", "60.0"))
 
 _registry = TestCategoryRegistry()

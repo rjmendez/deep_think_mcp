@@ -17,7 +17,7 @@ Architecture:
 
 Environment Configuration:
     MQTT_ENABLE=true|false             Toggle MQTT integration (default: false)
-    MQTT_HOST=localhost   Broker hostname
+    MQTT_HOST=<required>  Broker hostname
     MQTT_PORT=1883                     Broker port (1883=plain, 8883=TLS)
     MQTT_USERNAME=dama                 Authentication username
     MQTT_PASSWORD=...                  Authentication password (secret!)
@@ -53,7 +53,7 @@ class MQTTConfig:
     def __init__(self) -> None:
         """Load MQTT configuration from environment variables."""
         self.enabled: bool = os.getenv("MQTT_ENABLE", "false").lower() in ("true", "1", "yes")
-        self.broker_host: str = os.getenv("MQTT_HOST", "localhost")
+        self.broker_host: str = os.getenv("MQTT_HOST", "")
         self.broker_port: int = int(os.getenv("MQTT_PORT", "1883"))
         self.broker_user: str = os.getenv("MQTT_USERNAME", "dama")
         self.broker_password: str = os.getenv("MQTT_PASSWORD", "")
@@ -374,7 +374,7 @@ class ConfirmationSubscriber:
     
     def __init__(
         self,
-        mqtt_host: str = "localhost",
+        mqtt_host: str = "",
         mqtt_port: int = 1883,
         mqtt_username: str = "dama",
         mqtt_password: str = "",

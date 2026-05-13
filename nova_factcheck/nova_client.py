@@ -14,7 +14,7 @@ REQUIRED Environment Variables (for authentication):
                        
 OPTIONAL Environment Variables:
     NOVA_BASE_URL      Base URL of Nova service 
-                       Default: http://localhost:30850
+                       Required
     NOVA_VERIFY_TIMEOUT_S  Per-request timeout in seconds
                            Default: 20
     NOVA_VERIFY_RETRIES    Number of retries on transient errors
@@ -64,7 +64,7 @@ def _env_int(name: str, default: int) -> int:
 def _load_nova_settings() -> dict:
     """Read Nova settings at runtime so env loading order does not poison auth."""
     return {
-        "base_url": os.getenv("NOVA_BASE_URL", "http://localhost:30850").rstrip("/"),
+        "base_url": os.getenv("NOVA_BASE_URL", "").rstrip("/"),
         "token": os.getenv("NOVA_TOKEN", "").strip(),
         "totp_seed": os.getenv("NOVA_TOTP_SEED", "").strip(),
         "timeout_s": _env_float("NOVA_VERIFY_TIMEOUT_S", 20.0),

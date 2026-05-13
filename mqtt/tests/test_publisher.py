@@ -589,7 +589,7 @@ def test_load_config_from_env_defaults(monkeypatch):
 
     config = load_config_from_env()
 
-    assert config["mqtt_host"] == "localhost"
+    assert config["mqtt_host"] == ""
     assert config["batch_size"] == 10
 
 

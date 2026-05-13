@@ -46,7 +46,7 @@ _totp_lock = threading.Lock()
 # Nova environment variables
 NOVA_TOKEN = os.getenv("NOVA_TOKEN", "").strip()
 NOVA_TOTP_SEED = os.getenv("NOVA_TOTP_SEED", "").strip()
-NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "http://localhost:30850").rstrip("/")
+NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "").rstrip("/")
 
 
 def _get_nova_headers_with_cached_totp() -> Dict[str, str]:
@@ -949,7 +949,7 @@ class MQTTGroundTruthProvider:
     
     def __init__(
         self,
-        broker_host: str = "localhost",
+        broker_host: str = "",
         broker_port: int = 1883,
         keepalive: int = 30,
         cache_ttl_seconds: int = 30,
@@ -1923,7 +1923,7 @@ async def create_ground_truth_provider(
         return NovaGroundTruthProvider()
 
     if provider_type == "mqtt":
-        mqtt_host = os.getenv("MQTT_HOST", "localhost")
+        mqtt_host = os.getenv("MQTT_HOST", "")
         mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
         mqtt_password = os.getenv("MQTT_PASSWORD", "")
         
@@ -1946,7 +1946,7 @@ async def create_ground_truth_provider(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DAMAColonySubscriber:
-    """Subscribe to DAMA phone telemetry on localhost and deserialize claims.
+    """Subscribe to DAMA phone telemetry and deserialize claims.
     
     This is the subscriber half of the DAMA DefCon project colony node.
     Subscribes to dama/+/telemetry, deserializes sensor data into Claim objects,
@@ -1961,7 +1961,7 @@ class DAMAColonySubscriber:
     
     def __init__(
         self,
-        broker_host: str = "localhost",
+        broker_host: str = "",
         broker_port: int = 1883,
         broker_user: Optional[str] = None,
         broker_password: Optional[str] = None,
@@ -1969,7 +1969,7 @@ class DAMAColonySubscriber:
         """Initialize DAMA colony subscriber.
         
         Args:
-            broker_host: MQTT broker hostname (default: localhost)
+            broker_host: MQTT broker hostname (required)
             broker_port: MQTT broker port (default: 1883)
             broker_user: MQTT username (from env: MQTT_USERNAME)
             broker_password: MQTT password (from env: MQTT_PASSWORD)
