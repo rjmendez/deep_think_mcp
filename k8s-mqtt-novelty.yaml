@@ -99,8 +99,8 @@ data:
             self.mqtt_port = int(os.getenv('MQTT_PORT', 1883))
             self.mqtt_user = os.getenv('MQTT_USER', 'nova-agent')
             self.mqtt_password = os.getenv('MQTT_PASSWORD', '')
-            self.nova_url = os.getenv('NOVA_URL', 'http://[REDACTED_K8S_SERVICE]:8000')
-            self.ollama_url = os.getenv('OLLAMA_URL', 'http://[REDACTED_K8S_SERVICE]:11434')
+            self.nova_url = os.getenv('NOVA_URL', '')
+            self.ollama_url = os.getenv('OLLAMA_URL', '')
             
             self.client = mqtt.Client(client_id='mqtt-novelty-verifier')
             self.client.on_connect = self.on_connect

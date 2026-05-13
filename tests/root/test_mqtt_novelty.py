@@ -4,6 +4,7 @@ Test MQTT novelty detection with live Pixel 7 telemetry
 import asyncio
 import json
 import logging
+import os
 from mqtt_novelty_handler import MQTTNoveltyHandler, SensorClaim
 
 logging.basicConfig(
@@ -15,12 +16,12 @@ async def test_mqtt_pipeline():
     """Test receiving live telemetry and scoring novelty."""
     
     handler = MQTTNoveltyHandler(
-        mqtt_host="localhost",
+        mqtt_host=os.getenv("MQTT_HOST", ""),
         mqtt_port=1883,
         mqtt_user="dama",
-        mqtt_pass="[REDACTED_MQTT_PASSWORD]",
-        nova_url="http://localhost:30850",
-        ollama_url="http://localhost:11434",
+        mqtt_pass=os.getenv("MQTT_PASSWORD", ""),
+        nova_url=os.getenv("NOVA_URL", ""),
+        ollama_url=os.getenv("OLLAMA_URL", ""),
     )
     
     print("Starting MQTT novelty handler (listening for 30 seconds)...")
