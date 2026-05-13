@@ -55,7 +55,7 @@ if error:
 The MQTT integration is automatically initialized when the server starts:
 
 ```bash
-python3 server.py
+python3 -m deep_think_mcp.server
 ```
 
 The server will:
@@ -99,13 +99,13 @@ from mqtt.resilience import HealthCheckHandler
 async def mqtt_health():
     """Get MQTT health status."""
     handler = HealthCheckHandler(mqtt_monitor)
-    return await handler.health()
+    return await handler.handle_health_check()
 
 @app.get("/mqtt/metrics")
 async def mqtt_metrics():
     """Get Prometheus metrics."""
     handler = HealthCheckHandler(mqtt_monitor)
-    return await handler.metrics()
+    return await handler.handle_metrics()
 ```
 
 ### Checking Status
@@ -125,9 +125,9 @@ print(f"Current batch size: {stats['batch_buffer_size']}")
 Check for persisted findings during outages:
 
 ```bash
-sqlite3 mqtt_failures.db
-> SELECT * FROM findings;
-> SELECT * FROM publish_confirmations;
+sqlite3 ~/.deep_think/findings_queue.db
+> SELECT * FROM findings_queue;
+> SELECT * FROM confirmations;
 ```
 
 ## Troubleshooting
@@ -253,14 +253,14 @@ MQTT_USE_TLS=true                # Encrypted connection
 
 ### SQLite Database Security
 
-The `mqtt_failures.db` contains findings:
+The `~/.deep_think/findings_queue.db` database contains publisher findings:
 
 ```bash
 # Restrict access
-chmod 600 mqtt_failures.db
+chmod 600 ~/.deep_think/findings_queue.db
 
 # Back up regularly
-cp mqtt_failures.db mqtt_failures.db.$(date +%Y%m%d)
+cp ~/.deep_think/findings_queue.db ~/.deep_think/findings_queue.db.$(date +%Y%m%d)
 ```
 
 ## Maintenance
@@ -270,7 +270,7 @@ cp mqtt_failures.db mqtt_failures.db.$(date +%Y%m%d)
 Periodically remove old persisted findings:
 
 ```bash
-sqlite3 mqtt_failures.db
+sqlite3 ~/.deep_think/findings_queue.db
 > DELETE FROM findings WHERE published_at < datetime('now', '-30 days');
 > VACUUM;
 ```

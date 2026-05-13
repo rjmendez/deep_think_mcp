@@ -17,7 +17,7 @@ Jobs are submitted instantly, run in the background, and polled for results. No 
 | `extraction` | Structured JSON output, entity recognition | Lighter models — extraction is pattern matching, not reasoning |
 | `synthesis` | Writing, summarization, report drafting | Full model stack with narrative stress-test pass |
 | `reasoning` | Complex logical / mathematical reasoning | Biases toward largest available models |
-| `auto` | Lightweight classifier picks the best class (confidence ≥ 0.75) | — |
+| `auto` | Lightweight classifier picks the best class (no confidence-threshold gate currently enforced) | — |
 
 ## Skill Files
 
@@ -66,7 +66,7 @@ Control which providers are allowed to receive data — important for sensitive 
 |---|---|
 | `any` (default) | Use any configured provider including cloud |
 | `local` | **Ollama ONLY** — no data sent to cloud providers |
-| `cloud` | Cloud providers preferred; Ollama only for light tier |
+| `cloud` | Cloud-only routing; Ollama is blocked for all tiers |
 
 Set globally: `DEEP_THINK_DATA_POLICY=local`  
 Set per-call: `data_policy` parameter on `deep_think_async`
@@ -224,7 +224,7 @@ If you want to run `deep_think_mcp` in an environment without Nova, disable the 
 |---|---|---|
 | `DEEP_THINK_NOVA_VERIFY=0` | server env | Disables the post-run Nova fact-check / verification pipeline in `worker.py` |
 | `SKIP_VALIDATION=1` | server env | Disables pass-level ground-truth validation hooks in `engine/orchestrator.py` |
-| `enable_research=false` | per-call parameter | Disables research-tool injection (Nova search, web search, DAMA lookups) for that job |
+| `enable_research=false` | per-call parameter | Disables research-tool injection for most classes; `code_review` requires research enabled |
 
 Recommended minimal portable setup:
 
@@ -649,14 +649,13 @@ for perspective in result['reasoning_chain']:
 3. Break into 2-3 focused sub-jobs
 4. Embed actual code, not file paths
 
-### Provider Config Error: "provider is REQUIRED"
+### Provider Selection Behavior
 
-**Cause:** Missing `provider` in `provider_config`.
+`provider_config.provider` is optional. If omitted, provider defaults are resolved from `data_policy` and environment/discovered availability.
 
-**Fix:**
 ```python
-provider_config={"provider": "anthropic"}  # ✓
-provider_config={}                         # ✗
+provider_config={"provider": "anthropic"}  # explicit override
+provider_config={}                         # valid; provider auto-resolves
 ```
 
 ### "Timeout on Ollama" → Fallback to Copilot
@@ -676,7 +675,7 @@ Jobs marked `running` for >10 minutes are requeued on worker restart. Check:
 ```bash
 python -c "from deep_think_mcp import store; import sqlite3; 
   db = sqlite3.connect('~/.deep_think/jobs.db'); 
-  print(db.execute('SELECT id, status, created_at FROM jobs ORDER BY created_at DESC LIMIT 5').fetchall())"
+  print(db.execute('SELECT job_id, status, created_at FROM thinking_jobs ORDER BY created_at DESC LIMIT 5').fetchall())"
 ```
 
 If a job is legitimately stuck, delete it manually and requeue.

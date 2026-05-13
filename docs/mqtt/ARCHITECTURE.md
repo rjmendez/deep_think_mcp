@@ -115,7 +115,7 @@ class Finding:
 
 ```
 1. Publisher tries to publish findings
-2. If broker is down, persist to SQLite (mqtt_failures.db)
+2. If broker is down, persist to SQLite (`~/.deep_think/findings_queue.db`)
 3. Retry with backoff
 4. On successful reconnect, replay persisted findings
 5. Delete from SQLite after confirmed publish

@@ -96,7 +96,12 @@ Publishes findings to MQTT with batching and persistence.
 
 **Constructor:**
 ```python
-publisher = MQTTFindingsPublisher(config)
+publisher = MQTTFindingsPublisher(
+    mqtt_host="broker.example",
+    mqtt_port=1883,
+    mqtt_username="dama",
+    mqtt_password="secret",
+)
 ```
 
 **Methods:**
@@ -117,8 +122,8 @@ store = FindingsPersistenceStore(db_path="~/.deep_think/findings_queue.db")
 
 **Methods:**
 - `save_finding(finding)` - Persist finding to database
-- `load_pending() -> List[Finding]` - Load unpublished findings
-- `mark_published(finding_id)` - Mark as successfully published
+- `load_pending_findings(limit=100) -> List[(row_id, Finding)]` - Load unpublished findings
+- `mark_finding_published(row_id)` - Mark as successfully published
 - `get_stats()` - Get persistence statistics
 
 **Utility Functions:**
@@ -215,12 +220,12 @@ HTTP endpoint handler for health checks.
 @app.get("/health")
 async def health_check():
     handler = HealthCheckHandler(mqtt_monitor)
-    return await handler.health()
+    return await handler.handle_health_check()
 
 @app.get("/metrics")
 async def metrics():
     handler = HealthCheckHandler(mqtt_monitor)
-    return await handler.metrics()
+    return await handler.handle_metrics()
 ```
 
 ## Utilities (mqtt.utils)
