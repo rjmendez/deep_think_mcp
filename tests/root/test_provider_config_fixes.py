@@ -261,7 +261,7 @@ class TestTemperatureKnobPropagation:
                 user_prompt="prompt",
                 tier="medium",
                 provider_config={
-                    "base_url": "http://[REDACTED_INTERNAL_IP]:11434",
+                    "base_url": "http://localhost:11434",
                     "temperature": 1.3,
                     "top_p": 0.7,
                     "seed": 42,
@@ -270,7 +270,7 @@ class TestTemperatureKnobPropagation:
             )
 
             call = mock_ollama.await_args
-            assert call.kwargs["base_url"] == "http://[REDACTED_INTERNAL_IP]:11434"
+            assert call.kwargs["base_url"] == "http://localhost:11434"
             assert call.kwargs["custom_params"]["temperature"] == 1.3
             assert call.kwargs["custom_params"]["top_p"] == 0.7
             assert call.kwargs["custom_params"]["seed"] == 42

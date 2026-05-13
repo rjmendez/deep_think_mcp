@@ -22,7 +22,7 @@ async def test_mqtt_device_online_detection():
     pytest.importorskip("aiomqtt", reason="aiomqtt not installed")
     
     provider = MQTTGroundTruthProvider(
-        broker_host="[REDACTED_MQTT_HOST]",
+        broker_host="localhost",
         broker_port=1883,
     )
     
@@ -57,7 +57,7 @@ async def test_mqtt_device_offline_after_timeout():
     pytest.importorskip("aiomqtt", reason="aiomqtt not installed")
     
     provider = MQTTGroundTruthProvider(
-        broker_host="[REDACTED_MQTT_HOST]",
+        broker_host="localhost",
         broker_port=1883,
         cache_ttl_seconds=30,
     )
@@ -96,7 +96,7 @@ async def test_mqtt_topic_parsing():
     pytest.importorskip("aiomqtt", reason="aiomqtt not installed")
     
     provider = MQTTGroundTruthProvider(
-        broker_host="[REDACTED_MQTT_HOST]",
+        broker_host="localhost",
         broker_port=1883,
     )
     
@@ -130,7 +130,7 @@ async def test_mqtt_sensor_data_caching():
     pytest.importorskip("aiomqtt", reason="aiomqtt not installed")
     
     provider = MQTTGroundTruthProvider(
-        broker_host="[REDACTED_MQTT_HOST]",
+        broker_host="localhost",
         broker_port=1883,
     )
     

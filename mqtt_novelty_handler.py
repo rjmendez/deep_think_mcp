@@ -60,8 +60,8 @@ class NoveltyScorer:
 
     def __init__(
         self,
-        nova_url: str = "http://[REDACTED_INTERNAL_IP]:30850",
-        ollama_url: str = "http://[REDACTED_INTERNAL_IP]:11434",
+        nova_url: str = "http://localhost:30850",
+        ollama_url: str = "http://localhost:11434",
         nova_token: Optional[str] = None,
         nova_totp_seed: Optional[str] = None,
     ):
@@ -220,7 +220,7 @@ class MQTTNoveltyPublisher:
 
     def __init__(
         self,
-        broker_host: str = "[REDACTED_MQTT_HOST]",
+        broker_host: str = "localhost",
         broker_port: int = 1883,
         username: str = "dama",
         password: str = "",
@@ -271,12 +271,12 @@ class MQTTNoveltyHandler:
 
     def __init__(
         self,
-        mqtt_host: str = "[REDACTED_MQTT_HOST]",
+        mqtt_host: str = "localhost",
         mqtt_port: int = 1883,
         mqtt_user: str = "dama",
         mqtt_pass: str = "",
-        nova_url: str = "http://[REDACTED_INTERNAL_IP]:30850",
-        ollama_url: str = "http://[REDACTED_INTERNAL_IP]:11434",
+        nova_url: str = "http://localhost:30850",
+        ollama_url: str = "http://localhost:11434",
     ):
         self.mqtt_host = mqtt_host
         self.mqtt_port = mqtt_port

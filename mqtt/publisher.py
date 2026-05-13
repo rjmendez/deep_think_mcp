@@ -264,7 +264,7 @@ class MQTTFindingsPublisher:
 
     def __init__(
         self,
-        mqtt_host: str = "[REDACTED_MQTT_HOST]",
+        mqtt_host: str = "localhost",
         mqtt_port: int = 1883,
         mqtt_username: str = "dama",
         mqtt_password: str = "",
@@ -913,7 +913,7 @@ def load_config_from_env() -> dict[str, Any]:
         - enabled
     """
     return {
-        "mqtt_host": os.getenv("MQTT_HOST", "[REDACTED_MQTT_HOST]"),
+        "mqtt_host": os.getenv("MQTT_HOST", "localhost"),
         "mqtt_port": int(os.getenv("MQTT_PORT", "1883")),
         "mqtt_username": os.getenv("MQTT_USERNAME", "dama"),
         "mqtt_password": os.getenv("MQTT_PASSWORD", ""),

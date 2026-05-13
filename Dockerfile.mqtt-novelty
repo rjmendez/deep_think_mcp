@@ -41,7 +41,7 @@ USER mqtt-user
 
 # Health check: verify MQTT connection works
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python3 -c "import paho.mqtt.client as mqtt; client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1); client.connect('${MQTT_HOST:-[REDACTED_MQTT_HOST]}', int('${MQTT_PORT:-1883}'), keepalive=10); client.loop_start(); import time; time.sleep(2); client.disconnect(); client.loop_stop()" || exit 1
+    CMD python3 -c "import paho.mqtt.client as mqtt; client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1); client.connect('${MQTT_HOST:-localhost}', int('${MQTT_PORT:-1883}'), keepalive=10); client.loop_start(); import time; time.sleep(2); client.disconnect(); client.loop_stop()" || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["python3", "run_mqtt_novelty_service.py"]

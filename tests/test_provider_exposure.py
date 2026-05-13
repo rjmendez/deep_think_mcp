@@ -84,7 +84,7 @@ def test_local_code_search_no_match_is_success(monkeypatch):
 def test_local_code_search_uses_perspective_specific_terms():
     base = (
         "Perform a deep whole-repository review for correctness security reliability "
-        "of /home/USER/development/deep_think_mcp."
+        "of /path/to/repo."
     )
     query_a = (
         f"{base} Focus on sql injection in api/reasoning.py and data_policy precedence in provider."

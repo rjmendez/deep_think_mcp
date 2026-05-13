@@ -408,5 +408,5 @@ class TestRegression:
         """ImplementationPipeline initializes with defaults."""
         pipeline = ImplementationPipeline()
         
-        assert pipeline.git_repo_root == "/home/USER/development/deep_think_mcp"
+        assert pipeline.git_repo_root == str(Path(__file__).resolve().parents[2])
         assert pipeline.store is not None

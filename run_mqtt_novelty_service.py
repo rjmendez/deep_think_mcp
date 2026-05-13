@@ -4,12 +4,12 @@ MQTT Novelty Verification Service
 Runs as a k3s deployment sidecar to Nova.
 
 Environment variables:
-  MQTT_HOST              MQTT broker hostname (default: [REDACTED_MQTT_HOST])
+  MQTT_HOST              MQTT broker hostname (default: localhost)
   MQTT_PORT              MQTT broker port (default: 1883)
   MQTT_USERNAME          MQTT username (default: dama)
   MQTT_PASSWORD          MQTT password (required)
-  NOVA_URL               Nova endpoint (default: http://[REDACTED_INTERNAL_IP]:30850)
-  OLLAMA_URL             Ollama endpoint (default: http://[REDACTED_INTERNAL_IP]:11434)
+  NOVA_URL               Nova endpoint (default: http://localhost:30850)
+  OLLAMA_URL             Ollama endpoint (default: http://localhost:11434)
   LOG_LEVEL              Logging level (default: INFO)
 """
 
@@ -31,12 +31,12 @@ def main():
     log = logging.getLogger("mqtt_novelty_service")
 
     # Load configuration from environment
-    mqtt_host = os.getenv("MQTT_HOST", "[REDACTED_MQTT_HOST]")
+    mqtt_host = os.getenv("MQTT_HOST", "localhost")
     mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
     mqtt_user = os.getenv("MQTT_USERNAME", "dama")
     mqtt_pass = os.getenv("MQTT_PASSWORD", "")
-    nova_url = os.getenv("NOVA_URL", "http://[REDACTED_INTERNAL_IP]:30850")
-    ollama_url = os.getenv("OLLAMA_URL", "http://[REDACTED_INTERNAL_IP]:11434")
+    nova_url = os.getenv("NOVA_URL", "http://localhost:30850")
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
     if not mqtt_pass:
         log.error("MQTT_PASSWORD not set!")

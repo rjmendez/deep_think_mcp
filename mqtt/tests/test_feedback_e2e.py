@@ -314,5 +314,5 @@ def test_real_mqtt_connection_optional(feedback_store):
     Tests full flow with real device telemetry.
     """
     # This test is marked skip if broker unavailable
-    # In production, would connect to [REDACTED_MQTT_HOST]
+    # In production, would connect to localhost
     pytest.skip("Real MQTT broker test - requires environment setup")

@@ -14,11 +14,13 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from . import store
 from .governance import requires_human_review
 
 logger = logging.getLogger(__name__)
+_DEFAULT_REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 
 class ImplementationStatus(Enum):
@@ -58,7 +60,7 @@ class ImplementationPipeline:
 
     def __init__(
         self,
-        git_repo_root: str = "/home/USER/development/deep_think_mcp",
+        git_repo_root: str = _DEFAULT_REPO_ROOT,
         code_review_agent_endpoint: str = "http://localhost:8000/code-review",
         impl_agent_endpoint: str = "http://localhost:8000/general-purpose",
     ):

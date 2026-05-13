@@ -12,11 +12,13 @@ import subprocess
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import store
 from .metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
+_DEFAULT_REPO_ROOT = str(Path(__file__).resolve().parents[1])
 
 
 @dataclass
@@ -48,7 +50,7 @@ class ValidationSuite:
     def __init__(
         self,
         metrics: MetricsCollector,
-        git_repo_root: str = "/home/USER/development/deep_think_mcp",
+        git_repo_root: str = _DEFAULT_REPO_ROOT,
         test_command: str = "pytest --cov=adversarial_testing adversarial_testing/tests/",
     ):
         self.metrics = metrics

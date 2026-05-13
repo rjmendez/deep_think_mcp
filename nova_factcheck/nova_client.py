@@ -8,13 +8,13 @@ All settings are read from environment variables so no secrets appear in code.
 
 REQUIRED Environment Variables (for authentication):
     NOVA_TOKEN         Bearer token for Nova API (required for auth)
-                       Example: "nova-7a8b9c0d1e2f3a4b5c6d7e8f"
+                       Example: "nova-your-token-here"
     NOVA_TOTP_SEED     Base32-encoded TOTP seed (required for auth)
-                       Example: "JBSWY3DPEBLW64TMMQ4A73EMUQH5CUPC"
+                       Example: "YOUR_BASE32_TOTP_SEED"
                        
 OPTIONAL Environment Variables:
     NOVA_BASE_URL      Base URL of Nova service 
-                       Default: http://[REDACTED_INTERNAL_IP]:30850
+                       Default: http://localhost:30850
     NOVA_VERIFY_TIMEOUT_S  Per-request timeout in seconds
                            Default: 20
     NOVA_VERIFY_RETRIES    Number of retries on transient errors
@@ -64,7 +64,7 @@ def _env_int(name: str, default: int) -> int:
 def _load_nova_settings() -> dict:
     """Read Nova settings at runtime so env loading order does not poison auth."""
     return {
-        "base_url": os.getenv("NOVA_BASE_URL", "http://[REDACTED_INTERNAL_IP]:30850").rstrip("/"),
+        "base_url": os.getenv("NOVA_BASE_URL", "http://localhost:30850").rstrip("/"),
         "token": os.getenv("NOVA_TOKEN", "").strip(),
         "totp_seed": os.getenv("NOVA_TOTP_SEED", "").strip(),
         "timeout_s": _env_float("NOVA_VERIFY_TIMEOUT_S", 20.0),

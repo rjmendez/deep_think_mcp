@@ -47,10 +47,10 @@ metadata:
 type: Opaque
 data:
   # Base64 encoded: echo -n "changeme" | base64
-  password: QThZdm9WOU1MNndSbDJWc2lSNGNwMHQyN1phcDNoWlo=
+  password: Y2hhbmdlbWU=
 stringData:
   # Plain text values (will be base64 encoded when stored)
-  mqtt-host: "[REDACTED_MQTT_HOST]"
+  mqtt-host: "localhost"
   mqtt-port: "1883"
   mqtt-user: "dama"
 

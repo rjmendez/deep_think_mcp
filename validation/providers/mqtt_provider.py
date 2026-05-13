@@ -20,7 +20,7 @@ class MQTTGroundTruthProvider:
     
     def __init__(
         self,
-        broker_host: str = "[REDACTED_MQTT_HOST]",
+        broker_host: str = "localhost",
         broker_port: int = 1883,
         keepalive: int = 30,
         cache_ttl_seconds: int = 30,

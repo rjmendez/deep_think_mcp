@@ -443,7 +443,7 @@ async def _verify_with_nova(output: str, question: str) -> tuple[bool, float]:
     import os
     import httpx
 
-    nova_url = os.getenv("NOVA_URL", "http://[REDACTED_INTERNAL_IP]:30850")
+    nova_url = os.getenv("NOVA_URL", "http://localhost:30850")
     endpoint = f"{nova_url}/pre_action"
 
     payload = {

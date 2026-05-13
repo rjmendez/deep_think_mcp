@@ -60,6 +60,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -82,6 +83,7 @@ from .verify.provider import CloudProvider, LocalProvider
 from .verify.queue import VerifyJobQueue, VerifyWorker
 
 log = logging.getLogger(__name__)
+_REPO_ROOT = str(Path(__file__).resolve().parent)
 
 # Global planning engine instance
 _planning_engine: Optional[PlanningEngine] = None
@@ -168,7 +170,7 @@ async def _lifespan(app):
         metrics_collector = MetricsCollector()
         validation_suite = ValidationSuite(
             metrics=metrics_collector,
-            git_repo_root="/home/USER/development/deep_think_mcp",
+            git_repo_root=_REPO_ROOT,
             test_command="pytest --cov=adversarial_testing adversarial_testing/tests/",
         )
         app.validation_suite = validation_suite

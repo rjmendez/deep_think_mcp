@@ -44,7 +44,7 @@ class ResilientMQTTPublisher:
 
     def __init__(
         self,
-        broker_host: str = "[REDACTED_MQTT_HOST]",
+        broker_host: str = "localhost",
         broker_port: int = 1883,
         broker_user: Optional[str] = None,
         broker_password: Optional[str] = None,
@@ -253,7 +253,7 @@ class MQTTResilienceManager:
 
     async def initialize(
         self,
-        broker_host: str = "[REDACTED_MQTT_HOST]",
+        broker_host: str = "localhost",
         broker_port: int = 1883,
         broker_user: Optional[str] = None,
         broker_password: Optional[str] = None,
@@ -465,7 +465,7 @@ async def main():
 
     # Initialize with broker details from environment
     await manager.initialize(
-        broker_host=os.getenv("MQTT_HOST", "[REDACTED_MQTT_HOST]"),
+        broker_host=os.getenv("MQTT_HOST", "localhost"),
         broker_port=int(os.getenv("MQTT_PORT", "1883")),
         broker_user=os.getenv("MQTT_USERNAME"),
         broker_password=os.getenv("MQTT_PASSWORD"),

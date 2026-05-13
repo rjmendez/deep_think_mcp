@@ -15,12 +15,12 @@ async def test_mqtt_pipeline():
     """Test receiving live telemetry and scoring novelty."""
     
     handler = MQTTNoveltyHandler(
-        mqtt_host="[REDACTED_MQTT_HOST]",
+        mqtt_host="localhost",
         mqtt_port=1883,
         mqtt_user="dama",
         mqtt_pass="[REDACTED_MQTT_PASSWORD]",
-        nova_url="http://[REDACTED_INTERNAL_IP]:30850",
-        ollama_url="http://[REDACTED_INTERNAL_IP]:11434",
+        nova_url="http://localhost:30850",
+        ollama_url="http://localhost:11434",
     )
     
     print("Starting MQTT novelty handler (listening for 30 seconds)...")

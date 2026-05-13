@@ -4,12 +4,12 @@ These tools are injected into the reasoning loop when task_class permits researc
 They are BLOCKED for task_class="adversarial" to prevent data leakage to uncensored models.
 
 Environment variables:
-    NOVA_BASE_URL          Nova service base URL (default: http://[REDACTED_INTERNAL_IP]:30850)
+    NOVA_BASE_URL          Nova service base URL (default: http://localhost:30850)
     NOVA_TOKEN             Bearer token for Nova authentication
     NOVA_TOTP_SEED         TOTP seed for Nova authentication
     NOVA_SEARCH_TIMEOUT_S  Per-request timeout in seconds (default: 15)
 
-    DAMA_BASE_URL          DAMA API base URL (default: http://[REDACTED_INTERNAL_IP]:30900)
+    DAMA_BASE_URL          DAMA API base URL (default: http://localhost:30900)
     DAMA_TOKEN             Bearer token for DAMA API
     DAMA_TIMEOUT_S         Per-request timeout in seconds (default: 10)
 
@@ -37,10 +37,10 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "http://[REDACTED_INTERNAL_IP]:30850").rstrip("/")
+NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "http://localhost:30850").rstrip("/")
 NOVA_SEARCH_TIMEOUT_S = float(os.getenv("NOVA_SEARCH_TIMEOUT_S", "15"))
 
-DAMA_BASE_URL = os.getenv("DAMA_BASE_URL", "http://[REDACTED_INTERNAL_IP]:30900").rstrip("/")
+DAMA_BASE_URL = os.getenv("DAMA_BASE_URL", "http://localhost:30900").rstrip("/")
 DAMA_TOKEN = os.getenv("DAMA_TOKEN", "").strip()
 DAMA_TIMEOUT_S = float(os.getenv("DAMA_TIMEOUT_S", "10"))
 

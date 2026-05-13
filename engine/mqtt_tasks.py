@@ -69,7 +69,7 @@ class MQTTConfig:
         """Load configuration from environment variables."""
         return cls(
             enable=os.getenv("MQTT_ENABLE", "false").lower() == "true",
-            host=os.getenv("MQTT_HOST", "[REDACTED_MQTT_HOST]"),
+            host=os.getenv("MQTT_HOST", "localhost"),
             port=int(os.getenv("MQTT_PORT", "1883")),
             username=os.getenv("MQTT_USERNAME", "dama"),
             password=os.getenv("MQTT_PASSWORD", ""),

@@ -66,7 +66,7 @@ The MQTT integration provides a complete pipeline for:
 **Environment Variables:**
 ```
 MQTT_ENABLE              Enable/disable MQTT (default: false)
-MQTT_HOST                Broker hostname (default: [REDACTED_MQTT_HOST])
+MQTT_HOST                Broker hostname (default: localhost)
 MQTT_PORT                Broker port (default: 1883)
 MQTT_USERNAME            Auth username (default: dama)
 MQTT_PASSWORD            Auth password

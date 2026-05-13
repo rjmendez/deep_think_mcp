@@ -15,7 +15,7 @@ Set environment variables:
 
 ```bash
 MQTT_ENABLE=true
-MQTT_HOST=[REDACTED_MQTT_HOST]
+MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_USERNAME=dama
 MQTT_PASSWORD=<secret>

@@ -37,7 +37,7 @@ class TestMQTTConfig:
             config = MQTTConfig()
             
             assert config.enabled == False  # Default disabled
-            assert config.broker_host == "[REDACTED_MQTT_HOST]"
+            assert config.broker_host == "localhost"
             assert config.broker_port == 1883
             assert config.broker_user == "dama"
             assert config.batch_size == 10
@@ -117,7 +117,7 @@ class TestMQTTConfig:
             repr_str = repr(config)
             
             assert "secret123" not in repr_str
-            assert "[REDACTED_MQTT_HOST]" in repr_str
+            assert "localhost" in repr_str
             assert "enabled=True" in repr_str
 
 
@@ -287,7 +287,7 @@ class TestConfigIntegration:
         config = MQTTConfig()
         
         # Should load from .env without error
-        assert config.broker_host == "[REDACTED_MQTT_HOST]"
+        assert config.broker_host == "localhost"
         assert config.broker_port == 1883
         assert config.broker_user == "dama"
 

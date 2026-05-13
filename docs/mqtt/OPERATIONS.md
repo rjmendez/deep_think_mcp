@@ -21,7 +21,7 @@ Create a `.env` file or set environment variables:
 MQTT_ENABLE=true
 
 # Broker Connection
-MQTT_HOST=[REDACTED_MQTT_HOST]
+MQTT_HOST=localhost
 MQTT_PORT=1883
 MQTT_USERNAME=dama
 MQTT_PASSWORD=your_secret_password
