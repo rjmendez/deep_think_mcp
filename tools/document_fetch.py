@@ -36,13 +36,17 @@ def _allowed_domains() -> list[str]:
     raw = os.getenv("DEEP_THINK_DOCUMENT_FETCH_DOMAIN_WHITELIST", "").strip()
     if not raw:
         return []
-    return [d.strip().lower().lstrip("www.") for d in raw.split(",") if d.strip()]
+    return [_strip_www(d.strip().lower()) for d in raw.split(",") if d.strip()]
+
+
+def _strip_www(domain: str) -> str:
+    return domain[4:] if domain.lower().startswith("www.") else domain
 
 
 def _domain_allowed(url: str, allowed: list[str]) -> bool:
     if not allowed:
         return True
-    domain = urlparse(url).netloc.lower().lstrip("www.")
+    domain = _strip_www(urlparse(url).netloc.lower())
     return any(domain == d or domain.endswith("." + d) for d in allowed)
 
 

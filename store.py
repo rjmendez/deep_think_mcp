@@ -411,7 +411,13 @@ def _restore_db(backup_path: str) -> None:
     db_path = Path(_db_path())
     if not Path(backup_path).exists():
         raise FileNotFoundError(f"Backup not found: {backup_path}")
-    shutil.copy2(backup_path, db_path)
+    src = sqlite3.connect(str(backup_path), check_same_thread=False, timeout=10)
+    dst = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
     log.info(f"Database restored from: {backup_path}")
 
 

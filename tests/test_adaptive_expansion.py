@@ -21,6 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from deep_think_mcp.engine import orchestrator
 from deep_think_mcp.engine.orchestrator import _fan_out_parse_json
 from deep_think_mcp.engine.types import ProviderConfig
 
@@ -523,3 +524,96 @@ class TestAdaptiveExpansionIntegration:
         )
         if result["adaptive_triggered"]:
             assert result["final_width"] > 2
+
+
+class TestFanOutPolicyAndCache:
+    """Regression tests for fan-out policy propagation and cache grounding."""
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_passes_data_policy_to_classifier(self, monkeypatch):
+        calls: dict[str, Any] = {}
+
+        async def fake_deep_think_passes(**_kwargs):
+            return {
+                "status": "complete",
+                "final_answer": "ok",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": 0.8,
+            }
+
+        async def fake_classify_task(question, provider="", data_policy="any", **_kwargs):
+            calls["data_policy"] = data_policy
+            return "general"
+
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", lambda _k: None)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "classify_task", fake_classify_task)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="local"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "_validate_and_enforce_local_models", AsyncMock())
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            provider_config={"data_policy": "local"},
+            data_policy="local",
+        )
+
+        assert result["status"] == "complete"
+        assert calls["data_policy"] == "local"
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_cache_hit_runs_tool_phase_when_enabled(self, monkeypatch):
+        import deep_think_mcp.executor as executor_module
+
+        async def fake_deep_think_passes(**_kwargs):
+            return {
+                "status": "complete",
+                "final_answer": "ok",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": 0.8,
+            }
+
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", lambda _k: {"final_answer": "cached answer", "passes_run": 1})
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator.store, "set_pass_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="any"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+        monkeypatch.setattr(orchestrator, "check_research_tool_allowed", lambda *_args, **_kwargs: True)
+
+        queued_tool = {"tool_name": "code_search"}
+        fake_digest = SimpleNamespace(
+            entries=[SimpleNamespace(tool_name="code_search", tool_status="success")],
+            formatted_summary="evidence",
+        )
+        monkeypatch.setattr(executor_module, "queue_tools", lambda *_args, **_kwargs: ([queued_tool], 1))
+        monkeypatch.setattr(executor_module, "invoke_tools_and_digest", lambda *_args, **_kwargs: (fake_digest, None))
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            task_class="code_review",
+            enable_tool_use=True,
+            data_policy="any",
+        )
+
+        assert result["cache_hits"] == 1
+        assert result["tools_invoked_total"] == 1
+        assert result["perspectives"][0]["tools_invoked"] == ["code_search"]
+        assert result["perspectives"][0]["evidence_summary"] == "evidence"

@@ -649,7 +649,7 @@ async def deep_think_passes(
     
     # Check environment override for force_local_models (security gate)
     import os
-    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "0") != "0"
     force_local_models = force_local_models or env_force_local
     
     # Check for production security lock (strictest mode)
@@ -1081,7 +1081,7 @@ async def run_fan_out(
             "synthesis": None, "confidence": 0, "duration_secs": 0,
         }
 
-    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "1") != "0"
+    env_force_local = os.getenv("DEEP_THINK_FORCE_LOCAL", "0") != "0"
     force_local_models = force_local_models or env_force_local
     if os.getenv("OLLAMA_ONLY_MODE", "0") != "0":
         force_local_models = True
@@ -1115,7 +1115,11 @@ async def run_fan_out(
     height = max(1, min(height, 5))
 
     if not task_class:
-        task_class = await provider_module.classify_task(question, provider=_pc.get("provider", ""))
+        task_class = await provider_module.classify_task(
+            question,
+            provider=_pc.get("provider", ""),
+            data_policy=_pc.get("data_policy", data_policy),
+        )
 
     if task_class not in directives_module.TASK_CLASS_PROFILES:
         task_class = "general"
@@ -1162,7 +1166,10 @@ async def run_fan_out(
 
     def _perspective_cache_key(mandate_text: str, perspective_cfg: ProviderConfig) -> str:
         sig = provider_module.model_summary(perspective_cfg, resolved_class)
-        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}"
+        tool_sig = "tool:on" if tool_mode_enabled else "tool:off"
+        policy_sig = f"policy:{data_policy or 'any'}"
+        whitelist_sig = ",".join(sorted(web_domain_whitelist or []))
+        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}\n---{tool_sig}\n---{policy_sig}\n---{whitelist_sig}"
         return hashlib.sha256(payload.encode()).hexdigest()
 
     async def _run_tool_phase(perspective_name: str, perspective_answer: str, perspective_confidence: float = 0.5):
@@ -1242,6 +1249,13 @@ async def run_fan_out(
         cached = await asyncio.to_thread(store.get_perspective_cache, cache_key)
         if cached and cached.get("final_answer"):
             log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
+            tools_invoked: list[str] = []
+            tool_errors: list[str] = []
+            evidence_summary = ""
+            if tool_mode_enabled:
+                tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(
+                    name, cached["final_answer"], 0.5,
+                )
             if job_id:
                 await asyncio.to_thread(
                     store.set_pass_cache,
@@ -1254,7 +1268,7 @@ async def run_fan_out(
                 "final_answer": cached["final_answer"],
                 "passes_run": cached["passes_run"],
                 "cache_hit": True,
-                "tools_invoked": [], "tool_errors": [], "evidence_summary": "",
+                "tools_invoked": tools_invoked, "tool_errors": tool_errors, "evidence_summary": evidence_summary,
             }
 
         async with sem:

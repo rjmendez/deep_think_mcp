@@ -150,7 +150,8 @@ async def _lifespan(app):
     # Initialize advanced MQTT engine adapter
     try:
         log.info("[LIFESPAN] Initializing MQTTEngineAdapter...")
-        mqtt_adapter = MQTTEngineAdapter(deep_think_fn=__import__("engine", fromlist=["deep_think_passes"]).deep_think_passes)
+        from .engine import deep_think_passes
+        mqtt_adapter = MQTTEngineAdapter(deep_think_fn=deep_think_passes)
         mqtt_initialized = await mqtt_adapter.start_mqtt()
         log.info("[LIFESPAN] MQTTEngineAdapter initialized: %s", mqtt_initialized)
         app.mqtt_adapter = mqtt_adapter

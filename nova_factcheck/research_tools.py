@@ -37,6 +37,10 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+
+def _strip_www(domain: str) -> str:
+    return domain[4:] if domain.lower().startswith("www.") else domain
+
 NOVA_BASE_URL = os.getenv("NOVA_BASE_URL", "").rstrip("/")
 NOVA_SEARCH_TIMEOUT_S = float(os.getenv("NOVA_SEARCH_TIMEOUT_S", "15"))
 
@@ -299,8 +303,8 @@ def _domain_allowed(url: str, whitelist: List[str]) -> bool:
         return True
     try:
         from urllib.parse import urlparse
-        domain = urlparse(url).netloc.lower().lstrip("www.")
-        return any(domain == w.lower().lstrip("www.") or domain.endswith("." + w.lower().lstrip("www."))
+        domain = _strip_www(urlparse(url).netloc.lower())
+        return any(domain == _strip_www(w.lower()) or domain.endswith("." + _strip_www(w.lower()))
                    for w in whitelist)
     except Exception:
         return False
@@ -369,7 +373,7 @@ async def web_search(
             )
             continue
         from urllib.parse import urlparse
-        domain = urlparse(url).netloc.lstrip("www.")
+        domain = _strip_www(urlparse(url).netloc)
         results.append(WebResult(
             title=r.get("Text", "")[:200],
             url=url,
@@ -382,7 +386,7 @@ async def web_search(
     abstract_text = data.get("AbstractText", "")
     if abstract_url and abstract_text and _domain_allowed(abstract_url, whitelist):
         from urllib.parse import urlparse
-        domain = urlparse(abstract_url).netloc.lstrip("www.")
+        domain = _strip_www(urlparse(abstract_url).netloc)
         results.insert(0, WebResult(
             title=data.get("Heading", query),
             url=abstract_url,

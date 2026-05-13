@@ -245,6 +245,36 @@ class TestFix5AbliterationCustomParams:
             assert payload["max_tokens"] == 2048
 
 
+class TestCopilotPayloadFormat:
+    """Test that Copilot requests preserve the system prompt."""
+
+    @pytest.mark.asyncio
+    async def test_copilot_sends_system_message_in_messages(self):
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "choices": [{"message": {"content": "test"}}]
+            }
+
+            mock_client_instance = AsyncMock()
+            mock_client_instance.__aenter__.return_value = mock_client_instance
+            mock_client_instance.__aexit__.return_value = None
+            mock_client_instance.post = AsyncMock(return_value=mock_response)
+            mock_client.return_value = mock_client_instance
+
+            await provider_module._call_copilot(
+                oauth_token="token",
+                model="gpt-5.4-mini",
+                system="system prompt",
+                user_prompt="user prompt",
+            )
+
+            payload = mock_client_instance.post.call_args.kwargs.get("json")
+            assert payload["messages"][0] == {"role": "system", "content": "system prompt"}
+            assert payload["messages"][1] == {"role": "user", "content": "user prompt"}
+
+
 class TestTemperatureKnobPropagation:
     """Test that provider_config custom params reach provider payloads."""
 

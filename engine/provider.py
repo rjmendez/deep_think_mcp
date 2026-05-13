@@ -451,8 +451,10 @@ async def _call_copilot(
                 json={
                     "model": model,
                     "max_tokens": custom_params.get("max_tokens", 4096),
-                    "system": system,
-                    "messages": [{"role": "user", "content": user_prompt}],
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_prompt},
+                    ],
                     **{
                         key: custom_params[key]
                         for key in ("temperature", "top_p", "stop")

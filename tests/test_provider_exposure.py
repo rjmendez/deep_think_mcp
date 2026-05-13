@@ -12,6 +12,7 @@ from tools.code_search import invoke_code_search, _search_local_repo
 from tools.web_search import invoke_web_search
 from tools.nova_verify import invoke_nova_verify
 from tools.document_fetch import invoke_document_fetch
+import tools.document_fetch as document_fetch_module
 
 
 def test_reasoning_tool_schema_exposes_provider_config_fields():
@@ -205,3 +206,10 @@ def test_document_fetch_blocks_domain_not_in_whitelist(monkeypatch):
     _results, impact, error = invoke_document_fetch("https://example.com", timeout=5)
     assert impact < 0
     assert "Domain blocked by document fetch policy" in error
+
+
+def test_domain_whitelist_uses_exact_www_prefix_removal():
+    assert research_tools._domain_allowed("https://www.evil.com", ["evil.com"]) is True
+    assert research_tools._domain_allowed("https://wwwevil.com", ["evil.com"]) is False
+    assert document_fetch_module._domain_allowed("https://www.evil.com", ["evil.com"]) is True
+    assert document_fetch_module._domain_allowed("https://wwwevil.com", ["evil.com"]) is False
