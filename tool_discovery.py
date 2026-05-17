@@ -18,8 +18,9 @@ Built-in tools:
 - nova_search: Great Library semantic search (if available)
 """
 
+import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Protocol, runtime_checkable
 from enum import Enum
 import logging
 
@@ -145,6 +146,15 @@ class ToolDirective:
         
         if self.max_results is not None and self.max_results < 1:
             raise ValueError(f"max_results must be >= 1, got {self.max_results}")
+
+
+@runtime_checkable
+class ToolProtocol(Protocol):
+    """Runtime contract for custom tool handlers."""
+
+    def execute(self, query: str, timeout: int, **kwargs: Any) -> Any:
+        """Execute the tool and return a result."""
+        ...
 
 
 # ============================================================================
@@ -426,6 +436,16 @@ class ToolRegistry:
         
         if schema.name != name:
             raise ValueError(f"Schema name '{schema.name}' doesn't match tool name '{name}'")
+
+        if handler is not None:
+            if inspect.isfunction(handler) or inspect.ismethod(handler):
+                pass
+            elif not isinstance(handler, ToolProtocol) or not callable(
+                getattr(handler, "execute", None)
+            ):
+                raise ValueError(
+                    "Tool handler must be a function/method or implement ToolProtocol.execute()"
+                )
         
         self._tools[name] = schema
         if handler:

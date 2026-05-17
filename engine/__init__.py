@@ -73,6 +73,7 @@ from .task_class_enforcer import (
     RESEARCH_ENABLED_TASK_CLASSES,
     RESEARCH_BLOCKED_TASK_CLASSES,
 )
+from .private_adversarial_lane import build_private_challenge_flags
 
 __all__ = [
     # Types
@@ -114,6 +115,7 @@ __all__ = [
     "ABLITERATION_MODEL_PATTERNS",
     "RESEARCH_ENABLED_TASK_CLASSES",
     "RESEARCH_BLOCKED_TASK_CLASSES",
+    "build_private_challenge_flags",
     # Creative reasoning
     "CreativeReasoningEngine",
     "CreativePassResult",

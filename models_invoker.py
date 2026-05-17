@@ -35,6 +35,7 @@ class ToolDirective:
     """
     tool_name: str
     query: str
+    perspective_id: str = ""
     priority: int = 1
     purpose: str = "ground"
     expected_impact: str = ""
@@ -42,7 +43,21 @@ class ToolDirective:
     def __post_init__(self):
         """Validate directive fields."""
         valid_tools = {"web_search", "code_search", "nova_verify", "document_fetch"}
-        if self.tool_name not in valid_tools:
+        is_registered_tool = False
+        try:
+            from .tool_discovery import get_tool_registry
+        except ImportError:  # pragma: no cover - support direct imports in tests
+            try:
+                from tool_discovery import get_tool_registry
+            except ImportError:
+                get_tool_registry = None
+        if get_tool_registry is not None:
+            try:
+                is_registered_tool = get_tool_registry().has_tool(self.tool_name)
+            except Exception:
+                is_registered_tool = False
+
+        if self.tool_name not in valid_tools and not is_registered_tool:
             raise ValueError(f"Invalid tool_name: {self.tool_name}. Must be one of {valid_tools}")
         if not 0 <= self.priority <= 3:
             raise ValueError(f"Invalid priority: {self.priority}. Must be 0-3")

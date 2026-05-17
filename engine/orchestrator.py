@@ -30,6 +30,7 @@ from .task_class_enforcer import (
     check_research_tool_allowed,
     filter_adversarial_output,
 )
+from .private_adversarial_lane import build_private_challenge_flags
 from .validator import validate_passes, validate_width, validate_height, ValidationError
 from deep_think_mcp import store
 from deep_think_mcp import discover
@@ -47,6 +48,34 @@ def _build_tool_query(question: str, perspective_answer: str, max_chars: int = 1
         return ""
     query = "\n\n".join(parts)
     return query[:max_chars]
+
+
+def _is_off_topic_response(question: str, answer: str) -> tuple[bool, str]:
+    """Detect obvious perspective drift where model answers a different question."""
+    q = (question or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return False, ""
+
+    q_tokens = set(re.findall(r"[a-z0-9_]+", q.lower()))
+    if not q_tokens:
+        return False, ""
+
+    # Common failure mode observed in live runs: model emits its own "Question: ..."
+    # block that is unrelated to the requested task.
+    m = re.search(r"(?is)^\s*question:\s*(.+?)(?:\n|$)", a)
+    if m:
+        candidate = m.group(1).strip()
+        c_tokens = set(re.findall(r"[a-z0-9_]+", candidate.lower()))
+        if c_tokens:
+            overlap = len(q_tokens & c_tokens) / max(len(q_tokens), 1)
+            if overlap < 0.25:
+                return True, (
+                    "model generated a different question context "
+                    f"(overlap={overlap:.2f})"
+                )
+
+    return False, ""
 
 
 def _log_pass_exception(
@@ -70,6 +99,14 @@ def _log_pass_exception(
     except Exception:
         log.debug("Failed to extract custom params for pass exception", exc_info=True)
 
+    # Extract key diagnostic params directly from provider_config
+    _DIAG_PARAMS = ("temperature", "top_p", "top_k", "max_tokens", "seed")
+    diag_params = {}
+    if isinstance(provider_config, dict):
+        for p in _DIAG_PARAMS:
+            if provider_config.get(p) is not None:
+                diag_params[p] = provider_config[p]
+
     payload = {
         "event": "pass_exception",
         "job_id": job_id,
@@ -82,6 +119,7 @@ def _log_pass_exception(
         "error": error,
         "exception_type": exception_type,
     }
+    payload.update(diag_params)
     if custom_params:
         payload["custom_params"] = custom_params
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -520,7 +558,7 @@ Return ONLY valid JSON — no other text:
     {{
       "claim": "<specific factual or analytical claim, one sentence>",
       "confidence": <0.0-1.0, how confident the analysis seems in this claim>,
-      "evidence_basis": "<brief note on what supports this claim, or 'asserted' if no support given>"
+      "evidence_basis": "<cite the specific tool evidence entry that supports this, or 'asserted: no tool evidence' if fabricated from model knowledge>"
     }}
   ],
   "verdict": "<the analysis's overall conclusion in one sentence>",
@@ -540,6 +578,8 @@ PERSPECTIVE ANALYSES:
 
 ---
 Analyze convergence and divergence across these perspectives, then produce your output as a JSON block.
+
+GROUNDING RULE: You may only cite specific file paths or line numbers (e.g. engine/foo.py:42) if that exact reference appears in the TOOL EVIDENCE sections above. If you have not seen a file's contents in tool evidence, do not cite specific line numbers from it — describe the concern conceptually instead.
 
 INSTRUCTIONS:
 1. CONVERGED CLAIMS: Identify claims where different perspectives independently reached the same conclusion through different reasoning paths. These are the highest-confidence findings.
@@ -676,19 +716,44 @@ async def deep_think_passes(
     base_task_class = task_profile.get("task_class", task_class)
     directives = task_profile.get("directives", [])
     
+    adversarial_lane_meta: dict[str, Any] | None = None
+
     # Initialize provider config
     if provider_config is None:
         provider_config = {}
     else:
         provider_config = dict(provider_config)
 
+    if base_task_class == "adversarial" and provider_module.private_adversarial_lane_requested(provider_config):
+        try:
+            provider_config, adversarial_lane_meta = await provider_module.configure_private_adversarial_lane(
+                provider_config
+            )
+        except Exception as e:
+            error_msg = f"Private adversarial lane unavailable: {e}"
+            log.error(error_msg)
+            return {
+                "status": "failed",
+                "skill": task_class,
+                "task_class": base_task_class,
+                "final_answer": "",
+                "pass_outputs": [],
+                "pass_results": [],
+                "confidence": 0.0,
+                "duration_secs": time.time() - start_time,
+                "error": error_msg,
+            }
+
     if task_profile.get("force_local"):
-        force_local_models = True
-        provider_config.setdefault("provider", "ollama")
-        provider_config["light_provider"] = "ollama"
-        provider_config["medium_provider"] = "ollama"
-        provider_config["heavy_provider"] = "ollama"
-        provider_config.setdefault("data_policy", "local")
+        if adversarial_lane_meta and adversarial_lane_meta.get("provider") == "abliteration":
+            force_local_models = False
+        else:
+            force_local_models = True
+            provider_config.setdefault("provider", "ollama")
+            provider_config["light_provider"] = "ollama"
+            provider_config["medium_provider"] = "ollama"
+            provider_config["heavy_provider"] = "ollama"
+            provider_config.setdefault("data_policy", "local")
 
     if task_profile.get("block_research_tools"):
         enable_research = False
@@ -707,6 +772,43 @@ async def deep_think_passes(
         cfg.data_policy = data_policy
     elif force_local_models:
         cfg.data_policy = "local"  # Ensure local is set
+
+    if base_task_class == "adversarial" and adversarial_lane_meta:
+        lane_provider = (adversarial_lane_meta or {}).get("provider", "")
+        if cfg.data_policy == "local" and lane_provider == "abliteration":
+            error_msg = (
+                "Private adversarial lane configuration conflicts with data_policy=local: "
+                "lane selected provider=abliteration."
+            )
+            log.error(error_msg)
+            return {
+                "status": "failed",
+                "skill": task_class,
+                "task_class": base_task_class,
+                "final_answer": "",
+                "pass_outputs": [],
+                "pass_results": [],
+                "confidence": 0.0,
+                "duration_secs": time.time() - start_time,
+                "error": error_msg,
+            }
+        if cfg.data_policy == "cloud" and lane_provider == "ollama":
+            error_msg = (
+                "Private adversarial lane configuration conflicts with data_policy=cloud: "
+                "lane selected provider=ollama."
+            )
+            log.error(error_msg)
+            return {
+                "status": "failed",
+                "skill": task_class,
+                "task_class": base_task_class,
+                "final_answer": "",
+                "pass_outputs": [],
+                "pass_results": [],
+                "confidence": 0.0,
+                "duration_secs": time.time() - start_time,
+                "error": error_msg,
+            }
 
     for tier_name in ("light", "medium", "heavy"):
         tier_provider = provider_module._tier_provider(cfg, tier_name)
@@ -766,11 +868,13 @@ async def deep_think_passes(
         if pass_override and "system" in pass_override:
             system_prompt = pass_override["system"]
         else:
-            system_prompt = f"""You are an expert reasoner. Apply this framing strictly:
+            mandate_block = f"{mandate_prefix}\n\n" if mandate_prefix else ""
+            system_prompt = f"""{mandate_block}You are an expert reasoner. Apply this framing strictly:
 
 {framing_text}
 
-Use the mandate to structure your response. Be precise and evidence-based."""
+Use the mandate to structure your response. Be precise and evidence-based.
+Do NOT replace or invent the question. Answer only the provided question/context."""
         
         user_prompt = f"Question: {question}"
         
@@ -869,8 +973,19 @@ Use the mandate to structure your response. Be precise and evidence-based."""
     
     duration = time.time() - start_time
     
-    return {
-        "status": _result_status(pass_results),
+    result_status_val = _result_status(pass_results)
+    # Surface the first failed-pass error at the top level so callers
+    # (e.g. run_fan_out/run_perspective) can read r.get("error") directly
+    # without having to dig into pass_results.
+    top_level_error: Optional[str] = None
+    if result_status_val == "failed":
+        for pr in pass_results:
+            if pr.get("status") == "failed" and pr.get("error"):
+                top_level_error = pr["error"]
+                break
+
+    result = {
+        "status": result_status_val,
         "skill": task_class,
         "task_class": base_task_class,
         "final_answer": final_answer,
@@ -879,6 +994,33 @@ Use the mandate to structure your response. Be precise and evidence-based."""
         "confidence": avg_confidence,
         "duration_secs": duration,
     }
+    if top_level_error is not None:
+        result["error"] = top_level_error
+    if base_task_class == "adversarial":
+        successful_pass_providers = [
+            pr.get("provider", "")
+            for pr in pass_results
+            if pr.get("status") == "complete" and pr.get("provider")
+        ]
+        effective_provider = (
+            successful_pass_providers[-1]
+            if successful_pass_providers
+            else provider_module._tier_provider(cfg, "medium")
+        )
+        challenge_bundle = build_private_challenge_flags(
+            target_question=question,
+            target_output=final_answer,
+            context="\n".join(pass_outputs[:-1]),
+        )
+        result["challenge_flags"] = challenge_bundle["challenge_flags"]
+        result["adversarial_lane"] = {
+            "lane": challenge_bundle["lane"],
+            "role": challenge_bundle["role"],
+            "non_authoritative": challenge_bundle["non_authoritative"],
+            "provider": effective_provider,
+            "degraded_from_local": bool((adversarial_lane_meta or {}).get("degraded_from_local", False)),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +1036,7 @@ def _validate_synthesis_grounding(
     successful_tool_calls: int,
     enable_tool_use: bool,
     task_class: str,
+    evidence_texts: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     """Return (inference_only, grounding_warnings).
 
@@ -911,12 +1054,36 @@ def _validate_synthesis_grounding(
         )
 
     if task_class == "code_review" and successful_tool_calls == 0:
-        if not _FILE_CITATION_RE.search(synthesis_text):
-            inference_only = True
-            if not any("GROUNDING UNAVAILABLE" in w for w in warnings):
+        inference_only = True
+        if _FILE_CITATION_RE.search(synthesis_text):
+            warnings.append(
+                "CITATION WARNING: citation-like file-path:line tokens are present but no "
+                "successful tool evidence exists. Treat citations as unverified text."
+            )
+        elif not any("GROUNDING UNAVAILABLE" in w for w in warnings):
+            warnings.append(
+                "CITATION WARNING: code_review synthesis contains no file-path:line "
+                "citations. Findings may be fabricated. Do not treat as verified."
+            )
+
+    # Check file:line citations in synthesis against the actual evidence text.
+    # If the synthesis cites a specific file:line, that exact token must appear
+    # in at least one evidence_summary — otherwise it is fabricated.
+    if evidence_texts and successful_tool_calls > 0:
+        citations = _FILE_CITATION_RE.findall(synthesis_text)
+        if citations:
+            combined_evidence = "\n".join(evidence_texts)
+            ungrounded = [c for c in citations if c not in combined_evidence]
+            if ungrounded:
+                # Deduplicate while preserving order
+                seen: set[str] = set()
+                unique_ungrounded = [c for c in ungrounded if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
+                inference_only = True
                 warnings.append(
-                    "CITATION WARNING: code_review synthesis contains no file-path:line "
-                    "citations. Findings may be fabricated. Do not treat as verified."
+                    f"CITATION MISMATCH: {len(unique_ungrounded)} file:line citation(s) in synthesis "
+                    f"have no match in tool evidence — likely fabricated: "
+                    + ", ".join(unique_ungrounded[:5])
+                    + ("…" if len(unique_ungrounded) > 5 else "")
                 )
 
     return inference_only, warnings
@@ -1166,10 +1333,15 @@ async def run_fan_out(
 
     def _perspective_cache_key(mandate_text: str, perspective_cfg: ProviderConfig) -> str:
         sig = provider_module.model_summary(perspective_cfg, resolved_class)
+        topology_sig = f"topology:{topology}"
+        task_sig = f"task_class:{resolved_class}"
         tool_sig = "tool:on" if tool_mode_enabled else "tool:off"
         policy_sig = f"policy:{data_policy or 'any'}"
         whitelist_sig = ",".join(sorted(web_domain_whitelist or []))
-        payload = f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}\n---{tool_sig}\n---{policy_sig}\n---{whitelist_sig}"
+        payload = (
+            f"{question}\n---\n{mandate_text}\n---h{height}\n---{sig}\n---{topology_sig}"
+            f"\n---{task_sig}\n---{tool_sig}\n---{policy_sig}\n---{whitelist_sig}"
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
     async def _run_tool_phase(perspective_name: str, perspective_answer: str, perspective_confidence: float = 0.5):
@@ -1200,6 +1372,7 @@ async def run_fan_out(
                         tool_name=tool_name,
                         query=tool_query,
                         reason="fan_out_tool_loop",
+                        perspective_id=perspective_name,
                         priority=1,
                         max_results=5,
                         timeout=tool_timeout,
@@ -1305,6 +1478,23 @@ async def run_fan_out(
             passes_run = height
 
         if child_status == "complete" and isinstance(final_answer, str) and final_answer.strip():
+            off_topic, off_topic_reason = _is_off_topic_response(question, final_answer)
+            if off_topic:
+                child_status = "failed"
+                child_error = f"off_topic_response: {off_topic_reason}"
+                tools_invoked, tool_errors, evidence_summary = [], [], ""
+                final_answer = ""
+                return {
+                    "name": name,
+                    "status": child_status,
+                    "error": child_error,
+                    "final_answer": final_answer,
+                    "passes_run": passes_run,
+                    "cache_hit": False,
+                    "tools_invoked": tools_invoked,
+                    "tool_errors": tool_errors,
+                    "evidence_summary": evidence_summary,
+                }
             tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer, perspective_confidence)
             perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
             await asyncio.to_thread(
@@ -1314,7 +1504,14 @@ async def run_fan_out(
         else:
             tools_invoked, tool_errors, evidence_summary = [], [], ""
             if child_error is None and child_status != "complete":
-                child_error = f"perspective returned status={child_status}"
+                # Try to extract the real error from pass_results before falling back
+                if isinstance(r, dict):
+                    for pr in r.get("pass_results", []):
+                        if pr.get("status") == "failed" and pr.get("error"):
+                            child_error = pr["error"]
+                            break
+                if child_error is None:
+                    child_error = f"perspective returned status={child_status}"
 
         return {
             "name": name,
@@ -1373,9 +1570,14 @@ async def run_fan_out(
             "Fan-out failed: only %d/%d perspectives succeeded.",
             len(successes), width,
         )
+        failure_error = (
+            f"FAN_OUT_FAILURE: insufficient successful perspectives for synthesis "
+            f"({len(successes)}/{width} succeeded)"
+        )
         return {
             "type": "fan_out",
             "status": "failed",
+            "error": failure_error,
             "task_class": resolved_class,
             "skill": resolved_class,
             "width": width,
@@ -1385,8 +1587,10 @@ async def run_fan_out(
             "cache_hits": cache_hits,
             "tools_invoked_total": tools_invoked_total,
             "tool_successes_total": successful_tool_calls,
-            "inference_only": False,
-            "grounding_warnings": [],
+            "inference_only": True,
+            "grounding_warnings": [
+                f"{failure_error}. No grounded final answer could be produced."
+            ],
             "adaptive_triggered": False,
             "adaptive_reason": "",
             "final_width": width,
@@ -1664,12 +1868,14 @@ async def run_fan_out(
     )
 
     # Grounding gate
+    evidence_texts = [p.get("evidence_summary", "") for p in perspective_outputs if p.get("evidence_summary")]
     inference_only, grounding_warnings = _validate_synthesis_grounding(
         synthesis_text=synthesis_text,
         tools_invoked_total=tools_invoked_total,
         successful_tool_calls=successful_tool_calls,
         enable_tool_use=enable_tool_use,
         task_class=resolved_class,
+        evidence_texts=evidence_texts,
     )
     if grounding_warnings:
         warning_block = "\n".join(f"⚠️  {w}" for w in grounding_warnings)

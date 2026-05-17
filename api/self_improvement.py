@@ -429,7 +429,7 @@ def register(mcp):
                 )
             
             metrics = MetricsCollector()
-            metrics_endpoint = os.getenv("METRICS_ENDPOINT", os.getenv("PROMETHEUS_ENDPOINT", "")).strip()
+            metrics_endpoint = os.getenv("METRICS_ENDPOINT", "").strip()
             if not metrics_endpoint:
                 log.warning(
                     "No METRICS_ENDPOINT set; deployment will proceed without metric-based "

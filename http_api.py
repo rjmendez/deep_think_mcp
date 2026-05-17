@@ -234,6 +234,6 @@ async def list_recent_jobs(status: Optional[str] = None, limit: int = 10):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    host = os.getenv("DEEP_THINK_HOST", "127.0.0.1")
+    host = os.getenv("DEEP_THINK_HOST", "0.0.0.0")
     port = int(os.getenv("DEEP_THINK_PORT", "8080"))
     run(app, host=host, port=port, log_level="info")

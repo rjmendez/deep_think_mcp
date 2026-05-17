@@ -731,5 +731,242 @@ class TestBatchTiming:
         assert batch.total_time_ms >= 0
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# TEST: CUSTOM HANDLER REGISTRATION (tool_discovery)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestCustomHandlerRegistration:
+    """Tests for ToolRegistry custom handler validation (ToolProtocol enforcement)."""
+
+    def _make_registry(self):
+        """Return a fresh ToolRegistry for each test."""
+        from tool_discovery import ToolRegistry
+        return ToolRegistry()
+
+    def _make_schema(self, name: str):
+        from tool_discovery import ToolCapability, ToolCategory
+        return ToolCapability(
+            name=name,
+            description="Test tool",
+            category=ToolCategory.SEARCH.value,
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            output_schema={"type": "string"},
+        )
+
+    def test_handler_without_execute_raises(self):
+        """Registering an object without execute() raises ValueError."""
+        registry = self._make_registry()
+        schema = self._make_schema("custom_tool_a")
+
+        class BadHandler:
+            pass
+
+        with pytest.raises(ValueError, match="ToolProtocol"):
+            registry.register_tool("custom_tool_a", schema, handler=BadHandler())
+
+    def test_handler_with_execute_is_accepted(self):
+        """Registering an object implementing execute() succeeds."""
+        registry = self._make_registry()
+        schema = self._make_schema("custom_tool_b")
+
+        class GoodHandler:
+            def execute(self, query: str, timeout: int, **kwargs):
+                return "result", 0.1, ""
+
+        registry.register_tool("custom_tool_b", schema, handler=GoodHandler())
+        assert registry.has_tool("custom_tool_b")
+
+    def test_handler_with_noncallable_execute_raises(self):
+        """An execute attribute that is not callable is rejected."""
+        registry = self._make_registry()
+        schema = self._make_schema("custom_tool_b2")
+
+        class BadHandler:
+            execute = "not callable"
+
+        with pytest.raises(ValueError, match="ToolProtocol"):
+            registry.register_tool("custom_tool_b2", schema, handler=BadHandler())
+
+    def test_plain_callable_handler_is_accepted(self):
+        """Registering a plain callable (function) handler succeeds."""
+        registry = self._make_registry()
+        schema = self._make_schema("custom_tool_c")
+
+        def my_handler(query, timeout, **kwargs):
+            return "result", 0.1, ""
+
+        registry.register_tool("custom_tool_c", schema, handler=my_handler)
+        assert registry.has_tool("custom_tool_c")
+
+    def test_lambda_handler_is_accepted(self):
+        """Registering a lambda handler succeeds."""
+        registry = self._make_registry()
+        schema = self._make_schema("custom_tool_d")
+        registry.register_tool("custom_tool_d", schema, handler=lambda q, t: ("ok", 0.1, ""))
+        assert registry.has_tool("custom_tool_d")
+
+    def test_registered_execute_handler_is_invoked(self):
+        """Registered custom handlers are callable through the invoker."""
+        from tool_discovery import get_tool_registry, register_custom_tool
+
+        registry = get_tool_registry()
+        schema = self._make_schema("custom_tool_e")
+
+        class GoodHandler:
+            def execute(self, query: str, timeout: int, **kwargs):
+                return {"query": query, "timeout": timeout}, 0.25, ""
+
+        register_custom_tool("custom_tool_e", schema, handler=GoodHandler())
+
+        invoker = ToolInvoker()
+        invoker._tool_registry = registry
+
+        directive = ToolDirective(
+            tool_name="custom_tool_e",
+            query="hello",
+            priority=1,
+            purpose="ground",
+        )
+        result = invoker._invoke_single_tool(directive, timeout=5)
+
+        assert result.tool_status == "success"
+        assert '"query": "hello"' in result.results
+        assert result.confidence_impact == 0.25
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TEST: TOOL OUTPUT NORMALIZATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestToolOutputNormalization:
+    """Tests for ToolInvoker._normalize_tool_output validation and normalization."""
+
+    def test_string_passthrough(self):
+        """String output is returned unchanged."""
+        result, err = ToolInvoker._normalize_tool_output("hello world")
+        assert err == ""
+        assert result == "hello world"
+
+    def test_int_normalizes_to_repr(self):
+        """int output is converted with repr."""
+        result, err = ToolInvoker._normalize_tool_output(42)
+        assert err == ""
+        assert result == "42"
+
+    def test_float_normalizes_to_repr(self):
+        """float output is converted with repr."""
+        result, err = ToolInvoker._normalize_tool_output(3.14)
+        assert err == ""
+        assert result == repr(3.14)
+
+    def test_bool_normalizes_to_repr(self):
+        """bool output is converted with repr."""
+        result, err = ToolInvoker._normalize_tool_output(True)
+        assert err == ""
+        assert result == "True"
+
+    def test_none_normalizes_to_repr(self):
+        """None output is converted with repr."""
+        result, err = ToolInvoker._normalize_tool_output(None)
+        assert err == ""
+        assert result == "None"
+
+    def test_safe_dict_normalizes_to_json(self):
+        """JSON-safe dict is serialized to JSON string."""
+        value = {"key": "value", "count": 3}
+        result, err = ToolInvoker._normalize_tool_output(value)
+        import json
+        assert err == ""
+        assert json.loads(result) == value
+
+    def test_safe_list_normalizes_to_json(self):
+        """JSON-safe list is serialized to JSON string."""
+        value = [1, "two", True, None]
+        result, err = ToolInvoker._normalize_tool_output(value)
+        import json
+        assert err == ""
+        assert json.loads(result) == value
+
+    def test_safe_tuple_normalizes_to_json(self):
+        """JSON-safe tuple is serialized as a JSON array."""
+        value = (1, 2, 3)
+        result, err = ToolInvoker._normalize_tool_output(value)
+        import json
+        assert err == ""
+        assert json.loads(result) == list(value)
+
+    def test_callable_is_rejected(self):
+        """Callable tool output is rejected without calling it."""
+        side_effects = []
+
+        def evil():
+            side_effects.append("called")
+            return "pwned"
+
+        result, err = ToolInvoker._normalize_tool_output(evil)
+        assert result == ""
+        assert "callable" in err
+        assert side_effects == [], "callable must not have been invoked"
+
+    def test_generator_is_rejected(self):
+        """Generator tool output is rejected."""
+        def gen():
+            yield "item"
+
+        result, err = ToolInvoker._normalize_tool_output(gen())
+        assert result == ""
+        assert "generator" in err
+
+    def test_arbitrary_object_with_str_side_effect_is_rejected(self):
+        """Object with side-effectful __str__ is rejected without calling str()."""
+        side_effects = []
+
+        class EvilStr:
+            def __str__(self):
+                side_effects.append("str called")
+                return "evil"
+
+            def __repr__(self):
+                side_effects.append("repr called")
+                return "evil"
+
+        result, err = ToolInvoker._normalize_tool_output(EvilStr())
+        assert result == ""
+        assert "unsupported type" in err
+        assert side_effects == [], "__str__/__repr__ must not have been called"
+
+    def test_non_json_serializable_dict_rejected(self):
+        """Dict containing a non-JSON-serializable value is rejected."""
+        result, err = ToolInvoker._normalize_tool_output({"bad": object()})
+        assert result == ""
+        assert "not JSON-serializable" in err
+
+    def test_malicious_tool_output_yields_error_result(self, invoker):
+        """A tool wrapper returning a callable yields an error ToolResult."""
+
+        def malicious_result():
+            pass
+
+        directive = ToolDirective("web_search", "test query", priority=0)
+
+        with patch("tools.web_search.invoke_web_search", return_value=(malicious_result, 0.1, "")):
+            result = invoker._invoke_single_tool(directive, 10)
+
+        assert result.tool_status == "error"
+        assert "callable" in result.error_message
+
+    def test_safe_dict_output_normalizes_end_to_end(self, invoker):
+        """A tool wrapper returning a dict normalizes correctly into ToolResult.results."""
+        import json
+        dict_output = {"title": "Test", "score": 0.9}
+        directive = ToolDirective("web_search", "test query", priority=0)
+
+        with patch("tools.web_search.invoke_web_search", return_value=(dict_output, 0.15, "")):
+            result = invoker._invoke_single_tool(directive, 10)
+
+        assert result.tool_status == "success"
+        assert json.loads(result.results) == dict_output
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

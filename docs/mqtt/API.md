@@ -196,7 +196,7 @@ Snapshot of current metrics.
 
 **Methods:**
 - `to_json()` - Convert to JSON
-- `to_prometheus_format()` - Format for Prometheus scraping
+- `to_prometheus_format()` - Format as Prometheus exposition text
 
 ### HeartbeatPublisher
 

@@ -8,12 +8,14 @@ from deep_think_mcp.models_invoker import ToolInvocationBatch, ToolResult
 
 def test_invoke_tools_and_digest_initializes_invoker_with_low_budget_gate(monkeypatch):
     captured_config = {}
+    captured_perspective_ids = []
 
     class FakeInvoker:
-        def __init__(self, config=None):
+        def __init__(self, config=None, task_class=None, job_id=None, web_domain_whitelist=None):
             captured_config["config"] = config
 
         def invoke_tools(self, directives, budget_remaining, perspective_id, timeout):
+            captured_perspective_ids.extend(getattr(d, "perspective_id", "") for d in directives)
             return ToolInvocationBatch(
                 perspective_id=perspective_id,
                 directives=directives,
@@ -60,5 +62,6 @@ def test_invoke_tools_and_digest_initializes_invoker_with_low_budget_gate(monkey
 
     assert captured_config["config"].min_budget_remaining == 1
     assert captured_config["config"].tool_timeout_seconds == 7
+    assert captured_perspective_ids == ["p1"]
     assert digest is not None
     assert consumed == 1

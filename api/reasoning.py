@@ -110,6 +110,17 @@ class ProviderConfigOverrides(TypedDict, total=False):
     seed: int
     custom_params: dict
     options: dict
+    adversarial_provider: str
+    adversarial_allow_abliteration: bool
+    adversarial_ollama_base_url: str
+    adversarial_heretic_model: str
+    adversarial_heretic_light: str
+    adversarial_heretic_medium: str
+    adversarial_heretic_heavy: str
+    adversarial_abliteration_model: str
+    adversarial_abliteration_light: str
+    adversarial_abliteration_medium: str
+    adversarial_abliteration_heavy: str
 
 
 def register(mcp):
@@ -175,6 +186,11 @@ def register(mcp):
                 seed            Deterministic seed for Ollama
                 custom_params   Nested provider-specific sampling params
                 options         Ollama-native options object
+                adversarial_provider            "auto" | "ollama" | "abliteration" (adversarial lane only)
+                adversarial_allow_abliteration  Allow cloud fallback for adversarial lane
+                adversarial_ollama_base_url     Optional heretic Ollama endpoint override
+                adversarial_heretic_*           Per-tier local heretic model overrides
+                adversarial_abliteration_*      Per-tier Abliteration model overrides
             verify:      If True, runs an extra heavy-tier re-traversal pass after the main passes
                          to check for gaps, contradictions, and unsupported claims (RYS verification).
             enable_research: If True and task_class permits, inject grounded research context.
@@ -438,6 +454,10 @@ def register(mcp):
                 response["error"] = result.get("error")
             elif job.get("error"):
                 response["error"] = job.get("error")
+            elif isinstance(result, dict):
+                warnings = result.get("grounding_warnings")
+                if isinstance(warnings, list) and warnings:
+                    response["error"] = str(warnings[0])
 
         if include_reasoning_chain:
             response["reasoning_chain"] = store.get_full_reasoning_chain(job_id)

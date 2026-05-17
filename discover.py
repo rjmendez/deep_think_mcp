@@ -66,9 +66,8 @@ _CLOUD_TIMEOUTS: list[tuple[str, int]] = [
     ("opus-4.6",      180),
     ("opus-4.7",      180),
     ("opus-4",        180),
-    # Abliteration default cloud model
-    ("abliterated-model", 120),
     ("gpt-5.4",       120),
+    ("gpt-5.5",       180),
 ]
 _CLOUD_TIMEOUT_DEFAULT = 120
 
@@ -306,12 +305,16 @@ def _detect_cloud_providers() -> list[ModelInfo]:
             pass
 
     if abliteration_key:
-        mid = "abliterated-model"
-        models.append(ModelInfo(
-            model_id=mid, provider="abliteration",
-            suggested_tier="medium", capabilities=["general", "code", "reasoning"],
-            timeout_secs=cloud_timeout(mid), last_checked=now,
-        ))
+        for mid, tier in [
+            ("gpt-4.1", "light"),
+            ("gpt-5.4", "medium"),
+            ("gpt-5.5", "heavy"),
+        ]:
+            models.append(ModelInfo(
+                model_id=mid, provider="abliteration",
+                suggested_tier=tier, capabilities=["general", "code", "reasoning"],
+                timeout_secs=cloud_timeout(mid), last_checked=now,
+            ))
 
     return models
 

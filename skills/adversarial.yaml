@@ -36,6 +36,6 @@ controls:
     - stop when external research would be required
 models:
   ollama:
-    light: heretic-llama31-8b-instruct:latest
-    medium: heretic-llama31-8b-instruct:latest
-    heavy: heretic-llama31-8b-instruct:latest
+    light: phi4-mini:latest
+    medium: llama3.1:8b
+    heavy: llama3.1:8b

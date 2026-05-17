@@ -617,3 +617,69 @@ class TestFanOutPolicyAndCache:
         assert result["tools_invoked_total"] == 1
         assert result["perspectives"][0]["tools_invoked"] == ["code_search"]
         assert result["perspectives"][0]["evidence_summary"] == "evidence"
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_cache_key_varies_by_topology_enable_tool_use_and_task_class(self, monkeypatch):
+        seen_keys: list[tuple[str, str, str]] = []
+        current_topology = ""
+        current_task_class = ""
+
+        async def fake_deep_think_passes(**_kwargs):
+            return {
+                "status": "complete",
+                "final_answer": "ok",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": 0.8,
+            }
+
+        def record_cache_key(key):
+            seen_keys.append((current_topology, current_task_class, key))
+            return None
+
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", record_cache_key)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "_validate_and_enforce_local_models", AsyncMock())
+        monkeypatch.setattr(orchestrator, "check_research_tool_allowed", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="ollama", data_policy="any"))
+
+        current_topology = "static"
+        current_task_class = "general"
+        await orchestrator.run_fan_out(
+            question="cache-key regression",
+            width=1,
+            height=1,
+            task_class=current_task_class,
+            topology=current_topology,
+            enable_tool_use=True,
+        )
+
+        current_topology = "adaptive"
+        current_task_class = "general"
+        await orchestrator.run_fan_out(
+            question="cache-key regression",
+            width=1,
+            height=1,
+            task_class=current_task_class,
+            topology=current_topology,
+            enable_tool_use=True,
+        )
+
+        current_topology = "static"
+        current_task_class = "code_review"
+        await orchestrator.run_fan_out(
+            question="cache-key regression",
+            width=1,
+            height=1,
+            task_class=current_task_class,
+            topology=current_topology,
+            enable_tool_use=True,
+        )
+
+        keys = [key for _, _, key in seen_keys]
+        assert len(keys) == 3
+        assert len(set(keys)) == 3

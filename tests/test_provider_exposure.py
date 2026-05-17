@@ -6,6 +6,7 @@ from fastmcp import FastMCP
 
 from deep_think_mcp.api import reasoning as reasoning_api
 from deep_think_mcp.engine import orchestrator
+from deep_think_mcp.engine.orchestrator import _validate_synthesis_grounding
 from deep_think_mcp import discover
 from nova_factcheck import research_tools
 from tools.code_search import invoke_code_search, _search_local_repo
@@ -13,6 +14,8 @@ from tools.web_search import invoke_web_search
 from tools.nova_verify import invoke_nova_verify
 from tools.document_fetch import invoke_document_fetch
 import tools.document_fetch as document_fetch_module
+from tool_invoker import ToolInvoker
+from models_invoker import ToolDirective as InvokerDirective
 
 
 def test_reasoning_tool_schema_exposes_provider_config_fields():
@@ -27,6 +30,8 @@ def test_reasoning_tool_schema_exposes_provider_config_fields():
     assert "medium_provider" in provider_fields
     assert "heavy_provider" in provider_fields
     assert "temperature" in provider_fields
+    assert "adversarial_provider" in provider_fields
+    assert "adversarial_heretic_model" in provider_fields
 
 
 def test_detect_cloud_providers_includes_abliteration_from_env(monkeypatch):
@@ -36,7 +41,7 @@ def test_detect_cloud_providers_includes_abliteration_from_env(monkeypatch):
 
     abliteration_models = [m for m in providers if m.provider == "abliteration"]
     assert abliteration_models
-    assert abliteration_models[0].model_id == "abliterated-model"
+    assert [m.model_id for m in abliteration_models] == ["gpt-4.1", "gpt-5.4", "gpt-5.5"]
 
 
 def test_detect_cloud_providers_reads_abliteration_credentials_file(monkeypatch, tmp_path):
@@ -52,7 +57,7 @@ def test_detect_cloud_providers_reads_abliteration_credentials_file(monkeypatch,
 
     abliteration_models = [m for m in providers if m.provider == "abliteration"]
     assert abliteration_models
-    assert abliteration_models[0].timeout_secs == discover.cloud_timeout("abliterated-model")
+    assert abliteration_models[0].timeout_secs == discover.cloud_timeout("gpt-4.1")
 
 
 def test_grounding_gate_marks_failed_tool_calls_as_inference_only():
@@ -65,6 +70,67 @@ def test_grounding_gate_marks_failed_tool_calls_as_inference_only():
     )
     assert inference_only is True
     assert any("GROUNDING UNAVAILABLE" in w for w in warnings)
+
+
+def test_grounding_gate_rejects_citation_like_text_without_evidence():
+    inference_only, warnings = orchestrator._validate_synthesis_grounding(
+        synthesis_text="Potential bug in engine/orchestrator.py:932 with routing drift.",
+        tools_invoked_total=0,
+        successful_tool_calls=0,
+        enable_tool_use=False,
+        task_class="code_review",
+    )
+    assert inference_only is True
+    assert any("citation-like" in w.lower() for w in warnings)
+
+
+def test_off_topic_detector_flags_rewritten_question():
+    off_topic, reason = orchestrator._is_off_topic_response(
+        "Review deep_think_mcp grounding integrity in engine/orchestrator.py",
+        "Question: Explain the difference between a neural network and a decision tree.\nAnswer: ...",
+    )
+    assert off_topic is True
+    assert "different question context" in reason
+
+
+def test_off_topic_detector_allows_same_question_context():
+    off_topic, reason = orchestrator._is_off_topic_response(
+        "Review deep_think_mcp grounding integrity in engine/orchestrator.py",
+        "Question: Review deep_think_mcp grounding integrity in engine/orchestrator.py\nFindings: ...",
+    )
+    assert off_topic is False
+    assert reason == ""
+
+
+def test_tool_guardrails_apply_auth_checks_to_registry_tools(monkeypatch):
+    monkeypatch.delenv("NOVA_TOKEN", raising=False)
+
+    class FakeSchema:
+        requires_auth = True
+
+    class FakeRegistry:
+        def has_tool(self, tool_name):
+            return tool_name == "nova_search"
+
+        def get_tool_schema(self, _tool_name):
+            return FakeSchema()
+
+        def validate_tool_directive(self, _directive):
+            return True, ""
+
+        def get_tool_handler(self, _tool_name):
+            return lambda q, t: ("ok", 0.1, "")
+
+    invoker = ToolInvoker()
+    invoker._tool_registry = FakeRegistry()
+
+    result = invoker._invoke_single_tool(
+        InvokerDirective(tool_name="nova_search", query="auth test"),
+        timeout=5,
+    )
+
+    assert result.tool_status == "error"
+    assert "requires authentication" in result.error_message
 
 
 def test_local_code_search_returns_repo_matches():
@@ -213,3 +279,62 @@ def test_domain_whitelist_uses_exact_www_prefix_removal():
     assert research_tools._domain_allowed("https://wwwevil.com", ["evil.com"]) is False
     assert document_fetch_module._domain_allowed("https://www.evil.com", ["evil.com"]) is True
     assert document_fetch_module._domain_allowed("https://wwwevil.com", ["evil.com"]) is False
+
+
+# --- Regression tests: _validate_synthesis_grounding citation mismatch check ---
+
+def test_grounding_citation_mismatch_detected():
+    synthesis = "See engine/orchestrator.py:120 for details."
+    evidence = ["__init__.py:1\ndefaults.py:2"]
+    inference_only, warnings = _validate_synthesis_grounding(
+        synthesis_text=synthesis,
+        tools_invoked_total=1,
+        successful_tool_calls=1,
+        enable_tool_use=True,
+        task_class="code_review",
+        evidence_texts=evidence,
+    )
+    assert inference_only is True
+    assert any("CITATION MISMATCH" in w for w in warnings)
+
+
+def test_grounding_citation_matched():
+    synthesis = "See engine/orchestrator.py:120 for details."
+    evidence = ["engine/orchestrator.py:120  some content here"]
+    inference_only, warnings = _validate_synthesis_grounding(
+        synthesis_text=synthesis,
+        tools_invoked_total=1,
+        successful_tool_calls=1,
+        enable_tool_use=True,
+        task_class="general",
+        evidence_texts=evidence,
+    )
+    assert inference_only is False
+    assert not any("CITATION MISMATCH" in w for w in warnings)
+
+
+def test_grounding_citation_check_skipped_no_evidence():
+    synthesis = "See engine/orchestrator.py:120 for details."
+    inference_only, warnings = _validate_synthesis_grounding(
+        synthesis_text=synthesis,
+        tools_invoked_total=1,
+        successful_tool_calls=1,
+        enable_tool_use=True,
+        task_class="general",
+        evidence_texts=None,
+    )
+    assert not any("CITATION MISMATCH" in w for w in warnings)
+
+
+def test_grounding_citation_check_skipped_no_tool_calls():
+    synthesis = "See engine/orchestrator.py:120 for details."
+    evidence = ["some evidence without the citation"]
+    inference_only, warnings = _validate_synthesis_grounding(
+        synthesis_text=synthesis,
+        tools_invoked_total=0,
+        successful_tool_calls=0,
+        enable_tool_use=False,
+        task_class="general",
+        evidence_texts=evidence,
+    )
+    assert not any("CITATION MISMATCH" in w for w in warnings)

@@ -92,12 +92,15 @@ class TestTierRouting:
     def test_model_for_tier_ollama_provider(self):
         """Test model selection for ollama provider."""
         cfg = ProviderConfig(provider="ollama")
-        model = provider_module._model_for_tier(cfg, "medium", "general")
+        with patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", set()), \
+             patch.object(provider_module, "_profile_model", return_value=""):
+            model = provider_module._model_for_tier(cfg, "medium", "general")
         
         # Should return a model ID, not the tier name
         assert model != "medium"
         assert isinstance(model, str)
-        assert model == "heretic-llama31-8b-instruct:latest"
+        assert model == "qwen3:8b"
 
     def test_model_for_tier_with_invalid_tier_logs_warning(self):
         """Test that invalid tier names are handled gracefully."""
@@ -196,7 +199,7 @@ class TestProviderSpecificHelpers:
             )
 
             assert result == "general"
-            assert mock_call.await_args.kwargs["model"] == "heretic-llama31-8b-instruct:latest"
+            assert mock_call.await_args.kwargs["model"] == "phi4-mini:latest"
 
     @pytest.mark.asyncio
     async def test_safety_precheck_uses_available_ollama_guardian(self):

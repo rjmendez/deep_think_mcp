@@ -215,15 +215,15 @@ _COPILOT_DEFAULTS = {
 }
 
 _OLLAMA_DEFAULTS = {
-    "light": "heretic-llama31-8b-instruct:latest",
-    "medium": "heretic-llama31-8b-instruct:latest",
-    "heavy": "heretic-llama31-8b-instruct:latest",
+    "light": "phi4-mini:latest",
+    "medium": "qwen3:8b",
+    "heavy": "llama3.1:8b",
 }
 
 _ABLITERATION_DEFAULTS = {
-    "light": "abliterated-model",
-    "medium": "abliterated-model",
-    "heavy": "abliterated-model",
+    "light": "gpt-4.1",
+    "medium": "gpt-5.4",
+    "heavy": "gpt-5.5",
 }
 
 
@@ -921,6 +921,31 @@ def _read_copilot_token() -> str:
 
 _CLOUD_ONLY_PROVIDERS = {"anthropic", "copilot", "azure", "openai", "abliteration"}
 _VALID_DATA_POLICIES = {"any", "local", "cloud"}
+_PRIVATE_ADVERSARIAL_PROVIDERS = {"auto", "ollama", "abliteration"}
+_PRIVATE_ADVERSARIAL_ENV_KEYS = (
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_OLLAMA_BASE_URL",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MODEL",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_LIGHT",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MEDIUM",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_HEAVY",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_MODEL",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_LIGHT",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_MEDIUM",
+    "DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_HEAVY",
+)
+_PRIVATE_ADVERSARIAL_CONFIG_KEYS = (
+    "adversarial_provider",
+    "adversarial_ollama_base_url",
+    "adversarial_heretic_model",
+    "adversarial_heretic_light",
+    "adversarial_heretic_medium",
+    "adversarial_heretic_heavy",
+    "adversarial_abliteration_model",
+    "adversarial_abliteration_light",
+    "adversarial_abliteration_medium",
+    "adversarial_abliteration_heavy",
+)
 
 
 def _normalize_data_policy(value: Any) -> str:
@@ -931,6 +956,189 @@ def _normalize_data_policy(value: Any) -> str:
     if normalized in _VALID_DATA_POLICIES:
         return normalized
     return "any"
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _has_abliteration_credentials(provider_config: dict | None = None) -> bool:
+    cfg = provider_config or {}
+    override_key = str(cfg.get("abliteration_api_key", "")).strip()
+    if override_key:
+        return True
+    return bool(_read_credential("abliteration", "api_key"))
+
+
+def private_adversarial_lane_requested(provider_config: dict | None = None) -> bool:
+    cfg = provider_config or {}
+    # Activation requires explicit lane-routing knobs (provider/base_url/models).
+    # Policy toggles like adversarial_allow_abliteration must not activate the lane.
+    if _first_non_empty(cfg.get("adversarial_provider")):
+        return True
+    if any(_first_non_empty(cfg.get(key)) for key in _PRIVATE_ADVERSARIAL_CONFIG_KEYS):
+        return True
+    if _first_non_empty(os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER", "")):
+        return True
+    return any(_first_non_empty(os.getenv(key, "")) for key in _PRIVATE_ADVERSARIAL_ENV_KEYS)
+
+
+async def configure_private_adversarial_lane(provider_config: dict | None = None) -> tuple[dict, dict]:
+    """Resolve private adversarial lane routing with explicit degradation semantics."""
+    pc: dict = dict(provider_config or {})
+    requested_provider = (
+        _first_non_empty(
+            pc.get("adversarial_provider"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER"),
+            "auto",
+        ).lower()
+    )
+    if requested_provider not in _PRIVATE_ADVERSARIAL_PROVIDERS:
+        requested_provider = "auto"
+
+    allow_abliteration = _as_bool(
+        pc.get(
+            "adversarial_allow_abliteration",
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_ALLOW_ABLITERATION", "1"),
+        ),
+        default=True,
+    )
+    ollama_base_url = _first_non_empty(
+        pc.get("adversarial_ollama_base_url"),
+        os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_OLLAMA_BASE_URL"),
+        pc.get("base_url"),
+        os.getenv("OLLAMA_BASE_URL"),
+    )
+
+    selected_provider = ""
+    degraded_from_local = False
+    local_probe_error = ""
+
+    if requested_provider in {"auto", "ollama"}:
+        if ollama_base_url:
+            if await _check_ollama_available(ollama_base_url):
+                selected_provider = "ollama"
+            else:
+                local_probe_error = (
+                    "Configured local heretic Ollama endpoint is unavailable or has no models."
+                )
+        elif requested_provider == "ollama":
+            local_probe_error = "No local heretic Ollama endpoint configured."
+
+        if requested_provider == "ollama" and not selected_provider:
+            raise ValueError(
+                "Private adversarial lane unavailable: requested provider=ollama but "
+                f"{local_probe_error or 'the endpoint check failed'}"
+            )
+
+    if not selected_provider and requested_provider in {"auto", "abliteration"}:
+        if requested_provider == "auto" and local_probe_error:
+            degraded_from_local = True
+        if not allow_abliteration:
+            if requested_provider == "abliteration":
+                raise ValueError(
+                    "Private adversarial lane unavailable: provider=abliteration requested but "
+                    "adversarial_allow_abliteration is disabled."
+                )
+        elif _has_abliteration_credentials(pc):
+            selected_provider = "abliteration"
+        elif requested_provider == "abliteration":
+            raise ValueError(
+                "Private adversarial lane unavailable: provider=abliteration requested but "
+                "ABLITERATION_API_KEY is not configured."
+            )
+
+    if not selected_provider:
+        reasons = []
+        if local_probe_error:
+            reasons.append(local_probe_error)
+        else:
+            reasons.append("No local heretic Ollama endpoint configured.")
+        if allow_abliteration:
+            reasons.append("ABLITERATION_API_KEY is not configured.")
+        else:
+            reasons.append("Abliteration fallback is disabled.")
+        raise ValueError("Private adversarial lane unavailable: " + " ".join(reasons))
+
+    pc["provider"] = selected_provider
+    pc["light_provider"] = selected_provider
+    pc["medium_provider"] = selected_provider
+    pc["heavy_provider"] = selected_provider
+
+    if selected_provider == "ollama":
+        pc["data_policy"] = "local"
+        pc["base_url"] = ollama_base_url
+        lane_model = _first_non_empty(
+            pc.get("adversarial_heretic_model"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MODEL"),
+        )
+        lane_light = _first_non_empty(
+            pc.get("adversarial_heretic_light"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_LIGHT"),
+            lane_model,
+        )
+        lane_medium = _first_non_empty(
+            pc.get("adversarial_heretic_medium"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MEDIUM"),
+            lane_model,
+        )
+        lane_heavy = _first_non_empty(
+            pc.get("adversarial_heretic_heavy"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_HEAVY"),
+            lane_model,
+        )
+    else:
+        pc["data_policy"] = "cloud"
+        lane_model = _first_non_empty(
+            pc.get("adversarial_abliteration_model"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_MODEL"),
+        )
+        lane_light = _first_non_empty(
+            pc.get("adversarial_abliteration_light"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_LIGHT"),
+            lane_model,
+        )
+        lane_medium = _first_non_empty(
+            pc.get("adversarial_abliteration_medium"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_MEDIUM"),
+            lane_model,
+        )
+        lane_heavy = _first_non_empty(
+            pc.get("adversarial_abliteration_heavy"),
+            os.getenv("DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_HEAVY"),
+            lane_model,
+        )
+
+    if lane_light:
+        pc["light"] = lane_light
+    if lane_medium:
+        pc["medium"] = lane_medium
+    if lane_heavy:
+        pc["heavy"] = lane_heavy
+
+    lane_meta = {
+        "lane": "private_adversarial_challenger",
+        "provider": selected_provider,
+        "requested_provider": requested_provider,
+        "degraded_from_local": degraded_from_local,
+        "allow_abliteration": allow_abliteration,
+        "non_authoritative": True,
+    }
+    return pc, lane_meta
 
 
 def _tier_provider(cfg: ProviderConfig, tier: str) -> str:

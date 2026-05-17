@@ -9,8 +9,10 @@ Orchestrates tool directive execution with:
 """
 
 import asyncio
+import json
 import logging
 import time
+import types
 import os
 from typing import List, Dict, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -270,8 +272,7 @@ class ToolInvoker:
         
         try:
             # Guardrail: enforce tool registry + auth requirements before invocation.
-            known_tools = {"web_search", "code_search", "nova_verify", "document_fetch"}
-            guard_error = self._validate_tool_guardrails(directive) if directive.tool_name in known_tools else ""
+            guard_error = self._validate_tool_guardrails(directive)
             if guard_error:
                 return ToolResult(
                     tool_name=directive.tool_name,
@@ -315,18 +316,54 @@ class ToolInvoker:
                     from tools.document_fetch import invoke_document_fetch
                 results, impact, error = invoke_document_fetch(directive.query, timeout)
             else:
+                handler = None
+                if self._tool_registry is not None:
+                    handler = self._tool_registry.get_tool_handler(directive.tool_name)
+
+                if handler is None:
+                    return ToolResult(
+                        tool_name=directive.tool_name,
+                        query=directive.query,
+                        results="",
+                        tool_status="not_callable",
+                        timing_ms=0,
+                        confidence_impact=-0.05,
+                        error_message=f"Unknown tool: {directive.tool_name}",
+                    )
+
+                if hasattr(handler, "execute"):
+                    handler_result = handler.execute(directive.query, timeout)
+                else:
+                    handler_result = handler(directive.query, timeout)
+
+                if (
+                    isinstance(handler_result, tuple)
+                    and len(handler_result) == 3
+                ):
+                    results, impact, error = handler_result
+                else:
+                    results = handler_result
+                    impact = 0.0
+                    error = ""
+
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            # Validate/normalize tool output before building result.
+            # Rejects callables, generators, and arbitrary objects to prevent
+            # unsafe serialization or side effects.
+            normalized_results, norm_error = self._normalize_tool_output(results)
+            if norm_error:
                 return ToolResult(
                     tool_name=directive.tool_name,
                     query=directive.query,
                     results="",
-                    tool_status="not_callable",
-                    timing_ms=0,
+                    tool_status="error",
+                    timing_ms=elapsed_ms,
                     confidence_impact=-0.05,
-                    error_message=f"Unknown tool: {directive.tool_name}",
+                    error_message=norm_error,
                 )
-            
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            
+            results = normalized_results
+
             # Determine status
             if error:
                 normalized_error = error.lower()
@@ -383,7 +420,7 @@ class ToolInvoker:
             return f"Tool '{directive.tool_name}' is not registered"
 
         schema = self._tool_registry.get_tool_schema(directive.tool_name)
-        if schema and schema.requires_auth and not self._has_auth_for_tool(directive.tool_name):
+        if schema and schema.requires_auth and not self._has_auth_for_tool(directive.tool_name, schema=schema):
             return f"Tool '{directive.tool_name}' requires authentication"
 
         args: dict[str, Any]
@@ -403,12 +440,62 @@ class ToolInvoker:
             return error or "Invalid tool directive"
         return ""
 
-    def _has_auth_for_tool(self, tool_name: str) -> bool:
+    @staticmethod
+    def _normalize_tool_output(value: Any) -> tuple[str, str]:
+        """Validate and normalize a tool wrapper return value to a safe string.
+
+        Accepts only known-safe types:
+          - str                              → returned as-is
+          - int / float / bool / None        → repr()-converted (no side effects)
+          - dict / list / tuple              → JSON-serialized (fails if not serializable)
+
+        Rejects callables, generators, and arbitrary objects without calling
+        str() or repr() on them to avoid triggering unknown side effects.
+
+        Returns:
+            (normalized_str, error_message) — error_message is empty on success.
+        """
+        if isinstance(value, str):
+            return value, ""
+
+        if callable(value):
+            return "", "tool output rejected: got a callable"
+
+        if isinstance(value, (types.GeneratorType, types.AsyncGeneratorType)):
+            return "", "tool output rejected: got a generator"
+
+        if isinstance(value, (int, float, bool, type(None))):
+            return repr(value), ""
+
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return json.dumps(value), ""
+            except (TypeError, ValueError):
+                return "", "tool output rejected: dict/list/tuple is not JSON-serializable"
+
+        return "", f"tool output rejected: unsupported type '{type(value).__name__}'"
+
+    def _has_auth_for_tool(self, tool_name: str, schema: Any = None) -> bool:
         """Check whether auth prerequisites for a tool are present."""
-        if tool_name == "code_search":
-            return bool(os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN"))
-        if tool_name == "nova_search":
-            return bool(os.getenv("NOVA_TOKEN"))
+        auth_checks = {
+            "code_search": lambda: bool(
+                os.getenv("GITHUB_TOKEN") or os.getenv("GITHUB_COPILOT_OAUTH_TOKEN")
+            ),
+            "nova_search": lambda: bool(os.getenv("NOVA_TOKEN")),
+            "nova_verify": lambda: bool(os.getenv("NOVA_TOKEN")),
+        }
+        checker = auth_checks.get(tool_name)
+        if checker is not None:
+            return checker()
+
+        # Fail closed for registry-declared auth requirements unless a generic
+        # custom-tool auth token is explicitly provided.
+        if schema is not None and getattr(schema, "requires_auth", False):
+            return bool(
+                os.getenv("DEEP_THINK_CUSTOM_TOOL_AUTH")
+                or os.getenv("DEEP_THINK_TOOL_AUTH_TOKEN")
+            )
+
         return True
     
     def close(self):

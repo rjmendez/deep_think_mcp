@@ -268,6 +268,39 @@ async def test_get_thinking_result_backfills_missing_fan_out_defaults(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_get_thinking_result_uses_grounding_warning_when_error_missing(monkeypatch):
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    get_thinking_result = fake_mcp.tools["get_thinking_result"]
+
+    payload = {
+        "type": "fan_out",
+        "status": "failed",
+        "grounding_warnings": ["FAN_OUT_FAILURE: no grounded answer"],
+        "final_answer": "",
+    }
+    monkeypatch.setattr(
+        reasoning_api.store,
+        "get_job",
+        lambda _job_id: {
+            "job_id": "job-warning-only",
+            "status": "complete",
+            "provider": "anthropic",
+            "model_summary": "summary",
+            "created_at": datetime.now().isoformat(),
+            "completed_at": datetime.now().isoformat(),
+            "result": json.dumps(payload),
+            "error": None,
+        },
+    )
+
+    result = await get_thinking_result("job-warning-only")
+
+    assert result["status"] == "failed"
+    assert result["error"] == "FAN_OUT_FAILURE: no grounded answer"
+
+
+@pytest.mark.asyncio
 async def test_worker_honors_job_timeout_from_record(monkeypatch):
     captured_timeouts: list[float] = []
 

@@ -181,6 +181,45 @@ DEEP_THINK_MODEL_MEDIUM=qwen3:14b
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+### Private adversarial lane routing (challenger-only)
+
+These knobs only affect `task_class=adversarial` / `skill=adversarial` and never change normal synthesis routing.
+
+| Variable | Description |
+|---|---|
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER` | `auto` (default), `ollama`, or `abliteration` |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_ALLOW_ABLITERATION` | `1` to allow Abliteration fallback when local lane is unavailable |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_OLLAMA_BASE_URL` | Optional heretic Ollama endpoint override |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MODEL` | Single local heretic model override for all tiers |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_LIGHT/MEDIUM/HEAVY` | Per-tier local heretic model overrides |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_MODEL` | Single Abliteration model override for all tiers |
+| `DEEP_THINK_PRIVATE_ADVERSARIAL_ABLITERATION_LIGHT/MEDIUM/HEAVY` | Per-tier Abliteration model overrides |
+
+Selection behavior:
+- Prefer local heretic Ollama when configured and reachable.
+- If unavailable and Abliteration fallback is allowed + credentials exist, route to Abliteration.
+- If neither path is available, adversarial jobs fail explicitly (`status=failed`) without fabricated answers.
+
+Private deployment examples:
+```bash
+# Strict private lane: local heretic only
+DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER=ollama
+DEEP_THINK_PRIVATE_ADVERSARIAL_OLLAMA_BASE_URL=http://127.0.0.1:11434
+DEEP_THINK_PRIVATE_ADVERSARIAL_HERETIC_MODEL=dolphin-mistral:latest
+DEEP_THINK_PRIVATE_ADVERSARIAL_ALLOW_ABLITERATION=0
+
+# Degrade-to-cloud lane: local preferred, explicit Abliteration fallback
+DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER=auto
+DEEP_THINK_PRIVATE_ADVERSARIAL_ALLOW_ABLITERATION=1
+DEEP_THINK_PRIVATE_ADVERSARIAL_OLLAMA_BASE_URL=http://127.0.0.1:11434
+```
+
+Safe-operation boundaries:
+- The private adversarial lane is **challenger-only** and always marked `non_authoritative=true`.
+- `challenge_flags` are signals for review, never an approval, completion, or deployment verdict.
+- Private lane knobs apply only to `task_class=adversarial` and do not alter public-safe/default routing for other task classes.
+- Unavailable routing paths return explicit failures; no synthetic “success” answer is produced.
+
 ### Qwen thinking mode
 
 Ollama's Qwen3 models run extended chain-of-thought by default, which adds latency and tokens. Extended thinking is **disabled automatically** for any model whose name contains `qwen`.
@@ -205,7 +244,10 @@ Each reasoning pass uses a tier: `light` (cheap/fast), `medium` (analysis), `hea
 | `DEEP_THINK_COPILOT_HEAVY` | `claude-opus-4.7` |
 | `DEEP_THINK_MODEL_LIGHT` | `phi4-mini` |
 | `DEEP_THINK_MODEL_MEDIUM` | `qwen3:8b` |
-| `DEEP_THINK_MODEL_HEAVY` | `deepseek-r1:8b` |
+| `DEEP_THINK_MODEL_HEAVY` | `llama3.1:8b` |
+| `DEEP_THINK_ABLITERATION_LIGHT` | `gpt-4.1` |
+| `DEEP_THINK_ABLITERATION_MEDIUM` | `gpt-5.4` |
+| `DEEP_THINK_ABLITERATION_HEAVY` | `gpt-5.5` |
 
 ### Server
 
@@ -352,6 +394,43 @@ For fan-out jobs, perspectives are named (`defense`, `prosecution`, `forensics`,
 ### `list_thinking_jobs`
 
 List recent jobs. Filter by `status` (`all`, `queued`, `running`, `complete`, `failed`).
+
+## Adaptive reasoning modes
+
+| Mode | What it does | When to use |
+|---|---|---|
+| `deep_think_async` | Single-job multi-pass reasoning | Fast triage, clear questions, lightweight analysis |
+| `deep_think_fan_out` + `topology="static"` | Parallel perspectives with fixed width | Compare viewpoints without tool calls |
+| `deep_think_fan_out` + `topology="adaptive"` | Parallel perspectives with optional tool use per perspective | Hard bugs, disputed incidents, evidence-heavy work |
+
+Key rules:
+
+- `enable_tool_use=true` only activates tools when `topology="adaptive"` or `task_class="code_review"`.
+- Fan-out perspectives can reuse cached answers, but cache hits still run the tool phase when tool use is enabled.
+- `data_policy` still applies to every mode: `local`, `cloud`, or `any`.
+
+## Tool integration guide
+
+When tool use is enabled, fan-out can attach evidence to each perspective:
+
+| Tool | Purpose |
+|---|---|
+| `code_search` | Find matching code paths, symbols, and regressions |
+| `web_search` | Pull current external references and public docs |
+| `document_fetch` | Read allowlisted local/remote docs |
+| `nova_verify` | Ground claims against the Great Library when available |
+
+Guardrails:
+
+- `task_class` controls which tools are allowed.
+- `web_domain_whitelist` limits web access when provided.
+- Tool output is recorded per perspective in `tools_invoked`, `tool_errors`, and `evidence_summary`.
+
+### Real scenarios
+
+- **Security incident triage**: use `task_class="investigation"` and `passes=4` for a single narrative, then fan out if confidence stays moderate.
+- **Bug hunt with evidence**: use `task_class="code_review"`, `enable_tool_use=true`, and `topology="adaptive"` so each perspective can search code before synthesis.
+- **Executive summary**: use `task_class="synthesis"` with `data_policy="cloud"` when the output can leave the local machine.
 
 ## Lessons from Live Security Incident Triage
 

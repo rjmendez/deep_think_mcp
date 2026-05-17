@@ -70,7 +70,8 @@ CODE_REVIEW_DIRECTIVES: list[tuple[str, str]] = [
         "Analyze every identified code path for correctness defects: null/undefined "
         "dereferences, off-by-one errors, unchecked return values, type mismatches, "
         "resource leaks, and race conditions. State each defect as a falsifiable claim "
-        "with file location and line reference where available.",
+        "with file location and line reference where available. "
+        "Only cite file:line references that appear verbatim in tool evidence provided to you. Do not invent locations.",
     ),
     (
         "attack_surface",
@@ -82,7 +83,7 @@ CODE_REVIEW_DIRECTIVES: list[tuple[str, str]] = [
     (
         "structured_findings",
         "Synthesize into a structured code review report. For each finding: "
-        "severity (CRITICAL | HIGH | MEDIUM | LOW), location (file:line if known), "
+        "severity (CRITICAL | HIGH | MEDIUM | LOW), location (file:line if known — only cite verbatim references from tool evidence, do not invent locations), "
         "description, exploit scenario, and recommended fix. "
         "End with a summary verdict: APPROVE | REQUEST_CHANGES | NEEDS_DISCUSSION.",
     ),

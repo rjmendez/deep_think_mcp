@@ -48,9 +48,9 @@ controls:
     - stop when the artifact provenance does not match the live target
 models:
   ollama:
-    light: heretic-llama31-8b-instruct:latest
-    medium: heretic-llama31-8b-instruct:latest
-    heavy: heretic-llama31-8b-instruct:latest
+    light: phi4-mini:latest
+    medium: qwen3.5:27b
+    heavy: llama3.1:8b
   copilot:
     light: gpt-5.4
     medium: gpt-5.4

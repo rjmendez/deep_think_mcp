@@ -227,6 +227,7 @@ class ToolDirective:
     tool_name: str                   # "web_search", "code_search", "document_fetch"
     query: str
     reason: str                      # why this tool was triggered
+    perspective_id: str = ""         # which perspective requested it
     priority: int = 1                # 0=must, 1=high, 2=medium, 3=exploratory
     expected_impact: str = ""        # what this tool should accomplish
     max_results: int = 10

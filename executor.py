@@ -434,6 +434,7 @@ def invoke_tools_and_digest(
                 InvokerToolDirective(
                     tool_name=td["tool_name"],
                     query=td["query"],
+                    perspective_id=td.get("perspective_id", perspective_id),
                     priority=td.get("priority", 1),
                     purpose=_map_router_reason_to_purpose(td.get("reason", "unknown")),
                     expected_impact=td.get("expected_impact", "unknown"),
@@ -447,10 +448,10 @@ def invoke_tools_and_digest(
                 {
                     "tool_name": td["tool_name"],
                     "query": td["query"],
+                    "perspective_id": td.get("perspective_id", perspective_id),
                     "priority": td.get("priority", 1),
                     "purpose": _map_router_reason_to_purpose(td.get("reason", "unknown")),
                     "expected_impact": td.get("expected_impact", "unknown"),
-                    "perspective_id": perspective_id,  # ADD THIS (Fix p3-fix-003)
                 }
                 for td in tools_queued
             ]
@@ -502,7 +503,7 @@ def invoke_tools_and_digest(
             status = _EVIDENCE_STATUS_MAP.get(raw_status, raw_status)
             evidence_tool_results.append(
                 EvidenceToolResult(
-                    directive_id=f"{perspective_id}:{index}",
+                    directive_id=f"{getattr(directive, 'perspective_id', perspective_id)}:{index}",
                     tool_name=tool_result.tool_name,
                     query=tool_result.query,
                     purpose=purpose,

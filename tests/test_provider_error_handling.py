@@ -39,7 +39,7 @@ async def test_anthropic_timeout_returns_specific_message_and_metric(monkeypatch
     provider.runtime_metrics.reset_metrics()
     monkeypatch.setattr(provider.httpx, "AsyncClient", lambda timeout: _FakeTimeoutClient())
 
-    with pytest.raises(ValueError, match="Timeout calling Anthropic model 'claude-sonnet-4-6' after 60s"):
+    with pytest.raises(ValueError, match="Timeout calling Anthropic model 'claude-sonnet-4-6' after 120.0s"):
         await provider._call_anthropic(
             "sk-ant-test",
             "claude-sonnet-4-6",
