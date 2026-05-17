@@ -636,6 +636,7 @@ async def deep_think_passes(
     dama_node_id: str = "",
     dama_metric: str = "",
     web_domain_whitelist: Optional[list] = None,
+    pre_fetched_evidence: str = "",
 ) -> dict:
     """Main multi-pass reasoning loop.
     
@@ -869,12 +870,16 @@ async def deep_think_passes(
             system_prompt = pass_override["system"]
         else:
             mandate_block = f"{mandate_prefix}\n\n" if mandate_prefix else ""
+            evidence_block = (
+                f"\n\n## TOOL EVIDENCE (use this to ground your response — do NOT cite locations not listed here)\n{pre_fetched_evidence}"
+                if pre_fetched_evidence else ""
+            )
             system_prompt = f"""{mandate_block}You are an expert reasoner. Apply this framing strictly:
 
 {framing_text}
 
 Use the mandate to structure your response. Be precise and evidence-based.
-Do NOT replace or invent the question. Answer only the provided question/context."""
+Do NOT replace or invent the question. Answer only the provided question/context.{evidence_block}"""
         
         user_prompt = f"Question: {question}"
         
@@ -1344,7 +1349,7 @@ async def run_fan_out(
         )
         return hashlib.sha256(payload.encode()).hexdigest()
 
-    async def _run_tool_phase(perspective_name: str, perspective_answer: str, perspective_confidence: float = 0.5):
+    async def _run_tool_phase(perspective_name: str, perspective_answer: str, perspective_confidence: float = 0.5, query_override: str = ""):
         """Run optional per-perspective tool loop. Returns (tools_invoked, tool_errors, evidence_summary)."""
         if not tool_mode_enabled or tool_budget <= 0:
             return [], [], ""
@@ -1359,7 +1364,7 @@ async def run_fan_out(
         tool_name = "code_search" if resolved_class == "code_review" else "web_search"
         if not check_research_tool_allowed(resolved_class, tool_name, job_id=job_id):
             return [], [f"blocked_tool:{tool_name}"], ""
-        tool_query = _build_tool_query(question, perspective_answer)
+        tool_query = query_override if query_override else _build_tool_query(question, perspective_answer)
         if not tool_query:
             return [], ["missing tool query"], ""
 
@@ -1450,6 +1455,16 @@ async def run_fan_out(
 
             perspective_pc = asdict(perspective_cfg)
 
+            # Pre-answer tool phase: run tools on question+mandate so LLM sees evidence
+            pre_tools_invoked: list[str] = []
+            pre_tool_errors: list[str] = []
+            pre_evidence = ""
+            if tool_mode_enabled:
+                pre_query = _build_tool_query(question, mandate_text)
+                pre_tools_invoked, pre_tool_errors, pre_evidence = await _run_tool_phase(
+                    name, "", 0.5, query_override=pre_query
+                )
+
             r = await deep_think_passes(
                 question=question,
                 passes=height,
@@ -1461,6 +1476,7 @@ async def run_fan_out(
                 perspective_name=name,
                 force_local_models=force_local_models,
                 device_id=device_id,
+                pre_fetched_evidence=pre_evidence,
             )
 
         child_status = "complete"
@@ -1495,7 +1511,11 @@ async def run_fan_out(
                     "tool_errors": tool_errors,
                     "evidence_summary": evidence_summary,
                 }
-            tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer, perspective_confidence)
+            # Evidence already fetched pre-answer; skip redundant post-answer tool call
+            if pre_evidence:
+                tools_invoked, tool_errors, evidence_summary = pre_tools_invoked, pre_tool_errors, pre_evidence
+            else:
+                tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer, perspective_confidence)
             perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
             await asyncio.to_thread(
                 store.set_perspective_cache,
