@@ -102,6 +102,65 @@ class TestTierRouting:
         assert isinstance(model, str)
         assert model == "qwen3:8b"
 
+    def test_model_for_tier_ollama_falls_back_to_discovered_available(self):
+        """When defaults are unavailable, choose from discovered available models."""
+        cfg = ProviderConfig(provider="ollama")
+        with patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", {"heretic-llama31-8b-instruct:latest"}), \
+             patch.object(provider_module, "_profile_model", return_value=""):
+            model = provider_module._model_for_tier(cfg, "medium", "general")
+
+        assert model == "heretic-llama31-8b-instruct:latest"
+
+    def test_model_for_tier_ollama_profile_model_not_available_falls_back(self):
+        """Task-class profile model should be validated against live availability."""
+        cfg = ProviderConfig(provider="ollama")
+        with patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", {"heretic-llama31-8b-instruct:latest"}), \
+             patch.object(provider_module, "_profile_model", return_value="phi4-mini:latest"):
+            model = provider_module._model_for_tier(cfg, "light", "general")
+
+        assert model == "heretic-llama31-8b-instruct:latest"
+
+    def test_model_for_tier_ollama_profile_model_quarantined_falls_back(self):
+        """Runtime-quarantined profile model should be skipped before dispatch."""
+        cfg = ProviderConfig(provider="ollama", base_url="http://localhost:11434")
+        with patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(
+                 provider_module,
+                 "_available_ollama_models",
+                 return_value={"heretic-phi4-mini-reasoning:latest", "heretic-llama31-8b-instruct:latest"},
+             ), \
+             patch.object(provider_module, "_profile_model", return_value="heretic-phi4-mini-reasoning:latest"), \
+             patch.object(
+                 provider_module,
+                 "_is_ollama_model_quarantined",
+                 side_effect=lambda model, base_url="": model == "heretic-phi4-mini-reasoning:latest",
+             ):
+            model = provider_module._model_for_tier(cfg, "light", "general")
+
+        assert model == "heretic-llama31-8b-instruct:latest"
+
+    def test_model_for_tier_ollama_quarantined_discovery_never_returns_empty(self):
+        """If discovered light model is quarantined, routing must continue to fallback and not return ''. """
+        cfg = ProviderConfig(provider="ollama", base_url="http://localhost:11434")
+        with patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_profile_model", return_value=""), \
+             patch.object(provider_module, "_discovered_tier_model", return_value="heretic-phi4-mini-reasoning:latest"), \
+             patch.object(
+                 provider_module,
+                 "_available_ollama_models",
+                 return_value={"heretic-phi4-mini-reasoning:latest", "heretic-llama31-8b-instruct:latest"},
+             ), \
+             patch.object(
+                 provider_module,
+                 "_is_ollama_model_quarantined",
+                 side_effect=lambda model, base_url="": model == "heretic-phi4-mini-reasoning:latest",
+             ):
+            model = provider_module._model_for_tier(cfg, "light", "general")
+
+        assert model == "heretic-llama31-8b-instruct:latest"
+
     def test_model_for_tier_with_invalid_tier_logs_warning(self):
         """Test that invalid tier names are handled gracefully."""
         cfg = ProviderConfig(provider="anthropic")
@@ -200,6 +259,21 @@ class TestProviderSpecificHelpers:
 
             assert result == "general"
             assert mock_call.await_args.kwargs["model"] == "phi4-mini:latest"
+
+    @pytest.mark.asyncio
+    async def test_classify_task_ollama_uses_available_model_when_default_missing(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call, \
+             patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", {"heretic-llama31-8b-instruct:latest"}):
+            mock_call.return_value = "general"
+
+            result = await provider_module.classify_task(
+                "Classify this request.",
+                provider="ollama",
+            )
+
+            assert result == "general"
+            assert mock_call.await_args.kwargs["model"] == "heretic-llama31-8b-instruct:latest"
 
     @pytest.mark.asyncio
     async def test_safety_precheck_uses_available_ollama_guardian(self):

@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import asyncio
+import time
 from typing import Optional, Any
 
 import httpx
@@ -32,6 +33,144 @@ log = logging.getLogger(__name__)
 class SecurityError(Exception):
     """Raised when security policy is violated (e.g., cloud provider used in local-only mode)."""
     pass
+
+
+class ProviderError(ValueError):
+    """Base provider error type that preserves ValueError compatibility."""
+
+
+class ProviderConfigurationError(ProviderError):
+    """Raised when provider configuration is invalid."""
+
+
+class ProviderRoutingError(ProviderError):
+    """Raised when tier/provider routing cannot be resolved safely."""
+
+
+class ProviderRequestError(ProviderError):
+    """Raised for provider request failures."""
+
+
+class ProviderTimeoutError(ProviderRequestError):
+    """Raised for provider timeouts."""
+
+
+class ProviderTransportError(ProviderRequestError):
+    """Raised for provider transport errors."""
+
+
+class ProviderAPIError(ProviderRequestError):
+    """Raised for non-transport provider API failures."""
+
+
+class ProviderModelNotFoundError(ProviderAPIError):
+    """Raised when a requested model is unavailable on a provider."""
+
+
+class ProviderModelRuntimeError(ProviderAPIError):
+    """Raised when a provider model exists but fails to load/run reliably."""
+
+
+_VALID_PROVIDERS = {"anthropic", "copilot", "ollama", "abliteration"}
+_VALID_TIERS = {"light", "medium", "heavy"}
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.PoolTimeout,
+)
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECS = 0.5
+_RETRY_MAX_DELAY_SECS = 4.0
+_OLLAMA_RUNTIME_ERROR_PATTERNS = (
+    "check_tensor_dims",
+    "rope_factors_long.weight",
+    "runner process has terminated",
+    "failed to create context with model",
+)
+
+
+def _retry_delay_secs(attempt: int) -> float:
+    return min(_RETRY_MAX_DELAY_SECS, _RETRY_BASE_DELAY_SECS * (2 ** max(0, attempt - 1)))
+
+
+def _normalize_provider_name(value: Any, *, field_name: str) -> str:
+    text = str(value).strip().lower() if value is not None else ""
+    if not text:
+        return ""
+    if text not in _VALID_PROVIDERS:
+        raise ProviderConfigurationError(
+            f"Invalid {field_name}='{text}'. Expected one of: {sorted(_VALID_PROVIDERS)}"
+        )
+    return text
+
+
+def _normalize_base_url(value: Any, *, source: str, required_when_set: bool = False) -> str:
+    if value is None:
+        if required_when_set:
+            raise ProviderConfigurationError(f"{source} was provided but empty.")
+        return ""
+    normalized = str(value).strip()
+    if required_when_set and not normalized:
+        raise ProviderConfigurationError(f"{source} was provided but empty.")
+    return normalized
+
+
+def _is_retryable_transport_error(exc: httpx.TransportError) -> bool:
+    return isinstance(exc, _RETRYABLE_TRANSPORT_ERRORS)
+
+
+async def _post_with_retries(
+    *,
+    provider_name: str,
+    model: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    json_payload: dict | None = None,
+    max_attempts: int = _RETRY_ATTEMPTS,
+) -> httpx.Response:
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=headers, json=json_payload)
+        except httpx.TimeoutException:
+            if attempt >= max_attempts:
+                raise
+            delay = _retry_delay_secs(attempt)
+            log.warning(
+                "%s timeout for model '%s' (attempt %d/%d). Retrying in %.2fs.",
+                provider_name, model, attempt, max_attempts, delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        except httpx.TransportError as exc:
+            if attempt >= max_attempts or not _is_retryable_transport_error(exc):
+                raise
+            delay = _retry_delay_secs(attempt)
+            log.warning(
+                "%s transport error for model '%s' (attempt %d/%d): %s. Retrying in %.2fs.",
+                provider_name, model, attempt, max_attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_attempts:
+            delay = _retry_delay_secs(attempt)
+            log.warning(
+                "%s transient API status %s for model '%s' (attempt %d/%d). Retrying in %.2fs.",
+                provider_name, response.status_code, model, attempt, max_attempts, delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+        return response
+
+    raise ProviderRequestError(
+        f"{provider_name} request failed for model '{model}' after {max_attempts} attempts."
+    )
 
 
 def _validate_provider_is_local(provider: str, force_local: bool) -> None:
@@ -377,55 +516,59 @@ async def _call_anthropic(
     
     # Validate key
     if not api_key:
-        raise ValueError(f"API key is empty! Cannot call Anthropic.")
+        raise ProviderConfigurationError("API key is empty! Cannot call Anthropic.")
     if not api_key.startswith("sk-ant"):
         log.warning(f"API key doesn't start with sk-ant: {api_key[:20]}...")
     
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            payload = {
-                "model": model,
-                "max_tokens": custom_params.get("max_tokens", 4096),
-                "system": system,
-                "messages": [{"role": "user", "content": user_prompt}],
-            }
-            for key in ("temperature", "top_p", "top_k", "stop_sequences"):
-                if key in custom_params:
-                    payload[key] = custom_params[key]
-            log.warning(f"_call_anthropic: POSTING to API with model='{model}'")
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=payload,
-            )
-            if response.status_code != 200:
+        payload = {
+            "model": model,
+            "max_tokens": custom_params.get("max_tokens", 4096),
+            "system": system,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        for key in ("temperature", "top_p", "top_k", "stop_sequences"):
+            if key in custom_params:
+                payload[key] = custom_params[key]
+        log.warning(f"_call_anthropic: POSTING to API with model='{model}'")
+        response = await _post_with_retries(
+            provider_name="Anthropic",
+            model=model,
+            url="https://api.anthropic.com/v1/messages",
+            timeout=timeout,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json_payload=payload,
+        )
+        if response.status_code != 200:
                 error_detail = response.text[:500]
-                raise ValueError(f"Anthropic API error {response.status_code}: {error_detail}")
-            response.raise_for_status()
-            result = response.json()
-            
-            # Validate response structure
-            if not isinstance(result, dict) or "content" not in result:
-                raise ValueError(f"Invalid Anthropic response structure: {result}")
-            if not result.get("content") or len(result["content"]) == 0:
-                raise ValueError("Empty content in Anthropic response")
-            if "text" not in result["content"][0]:
-                raise ValueError(f"Missing 'text' field in Anthropic response content: {result['content'][0]}")
-            
-            return result["content"][0]["text"]
+                raise ProviderAPIError(f"Anthropic API error {response.status_code}: {error_detail}")
+        response.raise_for_status()
+        result = response.json()
+
+        # Validate response structure
+        if not isinstance(result, dict) or "content" not in result:
+                raise ProviderAPIError(f"Invalid Anthropic response structure: {result}")
+        if not result.get("content") or len(result["content"]) == 0:
+                raise ProviderAPIError("Empty content in Anthropic response")
+        if "text" not in result["content"][0]:
+                raise ProviderAPIError(
+                    f"Missing 'text' field in Anthropic response content: {result['content'][0]}"
+                )
+
+        return result["content"][0]["text"]
     except httpx.TimeoutException as exc:
         _record_timeout("anthropic")
         msg = f"Timeout calling Anthropic model '{model}' after {timeout}s"
         log.error("_call_anthropic: %s", msg)
-        raise ValueError(msg) from exc
-    except httpx.HTTPError as exc:
+        raise ProviderTimeoutError(msg) from exc
+    except httpx.TransportError as exc:
         msg = f"Anthropic transport error calling model '{model}': {exc}"
         log.error("_call_anthropic: %s", msg)
-        raise ValueError(msg) from exc
+        raise ProviderTransportError(msg) from exc
 
 
 async def _call_copilot(
@@ -441,53 +584,55 @@ async def _call_copilot(
     custom_params = custom_params or {}
     
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                "https://api.github.com/copilot/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {oauth_token}",
-                    "content-type": "application/json",
+        response = await _post_with_retries(
+            provider_name="Copilot",
+            model=model,
+            url="https://api.github.com/copilot/chat/completions",
+            timeout=timeout,
+            headers={
+                "Authorization": f"Bearer {oauth_token}",
+                "content-type": "application/json",
+            },
+            json_payload={
+                "model": model,
+                "max_tokens": custom_params.get("max_tokens", 4096),
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                **{
+                    key: custom_params[key]
+                    for key in ("temperature", "top_p", "stop")
+                    if key in custom_params
                 },
-                json={
-                    "model": model,
-                    "max_tokens": custom_params.get("max_tokens", 4096),
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    **{
-                        key: custom_params[key]
-                        for key in ("temperature", "top_p", "stop")
-                        if key in custom_params
-                    },
-                },
-            )
-            if response.status_code != 200:
-                error_detail = response.text[:500]
-                raise ValueError(f"Copilot API error {response.status_code}: {error_detail}")
-            response.raise_for_status()
-            result = response.json()
-            
-            # Validate response structure
-            if not isinstance(result, dict) or "choices" not in result:
-                raise ValueError(f"Invalid Copilot response structure: {result}")
-            if not result.get("choices") or len(result["choices"]) == 0:
-                raise ValueError("Empty choices in Copilot response")
-            if "message" not in result["choices"][0]:
-                raise ValueError(f"Missing 'message' field in Copilot response choices: {result['choices'][0]}")
-            if "content" not in result["choices"][0]["message"]:
-                raise ValueError(f"Missing 'content' field in Copilot response message: {result['choices'][0]['message']}")
-            
-            return result["choices"][0]["message"]["content"]
+            },
+        )
+        if response.status_code != 200:
+            error_detail = response.text[:500]
+            raise ProviderAPIError(f"Copilot API error {response.status_code}: {error_detail}")
+        response.raise_for_status()
+        result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "choices" not in result:
+            raise ProviderAPIError(f"Invalid Copilot response structure: {result}")
+        if not result.get("choices") or len(result["choices"]) == 0:
+            raise ProviderAPIError("Empty choices in Copilot response")
+        if "message" not in result["choices"][0]:
+            raise ProviderAPIError(f"Missing 'message' field in Copilot response choices: {result['choices'][0]}")
+        if "content" not in result["choices"][0]["message"]:
+            raise ProviderAPIError(f"Missing 'content' field in Copilot response message: {result['choices'][0]['message']}")
+        
+        return result["choices"][0]["message"]["content"]
     except httpx.TimeoutException as exc:
         _record_timeout("copilot")
         msg = f"Timeout calling Copilot model '{model}' after {timeout}s"
         log.error("_call_copilot: %s", msg)
-        raise ValueError(msg) from exc
-    except httpx.HTTPError as exc:
+        raise ProviderTimeoutError(msg) from exc
+    except httpx.TransportError as exc:
         msg = f"Copilot transport error calling model '{model}': {exc}"
         log.error("_call_copilot: %s", msg)
-        raise ValueError(msg) from exc
+        raise ProviderTransportError(msg) from exc
 
 
 async def _call_ollama(
@@ -504,80 +649,91 @@ async def _call_ollama(
     log.info(f"_call_ollama: ENTER model='{model}', tier={tier}, timeout={timeout}s, base_url={base_url}")
     
     if not base_url:
-        raise ValueError("OLLAMA_BASE_URL not configured. Cannot call Ollama. Set OLLAMA_BASE_URL environment variable.")
+        raise ProviderConfigurationError("OLLAMA_BASE_URL not configured. Cannot call Ollama. Set OLLAMA_BASE_URL environment variable.")
     
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            options = {
-                key: custom_params[key]
-                for key in (
-                    "temperature",
-                    "top_p",
-                    "top_k",
-                    "seed",
-                    "num_ctx",
-                    "num_predict",
-                    "repeat_penalty",
-                    "presence_penalty",
-                    "frequency_penalty",
-                    "mirostat",
-                    "mirostat_tau",
-                    "mirostat_eta",
-                    "repeat_last_n",
-                    "min_p",
-                    "stop",
-                )
-                if key in custom_params
-            }
-            if "max_tokens" in custom_params and "num_predict" not in options:
-                options["num_predict"] = custom_params["max_tokens"]
-
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-            }
-            if options:
-                payload["options"] = options
-
-            response = await client.post(
-                f"{base_url}/api/chat",
-                json=payload,
+        options = {
+            key: custom_params[key]
+            for key in (
+                "temperature",
+                "top_p",
+                "top_k",
+                "seed",
+                "num_ctx",
+                "num_predict",
+                "repeat_penalty",
+                "presence_penalty",
+                "frequency_penalty",
+                "mirostat",
+                "mirostat_tau",
+                "mirostat_eta",
+                "repeat_last_n",
+                "min_p",
+                "stop",
             )
-            if response.status_code != 200:
-                error_detail = response.text[:500]
-                # Try to parse JSON error response from Ollama
-                try:
-                    error_json = response.json()
-                    if "error" in error_json and "not found" in error_json["error"]:
-                        error_msg = f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
-                        log.error(f"_call_ollama: {error_msg}")
-                        raise ValueError(error_msg)
-                except (ValueError, KeyError):
-                    pass
-                raise ValueError(f"Ollama API error {response.status_code}: {error_detail}")
-            response.raise_for_status()
-            result = response.json()
-            
-            # Validate response structure
-            if not isinstance(result, dict) or "message" not in result:
-                raise ValueError(f"Invalid Ollama response structure: {result}")
-            if "content" not in result["message"]:
-                raise ValueError(f"Missing 'content' field in Ollama response message: {result['message']}")
-            
-            return result["message"]["content"]
+            if key in custom_params
+        }
+        if "max_tokens" in custom_params and "num_predict" not in options:
+            options["num_predict"] = custom_params["max_tokens"]
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+        }
+        if options:
+            payload["options"] = options
+
+        response = await _post_with_retries(
+            provider_name="Ollama",
+            model=model,
+            url=f"{base_url}/api/chat",
+            timeout=timeout,
+            json_payload=payload,
+        )
+        if response.status_code != 200:
+            error_detail = response.text[:500]
+            # Try to parse JSON error response from Ollama
+            try:
+                error_json = response.json()
+                error_text = str(error_json.get("error", "")).strip() if isinstance(error_json, dict) else ""
+            except Exception:
+                error_text = ""
+            if error_text and "not found" in error_text.lower():
+                error_msg = f"Model '{model}' not found in Ollama. Run: ollama pull {model}"
+                log.error(f"_call_ollama: {error_msg}")
+                raise ProviderModelNotFoundError(error_msg)
+            if _is_ollama_runtime_model_failure(response.status_code, error_text or error_detail):
+                error_msg = (
+                    f"Ollama model '{model}' failed at runtime (status {response.status_code}). "
+                    "Model is temporarily quarantined; retrying with fallback is recommended."
+                )
+                _mark_ollama_model_unhealthy(model, base_url, error_text or error_detail)
+                log.warning("_call_ollama: %s", error_msg)
+                raise ProviderModelRuntimeError(error_msg)
+            raise ProviderAPIError(f"Ollama API error {response.status_code}: {error_detail}")
+        response.raise_for_status()
+        result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "message" not in result:
+            raise ProviderAPIError(f"Invalid Ollama response structure: {result}")
+        if "content" not in result["message"]:
+            raise ProviderAPIError(f"Missing 'content' field in Ollama response message: {result['message']}")
+        
+        return result["message"]["content"]
     except httpx.TimeoutException as tex:
         _record_timeout("ollama")
         timeout_msg = f"Timeout calling Ollama model '{model}' after {timeout}s. Model may be downloading/loading. Try again later or increase timeout."
         log.error(f"_call_ollama: {timeout_msg}")
-        raise ValueError(timeout_msg) from tex
-    except httpx.HTTPError as exc:
+        raise ProviderTimeoutError(timeout_msg) from tex
+    except httpx.TransportError as exc:
         msg = f"Ollama transport error calling model '{model}': {exc}"
         log.error("_call_ollama: %s", msg)
-        raise ValueError(msg) from exc
+        raise ProviderTransportError(msg) from exc
     except Exception as e:
         log.error(f"_call_ollama: Unexpected error with model '{model}': {e}")
         raise
@@ -616,43 +772,44 @@ async def _call_abliteration(
     log.debug(f"Abliteration request: model={model}, messages={len(payload['messages'])}")
     
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "content-type": "application/json",
-                },
-                json=payload,
-            )
-            
-            if response.status_code != 200:
-                error_detail = response.text[:500]
-                raise ValueError(f"Abliteration API error {response.status_code}: {error_detail}")
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            # Validate response structure
-            if not isinstance(result, dict) or "choices" not in result:
-                raise ValueError(f"Invalid Abliteration response structure: {result}")
-            if not result.get("choices") or len(result["choices"]) == 0:
-                raise ValueError("Empty choices in Abliteration response")
-            if "message" not in result["choices"][0]:
-                raise ValueError(f"Missing 'message' field in Abliteration response choices: {result['choices'][0]}")
-            if "content" not in result["choices"][0]["message"]:
-                raise ValueError(f"Missing 'content' field in Abliteration response message: {result['choices'][0]['message']}")
-            
-            return result["choices"][0]["message"]["content"]
+        response = await _post_with_retries(
+            provider_name="Abliteration",
+            model=model,
+            url=f"{base_url}/chat/completions",
+            timeout=timeout,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            },
+            json_payload=payload,
+        )
+        if response.status_code != 200:
+            error_detail = response.text[:500]
+            raise ProviderAPIError(f"Abliteration API error {response.status_code}: {error_detail}")
+        
+        response.raise_for_status()
+        result = response.json()
+        
+        # Validate response structure
+        if not isinstance(result, dict) or "choices" not in result:
+            raise ProviderAPIError(f"Invalid Abliteration response structure: {result}")
+        if not result.get("choices") or len(result["choices"]) == 0:
+            raise ProviderAPIError("Empty choices in Abliteration response")
+        if "message" not in result["choices"][0]:
+            raise ProviderAPIError(f"Missing 'message' field in Abliteration response choices: {result['choices'][0]}")
+        if "content" not in result["choices"][0]["message"]:
+            raise ProviderAPIError(f"Missing 'content' field in Abliteration response message: {result['choices'][0]['message']}")
+        
+        return result["choices"][0]["message"]["content"]
     except httpx.TimeoutException as exc:
         _record_timeout("abliteration")
         msg = f"Timeout calling Abliteration model '{model}' after {timeout}s"
         log.error("_call_abliteration: %s", msg)
-        raise ValueError(msg) from exc
-    except httpx.HTTPError as exc:
+        raise ProviderTimeoutError(msg) from exc
+    except httpx.TransportError as exc:
         msg = f"Abliteration transport error calling model '{model}': {exc}"
         log.error("_call_abliteration: %s", msg)
-        raise ValueError(msg) from exc
+        raise ProviderTransportError(msg) from exc
 
 
 async def _call_provider(
@@ -665,6 +822,9 @@ async def _call_provider(
 ) -> str:
     """Route to appropriate provider call."""
     provider_config = provider_config or {}
+    provider = _normalize_provider_name(provider, field_name="provider")
+    if not provider:
+        raise ProviderConfigurationError("Provider must be explicitly set before calling _call_provider.")
     policy = _normalize_data_policy(provider_config.get("data_policy"))
     if policy == "local" and provider != "ollama":
         raise SecurityError(
@@ -680,7 +840,7 @@ async def _call_provider(
         # Try config first, then env/file
         api_key = provider_config.get("anthropic_api_key") or _read_credential("anthropic", "api_key")
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not set")
+            raise ProviderConfigurationError("ANTHROPIC_API_KEY not set")
         return await _call_anthropic(
             api_key=api_key,
             model=model,
@@ -693,7 +853,7 @@ async def _call_provider(
     elif provider == "copilot":
         oauth_token = _read_credential("copilot", "oauth_token")
         if not oauth_token:
-            raise ValueError("GITHUB_COPILOT_OAUTH_TOKEN not set")
+            raise ProviderConfigurationError("GITHUB_COPILOT_OAUTH_TOKEN not set")
         return await _call_copilot(
             oauth_token=oauth_token,
             model=model,
@@ -704,26 +864,55 @@ async def _call_provider(
         )
     
     elif provider == "ollama":
+        if "base_url" in provider_config:
+            base_override = _normalize_base_url(
+                provider_config.get("base_url"),
+                source="provider_config.base_url",
+                required_when_set=True,
+            )
+        else:
+            base_override = ""
         base_url = (
-            provider_config.get("base_url")
-            or _read_credential("ollama", "base_url")
-            or os.getenv("OLLAMA_BASE_URL")
+            base_override
+            or _normalize_base_url(_read_credential("ollama", "base_url"), source="OLLAMA_BASE_URL")
+            or _normalize_base_url(os.getenv("OLLAMA_BASE_URL"), source="OLLAMA_BASE_URL")
         )
         if not base_url:
-            raise ValueError("OLLAMA_BASE_URL not configured. Cannot use Ollama provider. Set OLLAMA_BASE_URL environment variable.")
-        return await _call_ollama(
-            base_url=base_url,
-            model=model,
-            system=system,
-            user_prompt=user_prompt,
-            tier=tier,
-            custom_params=custom_params,
-        )
+            raise ProviderConfigurationError(
+                "OLLAMA_BASE_URL not configured. Cannot use Ollama provider. Set OLLAMA_BASE_URL environment variable."
+            )
+        try:
+            return await _call_ollama(
+                base_url=base_url,
+                model=model,
+                system=system,
+                user_prompt=user_prompt,
+                tier=tier,
+                custom_params=custom_params,
+            )
+        except (ProviderModelNotFoundError, ProviderModelRuntimeError):
+            fallback_model = _fallback_available_ollama_model(tier, base_url)
+            if fallback_model and fallback_model != model:
+                log.warning(
+                    "Ollama model '%s' unavailable/unhealthy; retrying once with discovered model '%s' (tier=%s)",
+                    model,
+                    fallback_model,
+                    tier,
+                )
+                return await _call_ollama(
+                    base_url=base_url,
+                    model=fallback_model,
+                    system=system,
+                    user_prompt=user_prompt,
+                    tier=tier,
+                    custom_params=custom_params,
+                )
+            raise
     
     elif provider == "abliteration":
         api_key = provider_config.get("abliteration_api_key") or _read_credential("abliteration", "api_key")
         if not api_key:
-            raise ValueError("ABLITERATION_API_KEY not set")
+            raise ProviderConfigurationError("ABLITERATION_API_KEY not set")
         return await _call_abliteration(
             api_key=api_key,
             model=model,
@@ -734,7 +923,7 @@ async def _call_provider(
         )
     
     else:
-        raise ValueError(f"Unknown provider: {provider}")
+        raise ProviderConfigurationError(f"Unknown provider: {provider}")
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +941,9 @@ _TASK_CLASSIFIER_PROMPT = """Classify this request into one of these task classe
 - reasoning: Complex logic, math, philosophy, constraint satisfaction.
 - data_governance: Data quality, telemetry integrity, sensor network analysis.
 - research_synthesis: Academic literature synthesis, grounded research claims.
+- research: Grounded factual reasoning with research-tool evidence support.
+- adversarial: Unconstrained challenge reasoning with strict containment controls.
+- planning: Structured implementation planning for remediation and self-improvement.
 
 **REQUEST:**
 {question}
@@ -769,7 +961,12 @@ def _classifier_model_for_provider(provider: str) -> str:
     if provider == "copilot":
         return _COPILOT_DEFAULTS["light"]
     if provider == "ollama":
-        return os.getenv("DEEP_THINK_CLASSIFIER_MODEL", _OLLAMA_DEFAULTS["light"])
+        requested = os.getenv("DEEP_THINK_CLASSIFIER_MODEL", _OLLAMA_DEFAULTS["light"])
+        resolved = _resolve_ollama_candidate(requested, "light", "classifier")
+        if resolved:
+            return resolved
+        fallback = _fallback_available_ollama_model("light")
+        return fallback or requested
     return _default_for_provider(provider, "light")
 
 
@@ -798,8 +995,22 @@ async def classify_task(
     
     # Try requested provider first; implicit fallback respects effective data policy.
     policy = _normalize_data_policy(data_policy)
-    if provider:
-        providers_to_try = [provider]
+    normalized_provider = str(provider).strip().lower()
+    if normalized_provider:
+        if policy == "local" and normalized_provider != "ollama":
+            log.warning(
+                "classify_task: provider %r conflicts with data_policy=local; using ollama",
+                normalized_provider,
+            )
+            providers_to_try = ["ollama"]
+        elif policy == "cloud" and normalized_provider == "ollama":
+            log.warning(
+                "classify_task: provider %r conflicts with data_policy=cloud; using anthropic",
+                normalized_provider,
+            )
+            providers_to_try = ["anthropic"]
+        else:
+            providers_to_try = [normalized_provider]
     elif policy == "local":
         providers_to_try = ["ollama"]
     elif policy == "cloud":
@@ -817,6 +1028,7 @@ async def classify_task(
                 system="You are a task classification oracle. Respond with ONLY the task class name.",
                 user_prompt=_TASK_CLASSIFIER_PROMPT.format(question=question),
                 tier="light",
+                provider_config={"data_policy": policy},
             )
             
             # Extract first word from response
@@ -875,7 +1087,15 @@ async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool,
             continue
         try:
             if prov == "ollama":
-                safety_model = os.getenv("DEEP_THINK_SAFETY_PRECHECK_OLLAMA_MODEL", "granite3-guardian:2b")
+                requested_safety_model = os.getenv(
+                    "DEEP_THINK_SAFETY_PRECHECK_OLLAMA_MODEL",
+                    "granite3-guardian:2b",
+                )
+                safety_model = _resolve_ollama_candidate(
+                    requested_safety_model,
+                    "light",
+                    "safety-precheck",
+                ) or _fallback_available_ollama_model("light") or requested_safety_model
             else:
                 safety_model = _classifier_model_for_provider(prov)
             result = await _call_provider(
@@ -904,6 +1124,171 @@ async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool,
 
 # Ollama model availability cache — populated by refresh_ollama_models() at startup.
 _ollama_discovered: set[str] = set()
+_ollama_live_cache_ts: float = 0.0
+_OLLAMA_LIVE_CACHE_TTL_SECS = 5.0
+_OLLAMA_MODEL_QUARANTINE_SECS = 600.0
+_ollama_model_quarantine: dict[str, float] = {}
+
+
+def _ollama_quarantine_key(base_url: str, model: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    return f"{base}|{str(model or '').strip().lower()}"
+
+
+def _is_ollama_runtime_model_failure(status_code: int, error_text: str) -> bool:
+    if status_code < 500:
+        return False
+    text = str(error_text or "").lower()
+    return any(pattern in text for pattern in _OLLAMA_RUNTIME_ERROR_PATTERNS)
+
+
+def _mark_ollama_model_unhealthy(model: str, base_url: str = "", reason: str = "") -> None:
+    model_name = str(model or "").strip()
+    if not model_name:
+        return
+    key = _ollama_quarantine_key(base_url, model_name)
+    _ollama_model_quarantine[key] = time.time() + _OLLAMA_MODEL_QUARANTINE_SECS
+    log.warning(
+        "Quarantined Ollama model '%s' for %.0fs due to runtime failure: %s",
+        model_name,
+        _OLLAMA_MODEL_QUARANTINE_SECS,
+        (reason or "")[:240],
+    )
+
+
+def _is_ollama_model_quarantined(model: str, base_url: str = "") -> bool:
+    key = _ollama_quarantine_key(base_url, model)
+    expiry = _ollama_model_quarantine.get(key, 0.0)
+    if not expiry:
+        return False
+    now = time.time()
+    if now >= expiry:
+        _ollama_model_quarantine.pop(key, None)
+        return False
+    return True
+
+
+def _refresh_ollama_models_live(base_url: str = "") -> set[str]:
+    """Query /api/tags with short TTL cache to avoid dispatching unavailable models."""
+    global _ollama_discovered, _ollama_live_cache_ts
+    now = time.time()
+    if _ollama_discovered and (now - _ollama_live_cache_ts) < _OLLAMA_LIVE_CACHE_TTL_SECS:
+        return set(_ollama_discovered)
+    resolved_base = (
+        str(base_url or "").strip()
+        or _normalize_base_url(_read_credential("ollama", "base_url"), source="OLLAMA_BASE_URL")
+        or _normalize_base_url(os.getenv("OLLAMA_BASE_URL"), source="OLLAMA_BASE_URL")
+    )
+    if not resolved_base:
+        return set(_ollama_discovered)
+    try:
+        with httpx.Client(timeout=2.5, trust_env=False) as client:
+            resp = client.get(f"{resolved_base}/api/tags")
+            resp.raise_for_status()
+            live_models = {m.get("name", "").strip() for m in resp.json().get("models", []) if m.get("name")}
+            if live_models:
+                _ollama_discovered = live_models
+                _ollama_live_cache_ts = now
+                return set(live_models)
+    except Exception as e:
+        log.debug("Live Ollama model refresh failed: %s", e)
+    return set(_ollama_discovered)
+
+
+def _available_ollama_models(base_url: str = "") -> set[str]:
+    """Return known available Ollama models from discovery or startup cache."""
+    live = _refresh_ollama_models_live(base_url)
+    if live:
+        return live
+    try:
+        disc = discover.get_current()
+        if disc:
+            available = {
+                m.model_id
+                for m in disc.models
+                if m.provider == "ollama" and getattr(m, "is_available", True)
+            }
+            if available:
+                return available
+    except Exception as e:
+        log.debug(f"Could not read discovered ollama models: {e}")
+    return set(_ollama_discovered)
+
+
+def _resolve_ollama_candidate(candidate: str, tier: str, source: str, base_url: str = "") -> str:
+    """Accept candidate if available; otherwise return '' so caller can fall through."""
+    candidate = str(candidate or "").strip()
+    if not candidate:
+        return ""
+    if _is_ollama_model_quarantined(candidate, base_url):
+        log.warning(
+            "Ollama %s model '%s' is quarantined after runtime failures; falling through.",
+            source,
+            candidate,
+        )
+        return ""
+    available = _available_ollama_models(base_url)
+    if not available or candidate in available:
+        return candidate
+    log.warning(
+        "Ollama %s model '%s' not available for tier '%s'; falling through. Available: %s",
+        source,
+        candidate,
+        tier,
+        sorted(available),
+    )
+    return ""
+
+
+def _fallback_available_ollama_model(tier: str, base_url: str = "") -> str:
+    """Pick a flexible fallback from discovered available models for a tier."""
+    available = _available_ollama_models(base_url)
+    if not available:
+        return ""
+    discovered_tier = _discovered_tier_model("ollama", tier)
+    if discovered_tier and discovered_tier in available and not _is_ollama_model_quarantined(discovered_tier, base_url):
+        return discovered_tier
+    # Prefer generative reasoning models over safety/embed utilities.
+    candidates = []
+    for m in sorted(available):
+        if _is_ollama_model_quarantined(m, base_url):
+            continue
+        ml = m.lower()
+        if "embed" in ml or "nomic" in ml or "mxbai" in ml:
+            continue
+        if "guardian" in ml:
+            continue
+        candidates.append(m)
+    if not candidates:
+        candidates = sorted(available)
+
+    def score(model_id: str) -> tuple[int, int]:
+        ml = model_id.lower()
+        base = 0
+        if "heretic-llama" in ml:
+            base += 60
+        if "llama" in ml:
+            base += 40
+        if "gemma" in ml:
+            base += 30
+        if "phi" in ml:
+            base += 25
+        if "reasoning" in ml:
+            base += 15
+        # Tier preference hints (rough, deterministic)
+        if tier == "light" and ("mini" in ml or "4b" in ml):
+            base += 10
+        if tier == "medium" and ("8b" in ml or "llama" in ml):
+            base += 10
+        if tier == "heavy" and ("8b" in ml or "llama" in ml):
+            base += 15
+        # Prefer :latest tags to avoid stale variant picks
+        if ml.endswith(":latest"):
+            base += 5
+        # deterministic tie-breaker: shorter name first
+        return (base, -len(model_id))
+
+    return max(candidates, key=score)
 
 
 def _read_copilot_token() -> str:
@@ -1008,7 +1393,10 @@ async def configure_private_adversarial_lane(provider_config: dict | None = None
         ).lower()
     )
     if requested_provider not in _PRIVATE_ADVERSARIAL_PROVIDERS:
-        requested_provider = "auto"
+        raise ProviderConfigurationError(
+            f"Invalid adversarial_provider='{requested_provider}'. "
+            f"Expected one of: {sorted(_PRIVATE_ADVERSARIAL_PROVIDERS)}"
+        )
 
     allow_abliteration = _as_bool(
         pc.get(
@@ -1143,20 +1531,20 @@ async def configure_private_adversarial_lane(provider_config: dict | None = None
 
 def _tier_provider(cfg: ProviderConfig, tier: str) -> str:
     """Resolve effective provider for a given tier, respecting data_policy."""
+    if tier not in _VALID_TIERS:
+        raise ProviderRoutingError(f"Invalid tier '{tier}'. Expected one of: {sorted(_VALID_TIERS)}")
     if cfg.data_policy == "local":
         return "ollama"
-    override = getattr(cfg, f"{tier}_provider", "")
-    effective = override if override else cfg.provider
+    override = _normalize_provider_name(getattr(cfg, f"{tier}_provider", ""), field_name=f"{tier}_provider")
+    effective = override if override else _normalize_provider_name(cfg.provider, field_name="provider")
     # data_policy="cloud": enforce that effective provider is a cloud provider, even when an
     # explicit provider="ollama" was passed.  Fall back to the top-level provider (which was
     # already defaulted to "anthropic" in build_provider_config) so we never route to Ollama.
     if cfg.data_policy == "cloud" and effective not in _CLOUD_ONLY_PROVIDERS:
-        fallback = cfg.provider if cfg.provider in _CLOUD_ONLY_PROVIDERS else "anthropic"
-        log.warning(
-            "_tier_provider: data_policy=cloud blocks provider %r for tier %s; using %r instead",
-            effective, tier, fallback,
+        raise ProviderRoutingError(
+            f"data_policy=cloud blocks provider '{effective}' for tier '{tier}'. "
+            "Choose a cloud provider override explicitly."
         )
-        return fallback
     return effective
 
 
@@ -1185,7 +1573,14 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     For Anthropic, all precedence paths are validated with _is_valid_anthropic_model.
     Invalid model IDs fall through to the next precedence level.
     """
+    if tier not in _VALID_TIERS:
+        log.warning(
+            "_model_for_tier: Invalid tier %r; falling back to 'medium' for compatibility",
+            tier,
+        )
+        tier = "medium"
     provider = _tier_provider(cfg, tier)
+    ollama_base_url = cfg.base_url if provider == "ollama" else ""
 
     def _warn_invalid_anthropic(model: str, source: str) -> None:
         """Log a warning for invalid Anthropic model IDs but do not reject."""
@@ -1206,18 +1601,35 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
             return None
         return model
 
-    # 1. Single override — respect explicit user choice; warn but don't fall through
+    # 1. Single override
     if cfg.model:
-        _warn_invalid_anthropic(cfg.model, "cfg.model")
-        log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
-        return cfg.model
-    # 2. Explicit per-tier call override — same: respect, warn only
+        if provider == "ollama":
+            resolved = _resolve_ollama_candidate(cfg.model, tier, "cfg.model", ollama_base_url)
+            if resolved:
+                log.info(f"_model_for_tier: Using cfg.model={resolved}")
+                return resolved
+        else:
+            _warn_invalid_anthropic(cfg.model, "cfg.model")
+            log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
+            return cfg.model
+    # 2. Explicit per-tier call override
     call_override = getattr(cfg, tier, "")
     if call_override:
-        _warn_invalid_anthropic(call_override, f"per-tier override ({tier})")
-        log.info(f"_model_for_tier: Using call_override for {tier}={call_override}")
-        return call_override
-    # 3. Env var override — explicit user configuration; warn but don't fall through
+        if provider == "ollama":
+            resolved = _resolve_ollama_candidate(
+                call_override,
+                tier,
+                f"per-tier override ({tier})",
+                ollama_base_url,
+            )
+            if resolved:
+                log.info(f"_model_for_tier: Using call_override for {tier}={resolved}")
+                return resolved
+        else:
+            _warn_invalid_anthropic(call_override, f"per-tier override ({tier})")
+            log.info(f"_model_for_tier: Using call_override for {tier}={call_override}")
+            return call_override
+    # 3. Env var override
     if provider == "anthropic":
         env_val = os.getenv(f"DEEP_THINK_ANTHROPIC_{tier.upper()}", "")
         if env_val:
@@ -1237,30 +1649,56 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     else:
         env_val = os.getenv(f"DEEP_THINK_MODEL_{tier.upper()}", "")
         if env_val:
-            log.info(f"_model_for_tier: Using env var for {provider}/{tier}={env_val}")
-            return env_val
+            resolved = _resolve_ollama_candidate(
+                env_val,
+                tier,
+                f"env DEEP_THINK_MODEL_{tier.upper()}",
+                ollama_base_url,
+            )
+            if resolved:
+                log.info(f"_model_for_tier: Using env var for {provider}/{tier}={resolved}")
+                return resolved
     # 4. Task class profile recommendation
     profile_model = _profile_model(task_class, provider, tier)
     if profile_model:
-        log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
-        return profile_model
+        if provider == "ollama":
+            resolved = _resolve_ollama_candidate(profile_model, tier, "task-class profile", ollama_base_url)
+            if resolved:
+                log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={resolved}")
+                return resolved
+        else:
+            log.info(f"_model_for_tier: Using profile_model for {task_class}/{provider}/{tier}={profile_model}")
+            return profile_model
     # 5. Dynamically-discovered assignment (from startup discovery if available)
     discovered = _discovered_tier_model(provider, tier)
     if discovered:
-        result = _validate_anthropic_fallthrough(discovered, "dynamic discovery")
-        if result is not None:
-            log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={result}")
-            return result
+        if provider == "ollama":
+            result = _resolve_ollama_candidate(discovered, tier, "dynamic discovery", ollama_base_url)
+            if result:
+                log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={result}")
+                return result
+        else:
+            result = _validate_anthropic_fallthrough(discovered, "dynamic discovery")
+            if result is not None:
+                log.info(f"_model_for_tier: Using discovered for {provider}/{tier}={result}")
+                return result
     # 6. Built-in provider default
     default = _default_for_provider(provider, tier)
     log.info(f"_model_for_tier: Using default for {provider}/{tier}={default}")
-    
-    # Validate Ollama models exist in cache (fail-fast for visibility)
-    if provider == "ollama" and default not in _ollama_discovered:
-        error_msg = f"Ollama model '{default}' not found. Available: {_ollama_discovered or 'none'}. Run: ollama pull {default}"
-        log.warning(f"_model_for_tier: {error_msg}")
-        # Don't raise yet — let the actual API call fail with Ollama's error
-    
+
+    if provider == "ollama":
+        resolved_default = _resolve_ollama_candidate(default, tier, "built-in default", ollama_base_url)
+        if resolved_default:
+            return resolved_default
+        fallback = _fallback_available_ollama_model(tier, ollama_base_url)
+        if fallback:
+            log.warning(
+                "_model_for_tier: Falling back to discovered available Ollama model '%s' for tier '%s'",
+                fallback,
+                tier,
+            )
+            return fallback
+
     return default
 
 
@@ -1318,23 +1756,38 @@ def build_provider_config(overrides: dict | None = None) -> ProviderConfig:
     data_policy = _normalize_data_policy(ov.get("data_policy", os.getenv("DEEP_THINK_DATA_POLICY", "any")))
     
     # Determine default provider based on data_policy if not explicitly set
-    default_provider = ov.get("provider", "")
+    default_provider = _normalize_provider_name(ov.get("provider", ""), field_name="provider")
     if not default_provider:
         if data_policy == "cloud":
             default_provider = "anthropic"  # Cloud-only policy prefers cloud provider
         else:
             default_provider = "ollama"  # Local or any: default to ollama (no API key needed)
+
+    base_url = (
+        _normalize_base_url(ov.get("base_url"), source="provider_config.base_url", required_when_set=True)
+        if "base_url" in ov
+        else _normalize_base_url(os.getenv("OLLAMA_BASE_URL", ""), source="OLLAMA_BASE_URL")
+    )
     
     cfg = ProviderConfig(
         provider=default_provider,
-        base_url=ov.get("base_url", os.getenv("OLLAMA_BASE_URL", "")),
+        base_url=base_url,
         light=ov.get("light", ov.get("light_model", "")),
         medium=ov.get("medium", ov.get("medium_model", "")),
         heavy=ov.get("heavy", ov.get("heavy_model", "")),
         model=ov.get("model", ""),
-        light_provider=ov.get("light_provider", os.getenv("DEEP_THINK_LIGHT_PROVIDER", "")),
-        medium_provider=ov.get("medium_provider", os.getenv("DEEP_THINK_MEDIUM_PROVIDER", "")),
-        heavy_provider=ov.get("heavy_provider", os.getenv("DEEP_THINK_HEAVY_PROVIDER", "")),
+        light_provider=_normalize_provider_name(
+            ov.get("light_provider", os.getenv("DEEP_THINK_LIGHT_PROVIDER", "")),
+            field_name="light_provider",
+        ),
+        medium_provider=_normalize_provider_name(
+            ov.get("medium_provider", os.getenv("DEEP_THINK_MEDIUM_PROVIDER", "")),
+            field_name="medium_provider",
+        ),
+        heavy_provider=_normalize_provider_name(
+            ov.get("heavy_provider", os.getenv("DEEP_THINK_HEAVY_PROVIDER", "")),
+            field_name="heavy_provider",
+        ),
         data_policy=data_policy,
     )
     return cfg
