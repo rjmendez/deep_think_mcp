@@ -1073,14 +1073,38 @@ Output JSON ONLY:
 If safe=false, the request violates policy. If requires_review=true, escalate for human review."""
 
 
-async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool, str]:
+async def _run_safety_precheck(
+    question: str, provider: str = "", data_policy: str = "any"
+) -> tuple[bool, str]:
     """Run safety precheck using available providers with fallback.
     
     Returns:
         (safe, reason) tuple. safe=True if request passed checks.
     """
-    # Explicit provider can still be copilot, but implicit fallback excludes it.
-    providers_to_try = [provider] if provider else ["anthropic", "ollama"]
+    # Try requested provider first; implicit fallback respects effective data policy.
+    policy = _normalize_data_policy(data_policy)
+    normalized_provider = str(provider).strip().lower()
+    if normalized_provider:
+        if policy == "local" and normalized_provider != "ollama":
+            log.warning(
+                "_run_safety_precheck: provider %r conflicts with data_policy=local; using ollama",
+                normalized_provider,
+            )
+            providers_to_try = ["ollama"]
+        elif policy == "cloud" and normalized_provider == "ollama":
+            log.warning(
+                "_run_safety_precheck: provider %r conflicts with data_policy=cloud; using anthropic",
+                normalized_provider,
+            )
+            providers_to_try = ["anthropic"]
+        else:
+            providers_to_try = [normalized_provider]
+    elif policy == "local":
+        providers_to_try = ["ollama"]
+    elif policy == "cloud":
+        providers_to_try = ["anthropic"]
+    else:
+        providers_to_try = ["anthropic", "ollama"]
     
     for prov in providers_to_try:
         if not prov:
@@ -1104,6 +1128,7 @@ async def _run_safety_precheck(question: str, provider: str = "") -> tuple[bool,
                 system="You are a safety classifier. Respond with ONLY JSON.",
                 user_prompt=_SAFETY_PRECHECK_PROMPT.format(question=question),
                 tier="light",
+                provider_config={"data_policy": policy},
             )
             
             import json
@@ -1245,14 +1270,15 @@ def _fallback_available_ollama_model(tier: str, base_url: str = "") -> str:
     available = _available_ollama_models(base_url)
     if not available:
         return ""
+    non_quarantined = [m for m in sorted(available) if not _is_ollama_model_quarantined(m, base_url)]
+    if not non_quarantined:
+        return ""
     discovered_tier = _discovered_tier_model("ollama", tier)
-    if discovered_tier and discovered_tier in available and not _is_ollama_model_quarantined(discovered_tier, base_url):
+    if discovered_tier and discovered_tier in non_quarantined:
         return discovered_tier
     # Prefer generative reasoning models over safety/embed utilities.
     candidates = []
-    for m in sorted(available):
-        if _is_ollama_model_quarantined(m, base_url):
-            continue
+    for m in non_quarantined:
         ml = m.lower()
         if "embed" in ml or "nomic" in ml or "mxbai" in ml:
             continue
@@ -1260,7 +1286,7 @@ def _fallback_available_ollama_model(tier: str, base_url: str = "") -> str:
             continue
         candidates.append(m)
     if not candidates:
-        candidates = sorted(available)
+        candidates = list(non_quarantined)
 
     def score(model_id: str) -> tuple[int, int]:
         ml = model_id.lower()
@@ -1582,15 +1608,6 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
     provider = _tier_provider(cfg, tier)
     ollama_base_url = cfg.base_url if provider == "ollama" else ""
 
-    def _warn_invalid_anthropic(model: str, source: str) -> None:
-        """Log a warning for invalid Anthropic model IDs but do not reject."""
-        if provider == "anthropic" and not _is_valid_anthropic_model(model):
-            log.warning(
-                "_model_for_tier: Non-standard Anthropic model %r for tier %s (source: %s) — "
-                "prefer official IDs like claude-haiku-4-5, claude-sonnet-4-6",
-                model, tier, source,
-            )
-
     def _validate_anthropic_fallthrough(model: str, source: str) -> str | None:
         """Return model if valid for Anthropic, else None (triggers fall-through)."""
         if provider == "anthropic" and not _is_valid_anthropic_model(model):
@@ -1609,9 +1626,10 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
                 log.info(f"_model_for_tier: Using cfg.model={resolved}")
                 return resolved
         else:
-            _warn_invalid_anthropic(cfg.model, "cfg.model")
-            log.info(f"_model_for_tier: Using cfg.model={cfg.model}")
-            return cfg.model
+            result = _validate_anthropic_fallthrough(cfg.model, "cfg.model")
+            if result is not None:
+                log.info(f"_model_for_tier: Using cfg.model={result}")
+                return result
     # 2. Explicit per-tier call override
     call_override = getattr(cfg, tier, "")
     if call_override:
@@ -1626,16 +1644,18 @@ def _model_for_tier(cfg: ProviderConfig, tier: str, task_class: str = "general")
                 log.info(f"_model_for_tier: Using call_override for {tier}={resolved}")
                 return resolved
         else:
-            _warn_invalid_anthropic(call_override, f"per-tier override ({tier})")
-            log.info(f"_model_for_tier: Using call_override for {tier}={call_override}")
-            return call_override
+            result = _validate_anthropic_fallthrough(call_override, f"per-tier override ({tier})")
+            if result is not None:
+                log.info(f"_model_for_tier: Using call_override for {tier}={result}")
+                return result
     # 3. Env var override
     if provider == "anthropic":
         env_val = os.getenv(f"DEEP_THINK_ANTHROPIC_{tier.upper()}", "")
         if env_val:
-            _warn_invalid_anthropic(env_val, f"env DEEP_THINK_ANTHROPIC_{tier.upper()}")
-            log.info(f"_model_for_tier: Using env var for anthropic/{tier}={env_val}")
-            return env_val
+            result = _validate_anthropic_fallthrough(env_val, f"env DEEP_THINK_ANTHROPIC_{tier.upper()}")
+            if result is not None:
+                log.info(f"_model_for_tier: Using env var for anthropic/{tier}={result}")
+                return result
     elif provider == "copilot":
         env_val = os.getenv(f"DEEP_THINK_COPILOT_{tier.upper()}", "")
         if env_val:

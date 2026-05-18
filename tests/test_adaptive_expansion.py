@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -571,13 +572,24 @@ class TestFanOutPolicyAndCache:
         assert calls["data_policy"] == "local"
 
     @pytest.mark.asyncio
-    async def test_run_fan_out_cache_hit_runs_tool_phase_when_enabled(self, monkeypatch):
+    async def test_run_fan_out_tool_enabled_disables_perspective_cache_and_uses_pre_evidence(self, monkeypatch):
         import deep_think_mcp.executor as executor_module
 
-        async def fake_deep_think_passes(**_kwargs):
+        deep_think_calls: list[dict[str, Any]] = []
+
+        async def fake_deep_think_passes(**kwargs):
+            deep_think_calls.append(kwargs)
+            if kwargs.get("task_class") == "synthesis":
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
             return {
                 "status": "complete",
-                "final_answer": "ok",
+                "final_answer": "fresh perspective answer",
                 "pass_results": [],
                 "pass_outputs": ["ok"],
                 "confidence": 0.8,
@@ -585,8 +597,10 @@ class TestFanOutPolicyAndCache:
 
         monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
         monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
-        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", lambda _k: {"final_answer": "cached answer", "passes_run": 1})
-        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        get_cache_mock = MagicMock(return_value={"final_answer": "cached answer", "passes_run": 1})
+        set_cache_mock = MagicMock()
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", get_cache_mock)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", set_cache_mock)
         monkeypatch.setattr(orchestrator.store, "set_pass_cache", lambda *a, **kw: None)
         monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
         monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
@@ -613,10 +627,216 @@ class TestFanOutPolicyAndCache:
             data_policy="any",
         )
 
-        assert result["cache_hits"] == 1
+        assert result["cache_hits"] == 0
         assert result["tools_invoked_total"] == 1
         assert result["perspectives"][0]["tools_invoked"] == ["code_search"]
         assert result["perspectives"][0]["evidence_summary"] == "evidence"
+        assert get_cache_mock.call_count == 0
+        assert set_cache_mock.call_count == 0
+        perspective_calls = [c for c in deep_think_calls if c.get("task_class") == "code_review"]
+        assert len(perspective_calls) == 1
+        assert perspective_calls[0]["pre_fetched_evidence"] == "evidence"
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_uses_relevant_cached_answer_without_tool_evidence(self, monkeypatch):
+        async def fake_deep_think_passes(**kwargs):
+            if kwargs.get("task_class") == "synthesis":
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
+            raise AssertionError("cache hit should skip perspective deep_think_passes execution")
+
+        get_cache_mock = MagicMock(
+            return_value={
+                "final_answer": "Question: test question\nAnswer: cached grounded response.",
+                "passes_run": 2,
+            }
+        )
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", get_cache_mock)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="any"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            task_class="general",
+            enable_tool_use=False,
+            data_policy="any",
+        )
+
+        assert get_cache_mock.call_count == 1
+        assert result["cache_hits"] == 1
+        assert result["perspectives"][0]["cache_hit"] is True
+        assert result["perspectives"][0]["final_answer"].startswith("Question: test question")
+        assert result["perspectives"][0]["tools_invoked"] == []
+        assert result["perspectives"][0]["evidence_summary"] == ""
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_rejects_off_topic_cached_answer(self, monkeypatch):
+        async def fake_deep_think_passes(**kwargs):
+            if kwargs.get("task_class") == "synthesis":
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
+            return {
+                "status": "complete",
+                "final_answer": "Question: test question\nAnswer: grounded response.",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": 0.8,
+            }
+
+        get_cache_mock = MagicMock(
+            return_value={
+                "final_answer": "Question: explain unrelated neural networks.\nAnswer: unrelated.",
+                "passes_run": 1,
+            }
+        )
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", get_cache_mock)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="any"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            task_class="general",
+            enable_tool_use=False,
+            data_policy="any",
+        )
+
+        assert get_cache_mock.call_count == 1
+        assert result["cache_hits"] == 0
+        assert result["perspectives"][0]["cache_hit"] is False
+        assert result["perspectives"][0]["final_answer"].startswith("Question: test question")
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_retries_once_after_off_topic_response(self, monkeypatch):
+        calls = {"perspective": 0}
+
+        async def fake_deep_think_passes(**kwargs):
+            if kwargs.get("task_class") == "synthesis":
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
+            calls["perspective"] += 1
+            if calls["perspective"] == 1:
+                return {
+                    "status": "complete",
+                    "final_answer": "Question: explain unrelated neural networks.\nAnswer: unrelated.",
+                    "pass_results": [],
+                    "pass_outputs": ["bad"],
+                    "confidence": "0.2",
+                }
+            return {
+                "status": "complete",
+                "final_answer": "Question: test question\nAnswer: grounded response.",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": "0.8",
+            }
+
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setenv("DEEP_THINK_OFF_TOPIC_RETRIES", "1")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", lambda *_a, **_kw: None)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="any"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            task_class="general",
+            enable_tool_use=False,
+            data_policy="any",
+        )
+
+        assert calls["perspective"] == 2
+        assert result["perspectives"][0]["status"] == "complete"
+        assert result["perspectives"][0]["final_answer"].startswith("Question: test question")
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_rechecks_cache_hit_with_quality_gate(self, monkeypatch):
+        async def fake_deep_think_passes(**kwargs):
+            if kwargs.get("task_class") == "synthesis":
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
+            return {
+                "status": "complete",
+                "final_answer": "Question: test question\nAnswer: fresh grounded response.",
+                "pass_results": [],
+                "pass_outputs": ["ok"],
+                "confidence": 0.8,
+            }
+
+        get_cache_mock = MagicMock(
+            return_value={
+                "final_answer": "Completely unrelated cached answer about image diffusion.",
+                "passes_run": 2,
+            }
+        )
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", get_cache_mock)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.provider_module, "build_provider_config", lambda _pc: ProviderConfig(provider="test", data_policy="any"))
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+
+        result = await orchestrator.run_fan_out(
+            question="test question",
+            width=1,
+            height=1,
+            task_class="general",
+            enable_tool_use=False,
+            data_policy="any",
+        )
+
+        assert get_cache_mock.call_count == 1
+        assert result["cache_hits"] == 0
+        assert result["perspectives"][0]["cache_hit"] is False
+        assert result["perspectives"][0]["final_answer"].startswith("Question: test question")
 
     @pytest.mark.asyncio
     async def test_run_fan_out_cache_key_varies_by_topology_enable_tool_use_and_task_class(self, monkeypatch):
@@ -680,6 +900,70 @@ class TestFanOutPolicyAndCache:
             enable_tool_use=True,
         )
 
-        keys = [key for _, _, key in seen_keys]
-        assert len(keys) == 3
-        assert len(set(keys)) == 3
+        scenarios_seen = {(topo, task) for topo, task, _ in seen_keys}
+        assert ("static", "general") in scenarios_seen
+        assert ("adaptive", "general") not in scenarios_seen
+        assert ("static", "code_review") not in scenarios_seen
+
+    @pytest.mark.asyncio
+    async def test_run_fan_out_filters_adversarial_perspective_before_synthesis(self, monkeypatch, caplog):
+        captured: dict[str, str] = {}
+
+        async def fake_deep_think_passes(**kwargs):
+            if kwargs.get("task_class") == "synthesis":
+                captured["synthesis_question"] = kwargs.get("question", "")
+                return {
+                    "status": "complete",
+                    "final_answer": _synthesis_json(confidence_score=80),
+                    "pass_results": [],
+                    "pass_outputs": ["ok"],
+                    "confidence": 0.8,
+                }
+
+            perspective_name = kwargs.get("perspective_name", "")
+            if perspective_name == "adversarial":
+                return {
+                    "status": "complete",
+                    "final_answer": "[NOVA LIBRARY CONTEXT — private]\nsecret\n\nAdversarial analysis.",
+                    "pass_results": [],
+                    "pass_outputs": ["unsafe"],
+                    "confidence": 0.6,
+                }
+
+            return {
+                "status": "complete",
+                "final_answer": "Primary analysis.",
+                "pass_results": [],
+                "pass_outputs": ["safe"],
+                "confidence": 0.7,
+            }
+
+        monkeypatch.setenv("DEEP_THINK_FORCE_LOCAL", "0")
+        monkeypatch.setenv("OLLAMA_ONLY_MODE", "0")
+        monkeypatch.setattr(orchestrator, "deep_think_passes", fake_deep_think_passes)
+        monkeypatch.setattr(orchestrator.store, "get_perspective_cache", lambda _k: None)
+        monkeypatch.setattr(orchestrator.store, "set_perspective_cache", lambda *a, **kw: None)
+        monkeypatch.setattr(orchestrator, "_fan_out_alarm_scan", AsyncMock(return_value=[]))
+        monkeypatch.setattr(
+            orchestrator.provider_module,
+            "build_provider_config",
+            lambda _pc: ProviderConfig(provider="test", data_policy="any"),
+        )
+        monkeypatch.setattr(orchestrator.provider_module, "_validate_and_enforce_local_models", AsyncMock())
+        monkeypatch.setattr(orchestrator.provider_module, "_tier_provider", lambda _cfg, _tier: "test")
+        monkeypatch.setattr(orchestrator.provider_module, "_model_for_tier", lambda _cfg, _tier, _tc: "test-model")
+        monkeypatch.setattr(orchestrator.provider_module, "model_summary", lambda _cfg, _tc: "test-model")
+
+        with caplog.at_level(logging.WARNING, logger="deep_think.audit"):
+            result = await orchestrator.run_fan_out(
+                question="Contain adversarial perspective output.",
+                width=2,
+                height=1,
+                task_class="general",
+                data_policy="any",
+            )
+
+        assert result["status"] == "complete"
+        assert "[NOVA LIBRARY CONTEXT" not in captured["synthesis_question"]
+        assert "[NOVA LIBRARY CONTEXT" not in result["perspective_outputs"]["adversarial"]["synthesis"]
+        assert any("ADVERSARIAL_OUTPUT_FILTERED" in r.message for r in caplog.records)

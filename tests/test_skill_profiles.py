@@ -15,6 +15,7 @@ from engine import provider as provider_module
 
 def test_builtin_skill_files_loaded():
     summaries = {entry["id"]: entry for entry in directives_module.list_skill_profiles()}
+    planning_profile = directives_module.get_skill_profile("planning")
 
     assert "general" in summaries
     assert "adversarial" in summaries
@@ -27,6 +28,40 @@ def test_builtin_skill_files_loaded():
     assert summaries["planning"]["controls"]["approval_policy"]["explicit_confirmation_for_external_mutation"] is True
     assert summaries["planning"]["task_class"] == "planning"
     assert "planning" in directives_module.TASK_CLASS_NAMES
+    assert planning_profile is not None
+    assert planning_profile["directives"][0][0] == "problem_structuring"
+
+
+def test_resolve_skill_selection_keeps_planning_route():
+    selected, profile = directives_module.resolve_skill_selection("planning")
+    assert selected == "planning"
+    assert profile["task_class"] == "planning"
+
+
+def test_resolve_skill_selection_warns_on_unknown_and_falls_back(caplog):
+    with caplog.at_level("WARNING", logger=directives_module.__name__):
+        selected, profile = directives_module.resolve_skill_selection("planning_typo")
+    assert selected == "general"
+    assert profile["task_class"] == "general"
+    assert any("falling back to 'general'" in record.message for record in caplog.records)
+
+
+def test_data_governance_and_research_synthesis_use_class_specific_mandates():
+    data_profile = directives_module.get_skill_profile("data_governance")
+    research_profile = directives_module.get_skill_profile("research_synthesis")
+
+    assert data_profile is not None
+    assert research_profile is not None
+    assert data_profile["directives"][0][0] == "telemetry_inventory"
+    assert research_profile["directives"][0][0] == "literature_survey"
+
+    data_mandates = directives_module.PERSPECTIVE_MANDATES["data_governance"]
+    research_mandates = directives_module.PERSPECTIVE_MANDATES["research_synthesis"]
+
+    assert "stream_integrity" in data_mandates
+    assert "synthesis_decision" in research_mandates
+    assert data_profile["fan_out"]["mandates"] == data_mandates
+    assert research_profile["fan_out"]["mandates"] == research_mandates
 
 
 def test_reload_skill_registry_loads_custom_skill(tmp_path, monkeypatch):

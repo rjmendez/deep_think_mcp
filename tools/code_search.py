@@ -17,6 +17,14 @@ log = logging.getLogger(__name__)
 _MAX_CANDIDATE_RESULTS = 48
 _MAX_RESULTS_PER_FILE = 2
 _MAX_MATCHED_TERMS = 24
+_EXCLUDED_PATH_FRAGMENTS = {
+    "tests/",
+    "test_",
+    "/skills/",
+    "/docs/",
+    "__pycache__",
+    ".egg-info",
+}
 _GENERIC_PROMPT_TERMS = {
     "perform",
     "deep",
@@ -50,7 +58,10 @@ def invoke_code_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
             return formatted, 0.0, ""
 
         log.info("code_search succeeded in %dms", elapsed_ms)
-        return formatted, 0.15, ""
+        results = result.get("results", [])
+        avg_score = sum(r.get("score", 0) for r in results) / len(results)
+        delta = min(0.30, 0.05 + (len(results) / 8) * avg_score * 0.25)
+        return formatted, round(delta, 3), ""
     except TimeoutError:
         elapsed_ms = int((time.time() - start_time) * 1000)
         log.warning("code_search timed out after %dms", elapsed_ms)
@@ -62,6 +73,11 @@ def invoke_code_search(query: str, timeout: int = 10) -> Tuple[str, float, str]:
         return "", -0.05, error_msg
 
 
+def _is_excluded_path(path: Path, root: Path) -> bool:
+    rel = str(path.relative_to(root))
+    return any(fragment in rel for fragment in _EXCLUDED_PATH_FRAGMENTS)
+
+
 def _search_local_repo(query: str, timeout: int) -> dict:
     root = Path(os.getenv("DEEP_THINK_CODE_SEARCH_ROOT", Path(__file__).resolve().parents[1]))
     ranked_terms = _ranked_candidate_terms(query)
@@ -71,7 +87,9 @@ def _search_local_repo(query: str, timeout: int) -> dict:
 
     files = []
     for pattern in ("*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.java", "*.md", "*.txt"):
-        files.extend(root.rglob(pattern))
+        files.extend(
+            f for f in root.rglob(pattern) if not _is_excluded_path(f, root)
+        )
 
     for path in files:
         if time.time() - started > max(1, timeout):
@@ -83,7 +101,8 @@ def _search_local_repo(query: str, timeout: int) -> dict:
         except Exception:
             continue
 
-        for lineno, line in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        for lineno, line in enumerate(lines, 1):
             if time.time() - started > max(1, timeout):
                 break
             lower_line = line.lower()
@@ -94,11 +113,19 @@ def _search_local_repo(query: str, timeout: int) -> dict:
             if key in seen:
                 continue
             seen.add(key)
+            # Capture N-3 to N+3 context (0-indexed: lineno-1 is matched line)
+            ctx_start = max(0, lineno - 4)
+            ctx_end = min(len(lines), lineno + 3)
+            context_lines = [
+                (ctx_start + i + 1, lines[ctx_start + i])
+                for i in range(ctx_end - ctx_start)
+            ]
             candidates.append(
                 {
                     "path": str(path.relative_to(root)),
-                    "line": str(lineno),
+                    "line": lineno,
                     "text": line.strip(),
+                    "context_lines": context_lines,
                     "repository": root.name,
                     "score": round(score, 3),
                     "matched_terms": matched_terms[:6],
@@ -228,19 +255,41 @@ def _select_diverse_results(candidates: list[dict], limit: int = 8) -> list[dict
 
 
 def _format_code_search_results(result: any) -> str:
+    _MAX_TOTAL_CHARS = 2000
     try:
         items = result.get("results", [])
         if not items:
             return "No code matches found"
 
         formatted_lines = ["Code search results:"]
+        total_chars = len(formatted_lines[0])
+
         for i, item in enumerate(items[:8], 1):
             path = item.get("path", "unknown")
-            line = item.get("line", "")
-            text = item.get("text", "")[:200]
-            formatted_lines.append(f"{i}. {path}:{line}")
-            if text:
-                formatted_lines.append(f"   {text}")
+            matched_line = int(item.get("line", 0))
+            header = f"{i}. {path}:{matched_line}"
+            if total_chars + len(header) + 1 > _MAX_TOTAL_CHARS:
+                break
+            formatted_lines.append(header)
+            total_chars += len(header) + 1
+
+            context_lines = item.get("context_lines")
+            if context_lines:
+                for ctx_lineno, ctx_text in context_lines:
+                    marker = ">>>" if ctx_lineno == matched_line else "   "
+                    ctx_entry = f"   {marker} {ctx_lineno}: {ctx_text}"
+                    if total_chars + len(ctx_entry) + 1 > _MAX_TOTAL_CHARS:
+                        break
+                    formatted_lines.append(ctx_entry)
+                    total_chars += len(ctx_entry) + 1
+            else:
+                text = item.get("text", "")[:200]
+                if text:
+                    line_entry = f"   {text}"
+                    if total_chars + len(line_entry) + 1 <= _MAX_TOTAL_CHARS:
+                        formatted_lines.append(line_entry)
+                        total_chars += len(line_entry) + 1
+
         return "\n".join(formatted_lines)
     except Exception as e:
         log.warning("Error formatting code search results: %s", e)

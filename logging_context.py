@@ -43,20 +43,20 @@ def job_context(
     tokens = []
     
     try:
-        tokens.append(_job_id.set(job_id))
+        tokens.append((_job_id, _job_id.set(job_id)))
         if provider:
-            tokens.append(_provider.set(provider))
+            tokens.append((_provider, _provider.set(provider)))
         if model:
-            tokens.append(_model.set(model))
+            tokens.append((_model, _model.set(model)))
         if pass_num is not None:
-            tokens.append(_pass_num.set(pass_num))
+            tokens.append((_pass_num, _pass_num.set(pass_num)))
         if perspective:
-            tokens.append(_perspective.set(perspective))
+            tokens.append((_perspective, _perspective.set(perspective)))
         yield
     finally:
-        for token in reversed(tokens):
+        for var, token in reversed(tokens):
             try:
-                token.__class__.reset(token)
+                var.reset(token)
             except Exception:
                 pass
 

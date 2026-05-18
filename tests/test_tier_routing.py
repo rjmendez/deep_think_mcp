@@ -59,26 +59,42 @@ class TestTierRouting:
 
     def test_model_for_tier_with_explicit_override(self):
         """Test that explicit per-tier override takes precedence."""
-        cfg = ProviderConfig(provider="anthropic", light="custom-model-id")
+        cfg = ProviderConfig(provider="anthropic", light="claude-haiku-4-5")
         model = provider_module._model_for_tier(cfg, "light", "general")
         
-        assert model == "custom-model-id"
+        assert model == "claude-haiku-4-5"
         assert model != "light"
 
     def test_model_for_tier_with_global_override(self):
         """Test that global model override takes precedence."""
-        cfg = ProviderConfig(provider="anthropic", model="global-model-id")
+        cfg = ProviderConfig(provider="anthropic", model="claude-opus-4-7")
         model = provider_module._model_for_tier(cfg, "medium", "general")
         
-        assert model == "global-model-id"
+        assert model == "claude-opus-4-7"
 
     def test_model_for_tier_with_env_var_override(self):
         """Test that environment variable override is respected."""
         cfg = ProviderConfig(provider="anthropic")
         
-        with patch.dict('os.environ', {'DEEP_THINK_ANTHROPIC_LIGHT': 'env-model-id'}):
+        with patch.dict('os.environ', {'DEEP_THINK_ANTHROPIC_LIGHT': 'claude-haiku-4-5'}):
             model = provider_module._model_for_tier(cfg, "light", "general")
-            assert model == "env-model-id"
+            assert model == "claude-haiku-4-5"
+
+    def test_model_for_tier_invalid_anthropic_global_override_falls_through(self):
+        cfg = ProviderConfig(provider="anthropic", model="invalid-global-model")
+        model = provider_module._model_for_tier(cfg, "light", "general")
+        assert model == "claude-haiku-4-5"
+
+    def test_model_for_tier_invalid_anthropic_per_tier_override_falls_through(self):
+        cfg = ProviderConfig(provider="anthropic", light="invalid-light-model")
+        model = provider_module._model_for_tier(cfg, "light", "general")
+        assert model == "claude-haiku-4-5"
+
+    def test_model_for_tier_invalid_anthropic_env_override_falls_through(self):
+        cfg = ProviderConfig(provider="anthropic")
+        with patch.dict('os.environ', {'DEEP_THINK_ANTHROPIC_LIGHT': 'invalid-env-model'}):
+            model = provider_module._model_for_tier(cfg, "light", "general")
+        assert model == "claude-haiku-4-5"
 
     def test_model_for_tier_copilot_provider(self):
         """Test model selection for copilot provider."""
@@ -160,6 +176,32 @@ class TestTierRouting:
             model = provider_module._model_for_tier(cfg, "light", "general")
 
         assert model == "heretic-llama31-8b-instruct:latest"
+
+    def test_fallback_available_ollama_model_all_quarantined_returns_empty(self):
+        with patch.object(
+            provider_module,
+            "_available_ollama_models",
+            return_value={"heretic-phi4-mini-reasoning:latest", "heretic-llama31-8b-instruct:latest"},
+        ), patch.object(
+            provider_module,
+            "_is_ollama_model_quarantined",
+            return_value=True,
+        ):
+            model = provider_module._fallback_available_ollama_model("light", "http://localhost:11434")
+        assert model == ""
+
+    def test_fallback_available_ollama_model_utility_only_non_quarantined(self):
+        with patch.object(
+            provider_module,
+            "_available_ollama_models",
+            return_value={"granite3-guardian:2b", "nomic-embed-text:latest"},
+        ), patch.object(
+            provider_module,
+            "_is_ollama_model_quarantined",
+            return_value=False,
+        ):
+            model = provider_module._fallback_available_ollama_model("light", "http://localhost:11434")
+        assert model in {"granite3-guardian:2b", "nomic-embed-text:latest"}
 
     def test_model_for_tier_with_invalid_tier_logs_warning(self):
         """Test that invalid tier names are handled gracefully."""
@@ -249,7 +291,9 @@ class TestProviderSpecificHelpers:
 
     @pytest.mark.asyncio
     async def test_classify_task_uses_provider_compatible_model(self):
-        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call, \
+             patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", {"phi4-mini:latest", "heretic-llama31-8b-instruct:latest"}):
             mock_call.return_value = "general"
 
             result = await provider_module.classify_task(
@@ -277,7 +321,9 @@ class TestProviderSpecificHelpers:
 
     @pytest.mark.asyncio
     async def test_safety_precheck_uses_available_ollama_guardian(self):
-        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call, \
+             patch.object(provider_module.discover, "get_current", return_value=None), \
+             patch.object(provider_module, "_ollama_discovered", {"granite3-guardian:2b", "heretic-llama31-8b-instruct:latest"}):
             mock_call.return_value = '{"safe": true, "reason": "ok", "requires_review": false}'
 
             safe, reason = await provider_module._run_safety_precheck(
@@ -288,6 +334,22 @@ class TestProviderSpecificHelpers:
             assert safe is True
             assert reason == "ok"
             assert mock_call.await_args.kwargs["model"] == "granite3-guardian:2b"
+
+    @pytest.mark.asyncio
+    async def test_safety_precheck_local_policy_rewrites_anthropic_provider(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+            mock_call.return_value = '{"safe": true, "reason": "ok", "requires_review": false}'
+
+            safe, reason = await provider_module._run_safety_precheck(
+                "Check this request.",
+                provider="anthropic",
+                data_policy="local",
+            )
+
+            assert safe is True
+            assert reason == "ok"
+            assert mock_call.await_args.kwargs["provider"] == "ollama"
+            assert mock_call.await_args.kwargs["provider_config"]["data_policy"] == "local"
 
 
 class TestEdgeCases:
@@ -319,13 +381,13 @@ class TestEdgeCases:
         # Priority: 1. model > 2. light/medium/heavy > 3. env var > ...
         cfg = ProviderConfig(
             provider="anthropic",
-            model="priority1",
-            light="priority2"
+            model="claude-opus-4-7",
+            light="claude-haiku-4-5"
         )
         
         # Global model should win
         model = provider_module._model_for_tier(cfg, "light", "general")
-        assert model == "priority1"
+        assert model == "claude-opus-4-7"
 
     def test_tier_routing_with_data_policy_local(self):
         """Test that local data policy works with tier routing."""

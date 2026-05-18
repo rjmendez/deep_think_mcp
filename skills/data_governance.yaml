@@ -5,7 +5,7 @@ task_class: data_governance
 description: Telemetry integrity analysis, data quality triage, and remediation synthesis.
 routing:
   directive_set: data_governance
-  mandate_set: investigation
+  mandate_set: data_governance
 controls:
   verification_mode: telemetry
   provenance_mode: layered

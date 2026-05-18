@@ -54,6 +54,22 @@ def test_complete_job_uses_failed_status_from_result_payload(local_db):
     assert job["error"] == "synthesis failed"
 
 
+def test_complete_job_maps_partial_payload_to_complete_terminal_status(local_db):
+    job_id = store.create_job("question", passes=1, provider="ollama", model_summary="test")
+    claimed = store.claim_next_job()
+    assert claimed is not None
+    assert claimed["job_id"] == job_id
+
+    store.complete_job(job_id, json.dumps({"status": "partial", "final_answer": "partial synthesis"}))
+
+    job = store.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "complete"
+    persisted = json.loads(job["result"])
+    assert persisted["status"] == "partial"
+    assert job["error"] is None
+
+
 @pytest.mark.asyncio
 async def test_get_thinking_result_reports_effective_status_and_empty_lists(monkeypatch):
     fake_mcp = FakeMCP()

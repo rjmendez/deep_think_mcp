@@ -37,15 +37,27 @@ Tables:
 """
 
 import json
+import hashlib
 import logging
 import shutil
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+_FAILED_TERMINAL_STATUSES = {
+    "failed",
+    "failure",
+    "error",
+    "timeout",
+    "timed_out",
+    "cancelled",
+    "canceled",
+    "validation_error",
+}
 
 
 def _db_path() -> str:
@@ -60,6 +72,16 @@ def _max_result_bytes() -> int:
     import os
 
     return int(os.getenv("DEEP_THINK_MAX_RESULT_BYTES", str(2 * 1024 * 1024)))
+
+
+def _job_retention_days() -> int:
+    import os
+    return max(int(os.getenv("DEEP_THINK_JOB_RETENTION_DAYS", "30")), 0)
+
+
+def _job_retention_max_rows() -> int:
+    import os
+    return max(int(os.getenv("DEEP_THINK_JOB_RETENTION_MAX_ROWS", "10000")), 0)
 
 
 def _validate_result_size(result: str) -> None:
@@ -105,6 +127,8 @@ def init_db() -> None:
                 started_at           TEXT,
                 claimed_by           TEXT,
                 claimed_at           TEXT,
+                cancel_requested_at  TEXT,
+                cancel_reason        TEXT,
                 completed_at         TEXT,
                 result               TEXT,
                 error                TEXT,
@@ -144,6 +168,18 @@ def init_db() -> None:
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(thinking_jobs)").fetchall()
             }
+        if "cancel_requested_at" not in existing_columns:
+            conn.execute("ALTER TABLE thinking_jobs ADD COLUMN cancel_requested_at TEXT")
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(thinking_jobs)").fetchall()
+            }
+        if "cancel_reason" not in existing_columns:
+            conn.execute("ALTER TABLE thinking_jobs ADD COLUMN cancel_reason TEXT")
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(thinking_jobs)").fetchall()
+            }
         required_columns = {
             "job_id",
             "status",
@@ -154,6 +190,8 @@ def init_db() -> None:
             "model_summary",
             "provider_config_json",
             "created_at",
+            "cancel_requested_at",
+            "cancel_reason",
             "result",
             "error",
         }
@@ -235,6 +273,23 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS job_idempotency_keys (
+                idempotency_key  TEXT PRIMARY KEY,
+                request_hash     TEXT NOT NULL,
+                endpoint         TEXT NOT NULL,
+                job_id           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES thinking_jobs(job_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_job_id "
+            "ON job_idempotency_keys(job_id)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS self_improvement_plans (
                 id                  TEXT PRIMARY KEY,
                 finding_ids         TEXT NOT NULL,
@@ -285,6 +340,7 @@ def init_db() -> None:
     # Purge expired cache rows on every startup so stale entries don't
     # accumulate between runs (DAMA pheromone evaporation).
     evict_expired_cache()
+    prune_thinking_jobs()
 
     # Integrity check: warn and attempt VACUUM on failure.
     _startup_integrity_check()
@@ -540,7 +596,174 @@ def create_job(
         conn.commit()
     finally:
         conn.close()
+    # Bounded retention for completed/failed job history only.
+    try:
+        prune_thinking_jobs()
+    except Exception as exc:
+        log.warning("Job retention prune failed (non-fatal): %s", exc)
     return job_id
+
+
+def build_idempotency_request_hash(payload: dict) -> str:
+    """Create a stable hash for an idempotency request payload."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def lookup_idempotent_job(idempotency_key: str, request_hash: str, endpoint: str) -> Optional[dict]:
+    """Return existing job bound to key/hash/endpoint, or None if unbound.
+
+    Raises ValueError if the key is already bound to a different request payload.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM job_idempotency_keys WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        existing_hash = row["request_hash"]
+        existing_endpoint = row["endpoint"] or ""
+        if existing_hash != request_hash or existing_endpoint != endpoint:
+            raise ValueError("Idempotency key already used with a different request payload")
+        job_row = conn.execute(
+            "SELECT * FROM thinking_jobs WHERE job_id=?",
+            (row["job_id"],),
+        ).fetchone()
+        if job_row is None:
+            conn.execute("DELETE FROM job_idempotency_keys WHERE idempotency_key=?", (idempotency_key,))
+            conn.commit()
+            return None
+        return dict(job_row)
+    finally:
+        conn.close()
+
+
+def bind_idempotency_key(
+    idempotency_key: str,
+    request_hash: str,
+    endpoint: str,
+    job_id: str,
+) -> str:
+    """Bind idempotency key to a job.
+
+    Returns the existing job_id when key is already bound, otherwise returns the
+    newly bound job_id.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM job_idempotency_keys WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO job_idempotency_keys
+                    (idempotency_key, request_hash, endpoint, job_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (idempotency_key, request_hash, endpoint, job_id, now, now),
+            )
+            conn.commit()
+            return job_id
+        existing_hash = row["request_hash"]
+        existing_endpoint = row["endpoint"] or ""
+        existing_job_id = row["job_id"]
+        if existing_hash != request_hash or existing_endpoint != endpoint:
+            conn.execute("ROLLBACK")
+            raise ValueError("Idempotency key already used with a different request payload")
+        conn.execute(
+            "UPDATE job_idempotency_keys SET updated_at=? WHERE idempotency_key=?",
+            (now, idempotency_key),
+        )
+        conn.commit()
+        return existing_job_id
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def prune_thinking_jobs(
+    conn_or_path: Optional[str] = None,
+    max_rows: Optional[int] = None,
+    max_age_days: Optional[int] = None,
+) -> int:
+    """Prune terminal thinking_jobs rows using safe retention policy.
+
+    Only rows in terminal states ('complete', 'failed') are eligible.
+    Running/queued jobs are never pruned.
+    """
+    resolved_max_rows = _job_retention_max_rows() if max_rows is None else max(int(max_rows), 0)
+    resolved_max_age_days = _job_retention_days() if max_age_days is None else max(int(max_age_days), 0)
+    if resolved_max_rows == 0 and resolved_max_age_days == 0:
+        return 0
+
+    if isinstance(conn_or_path, str):
+        conn = sqlite3.connect(conn_or_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.row_factory = sqlite3.Row
+    else:
+        conn = _connect()
+
+    pruned = 0
+    now = datetime.now(timezone.utc)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        if resolved_max_age_days > 0:
+            cutoff = (now - timedelta(days=resolved_max_age_days)).isoformat()
+            cur_age = conn.execute(
+                "DELETE FROM thinking_jobs "
+                "WHERE status IN ('complete', 'failed') "
+                "AND COALESCE(completed_at, created_at) <= ?",
+                (cutoff,),
+            )
+            pruned += cur_age.rowcount
+
+        if resolved_max_rows > 0:
+            total_terminal = conn.execute(
+                "SELECT COUNT(*) FROM thinking_jobs WHERE status IN ('complete', 'failed')"
+            ).fetchone()[0]
+            overflow = max(total_terminal - resolved_max_rows, 0)
+            if overflow > 0:
+                cur_rows = conn.execute(
+                    "DELETE FROM thinking_jobs WHERE job_id IN ("
+                    "  SELECT job_id FROM thinking_jobs "
+                    "  WHERE status IN ('complete', 'failed') "
+                    "  ORDER BY COALESCE(completed_at, created_at) ASC "
+                    "  LIMIT ?"
+                    ")",
+                    (overflow,),
+                )
+                pruned += cur_rows.rowcount
+
+        conn.commit()
+        if pruned:
+            log.info(
+                "Pruned %d terminal thinking_jobs rows (max_rows=%d, max_age_days=%d)",
+                pruned,
+                resolved_max_rows,
+                resolved_max_age_days,
+            )
+        return pruned
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def claim_next_job(worker_id: str = "default") -> Optional[dict]:
@@ -556,7 +779,9 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
         # BUG FIX #3: BEGIN IMMEDIATE provides exclusive transaction lock
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT * FROM thinking_jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+            "SELECT * FROM thinking_jobs "
+            "WHERE status='queued' AND cancel_requested_at IS NULL "
+            "ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
             conn.execute("ROLLBACK")
@@ -566,7 +791,7 @@ def claim_next_job(worker_id: str = "default") -> Optional[dict]:
         # If another worker updated this job first, the WHERE fails and rowcount is 0.
         cur = conn.execute(
             "UPDATE thinking_jobs SET status='running', started_at=?, claimed_by=?, claimed_at=? "
-            "WHERE job_id=? AND status='queued'",
+            "WHERE job_id=? AND status='queued' AND cancel_requested_at IS NULL",
             (now, worker_id, now, row["job_id"]),
         )
         # If no rows were updated, another worker claimed this job first - rollback and return None
@@ -625,7 +850,12 @@ def complete_job(
         payload_error = str(raw_payload_error) if raw_payload_error is not None else None
 
     effective_status = str(status or payload_status or "complete").strip().lower()
-    terminal_status = "complete" if effective_status == "complete" else "failed"
+    if effective_status in {"complete", "completed", "partial"}:
+        terminal_status = "complete"
+    elif effective_status in _FAILED_TERMINAL_STATUSES:
+        terminal_status = "failed"
+    else:
+        terminal_status = "failed"
     terminal_error = payload_error if terminal_status == "failed" else None
 
     conn = _connect()
@@ -708,7 +938,8 @@ def fail_job(job_id: str, error: str) -> None:
         
         # Update job status
         conn.execute(
-            "UPDATE thinking_jobs SET status='failed', error=?, completed_at=? WHERE job_id=?",
+            "UPDATE thinking_jobs SET status='failed', error=?, completed_at=? "
+            "WHERE job_id=? AND status IN ('queued','running')",
             (error, now, job_id),
         )
         
@@ -744,10 +975,15 @@ def requeue_stale(stale_after_minutes: int = 0) -> int:
     try:
         cur = conn.execute(
             "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
-            "WHERE status='running' AND started_at < ?",
+            "WHERE status='running' AND started_at < ? AND cancel_requested_at IS NULL",
             (cutoff,),
         )
-        count = cur.rowcount
+        cancelled_cur = conn.execute(
+            "UPDATE thinking_jobs SET status='failed', completed_at=?, error=COALESCE(error, ?) "
+            "WHERE status='running' AND started_at < ? AND cancel_requested_at IS NOT NULL",
+            (datetime.now(timezone.utc).isoformat(), "cancelled", cutoff),
+        )
+        count = cur.rowcount + cancelled_cur.rowcount
         conn.commit()
         return count
     finally:
@@ -842,14 +1078,121 @@ def requeue_orphaned_job(job_id: str, reason: str = "orphan_timeout") -> bool:
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     try:
-        # BUG FIX #2: status='queued' is the correct status for jobs awaiting processing
-        cur = conn.execute(
-            "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
-            "WHERE job_id=? AND status='running'",
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status, cancel_requested_at, cancel_reason FROM thinking_jobs WHERE job_id=?",
             (job_id,),
-        )
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            conn.execute("ROLLBACK")
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        if row["cancel_requested_at"]:
+            cancel_reason = row["cancel_reason"] or "cancelled"
+            cur = conn.execute(
+                "UPDATE thinking_jobs SET status='failed', completed_at=?, error=?, "
+                "started_at=NULL, claimed_by=NULL, claimed_at=NULL WHERE job_id=? AND status='running'",
+                (now, f"cancelled: {cancel_reason}", job_id),
+            )
+        else:
+            # BUG FIX #2: status='queued' is the correct status for jobs awaiting processing
+            cur = conn.execute(
+                "UPDATE thinking_jobs SET status='queued', started_at=NULL, claimed_by=NULL, claimed_at=NULL "
+                "WHERE job_id=? AND status='running'",
+                (job_id,),
+            )
         conn.commit()
         return cur.rowcount > 0
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def request_job_cancellation(job_id: str, reason: str = "api_cancel") -> Optional[dict]:
+    """Request cancellation for queued/running jobs with safe state transitions."""
+    reason = (reason or "api_cancel").strip() or "api_cancel"
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT status, cancel_requested_at, cancel_reason FROM thinking_jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+        status = row["status"]
+        if status in ("complete", "failed"):
+            conn.execute("ROLLBACK")
+            return {
+                "job_id": job_id,
+                "status": status,
+                "cancel_requested": bool(row["cancel_requested_at"]),
+                "terminal": True,
+            }
+        if status == "queued":
+            error = f"cancelled: {reason}"
+            conn.execute(
+                "UPDATE thinking_jobs SET status='failed', error=?, completed_at=?, "
+                "cancel_requested_at=COALESCE(cancel_requested_at, ?), "
+                "cancel_reason=COALESCE(cancel_reason, ?) "
+                "WHERE job_id=? AND status='queued'",
+                (error, now, now, reason, job_id),
+            )
+            conn.commit()
+            return {
+                "job_id": job_id,
+                "status": "failed",
+                "cancel_requested": True,
+                "terminal": True,
+                "transition": "queued_to_failed",
+            }
+        conn.execute(
+            "UPDATE thinking_jobs SET cancel_requested_at=COALESCE(cancel_requested_at, ?), "
+            "cancel_reason=COALESCE(cancel_reason, ?) WHERE job_id=? AND status='running'",
+            (now, reason, job_id),
+        )
+        conn.commit()
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "cancel_requested": True,
+            "terminal": False,
+            "transition": "running_cancel_requested",
+        }
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def get_cancellation_error(job_id: str) -> Optional[str]:
+    """Return canonical cancellation error text for a job if cancellation was requested."""
+    conn = _connect()
+    try:
+        try:
+            row = conn.execute(
+                "SELECT cancel_requested_at, cancel_reason FROM thinking_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "cancel_requested_at" in str(exc):
+                return None
+            raise
+        if row is None or not row["cancel_requested_at"]:
+            return None
+        reason = row["cancel_reason"] or "cancelled"
+        return f"cancelled: {reason}"
     finally:
         conn.close()
 

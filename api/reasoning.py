@@ -20,7 +20,15 @@ from ..engine import (
 )
 from ..defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
 from ..engine.directives import resolve_skill_selection
-from ..engine.validator import validate_passes, validate_width, validate_height, ValidationError
+from ..engine.validator import (
+    validate_passes,
+    validate_width,
+    validate_height,
+    validate_question,
+    validate_adaptive_config,
+    validate_web_domain_whitelist,
+    ValidationError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +98,22 @@ def _estimate_fan_out_timeout_secs(
     return max(300, min(int(timeout_secs), 3600))
 
 
+def _idempotent_response(job: dict, endpoint: str) -> dict:
+    response = {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "idempotent_replay": True,
+        "idempotency_endpoint": endpoint,
+    }
+    if job.get("completed_at"):
+        response["completed_at"] = job.get("completed_at")
+    if job.get("error"):
+        response["error"] = job.get("error")
+    if job.get("result") is not None:
+        response["result_available"] = True
+    return response
+
+
 class ProviderConfigOverrides(TypedDict, total=False):
     """Explicit schema for per-call provider overrides exposed via MCP."""
 
@@ -144,6 +168,7 @@ def register(mcp):
         dama_node_id: Optional[str] = None,
         dama_metric: Optional[str] = None,
         web_domain_whitelist: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Queue a multi-pass reasoning job and return a job_id immediately.
 
@@ -214,9 +239,11 @@ def register(mcp):
 
         # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
         try:
+            question = validate_question(question)
             passes = validate_passes(passes)
             width = validate_width(width)
             height = validate_height(height)
+            web_domain_whitelist = validate_web_domain_whitelist(web_domain_whitelist)
         except ValidationError as e:
             return {"error": str(e), "status": "validation_error"}
         
@@ -280,6 +307,36 @@ def register(mcp):
         else:
             total_passes = max(2, min(passes, 6))
 
+        request_hash = None
+        if idempotency_key:
+            request_hash = store.build_idempotency_request_hash(
+                {
+                    "endpoint": "deep_think_async",
+                    "question": question,
+                    "passes": total_passes,
+                    "task_class": selected_skill,
+                    "skill": selected_skill,
+                    "resolved_class": resolved_class,
+                    "data_policy": effective_data_policy,
+                    "verify": verify,
+                    "width": width if fan_out_enabled else 1,
+                    "height": height if fan_out_enabled else 1,
+                    "extract_claims": extract_claims,
+                    "enable_research": enable_research,
+                    "research_query": research_query,
+                    "dama_node_id": dama_node_id,
+                    "dama_metric": dama_metric,
+                    "web_domain_whitelist": web_domain_whitelist,
+                    "provider_config": pc,
+                }
+            )
+            existing = store.lookup_idempotent_job(idempotency_key, request_hash, "deep_think_async")
+            if existing:
+                response = _idempotent_response(existing, "deep_think_async")
+                response["task_class"] = resolved_class
+                response["skill"] = selected_skill
+                return response
+
         job_id = store.create_job(
             question=question,
             passes=total_passes,
@@ -297,7 +354,7 @@ def register(mcp):
                 "research_query": research_query,
                 "dama_node_id": dama_node_id,
                 "dama_metric": dama_metric,
-                "web_domain_whitelist": web_domain_whitelist or [],
+                "web_domain_whitelist": web_domain_whitelist,
                 "fan_out": fan_out_enabled,
                 "width": width if fan_out_enabled else 1,
                 "height": height if fan_out_enabled else 1,
@@ -310,6 +367,21 @@ def register(mcp):
             }),
             timeout_secs=fan_out_timeout_secs or 300,
         )
+        if idempotency_key and request_hash:
+            bound_job_id = store.bind_idempotency_key(
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                endpoint="deep_think_async",
+                job_id=job_id,
+            )
+            if bound_job_id != job_id:
+                store.fail_job(job_id, "cancelled: duplicate idempotency key")
+                existing = store.get_job(bound_job_id)
+                if existing:
+                    response = _idempotent_response(existing, "deep_think_async")
+                    response["task_class"] = resolved_class
+                    response["skill"] = selected_skill
+                    return response
         _worker.notify_job_available()
 
         response = {
@@ -390,6 +462,44 @@ def register(mcp):
                 response["result"] = job["result"]
 
         if isinstance(result, dict):
+            # Prefer runtime-observed pass models over queued-time summary when available.
+            pass_results = result.get("pass_results")
+            if isinstance(pass_results, list) and pass_results:
+                observed: list[str] = []
+                for pr in pass_results:
+                    if not isinstance(pr, dict):
+                        continue
+                    provider_name = str(pr.get("provider") or "").strip()
+                    model_name = str(pr.get("model") or "").strip()
+                    if provider_name and model_name:
+                        sig = f"{provider_name}/{model_name}"
+                        if sig not in observed:
+                            observed.append(sig)
+                if observed:
+                    response["model_summary"] = "observed: " + " | ".join(observed)
+            else:
+                # Fan-out path: derive observed models from perspective pass results.
+                observed: list[str] = []
+                perspective_outputs = result.get("perspective_outputs")
+                if isinstance(perspective_outputs, dict):
+                    for pobj in perspective_outputs.values():
+                        if not isinstance(pobj, dict):
+                            continue
+                        prs = pobj.get("pass_results")
+                        if not isinstance(prs, list):
+                            continue
+                        for pr in prs:
+                            if not isinstance(pr, dict):
+                                continue
+                            provider_name = str(pr.get("provider") or "").strip()
+                            model_name = str(pr.get("model") or "").strip()
+                            if provider_name and model_name:
+                                sig = f"{provider_name}/{model_name}"
+                                if sig not in observed:
+                                    observed.append(sig)
+                if observed:
+                    response["model_summary"] = "observed: " + " | ".join(observed)
+
             if result.get("status") is not None:
                 result_status = str(result.get("status"))
             for key in (
@@ -528,6 +638,7 @@ def register(mcp):
         tool_evidence_weight: float = DEFAULT_TOOL_EVIDENCE_WEIGHT,
         provider_config: Optional[ProviderConfigOverrides] = None,
         web_domain_whitelist: Optional[list] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Queue a perspective fan-out reasoning job and return a job_id immediately.
 
@@ -597,8 +708,11 @@ def register(mcp):
         
         # Validate parameters (Tier 1: prevent FastMCP slice object bugs)
         try:
+            question = validate_question(question)
             width = validate_width(width)
             height = validate_height(height)
+            adaptive_config = validate_adaptive_config(adaptive_config)
+            web_domain_whitelist = validate_web_domain_whitelist(web_domain_whitelist)
         except ValidationError as e:
             return {"error": str(e), "status": "validation_error"}
         
@@ -642,6 +756,38 @@ def register(mcp):
         height = max(1, min(height, 5))
         total_calls = width * height + 1
 
+        request_hash = None
+        if idempotency_key:
+            request_hash = store.build_idempotency_request_hash(
+                {
+                    "endpoint": "deep_think_fan_out",
+                    "question": question,
+                    "width": width,
+                    "height": height,
+                    "task_class": selected_skill,
+                    "resolved_class": resolved_class,
+                    "skill": selected_skill,
+                    "data_policy": data_policy,
+                    "max_parallel": max_parallel,
+                    "max_width": max_width,
+                    "confidence_threshold": confidence_threshold,
+                    "extract_claims": extract_claims,
+                    "topology": topology,
+                    "adaptive_config": adaptive_config,
+                    "enable_tool_use": enable_tool_use,
+                    "tool_evidence_weight": tool_evidence_weight,
+                    "web_domain_whitelist": web_domain_whitelist,
+                    "provider_config": pc,
+                }
+            )
+            existing = store.lookup_idempotent_job(idempotency_key, request_hash, "deep_think_fan_out")
+            if existing:
+                response = _idempotent_response(existing, "deep_think_fan_out")
+                response["width"] = width
+                response["height"] = height
+                response["total_llm_calls"] = total_calls
+                return response
+
         job_id = store.create_job(
             question=question,
             passes=total_calls,
@@ -666,7 +812,7 @@ def register(mcp):
                 "enable_tool_use": enable_tool_use,
                 "tool_evidence_weight": tool_evidence_weight,
                 "auto_grounded": auto_grounded,
-                "web_domain_whitelist": web_domain_whitelist or [],
+                "web_domain_whitelist": web_domain_whitelist,
             }),
             timeout_secs=_estimate_fan_out_timeout_secs(
                 width=width,
@@ -679,6 +825,22 @@ def register(mcp):
                 enable_tool_use=enable_tool_use,
             ),
         )
+        if idempotency_key and request_hash:
+            bound_job_id = store.bind_idempotency_key(
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                endpoint="deep_think_fan_out",
+                job_id=job_id,
+            )
+            if bound_job_id != job_id:
+                store.fail_job(job_id, "cancelled: duplicate idempotency key")
+                existing = store.get_job(bound_job_id)
+                if existing:
+                    response = _idempotent_response(existing, "deep_think_fan_out")
+                    response["width"] = width
+                    response["height"] = height
+                    response["total_llm_calls"] = total_calls
+                    return response
         _worker.notify_job_available()
 
         mandates = PERSPECTIVE_MANDATES.get(selected_skill, PERSPECTIVE_MANDATES["general"])
@@ -726,6 +888,7 @@ def register(mcp):
         model: str = "",
         provider_config: Optional[ProviderConfigOverrides] = None,
         verify_with_nova: bool = False,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Queue a high-temperature creative reasoning job and return a job_id immediately.
 
@@ -766,6 +929,11 @@ def register(mcp):
         if stale_error:
             return stale_error
 
+        try:
+            question = validate_question(question)
+        except ValidationError as e:
+            return {"error": str(e), "status": "validation_error"}
+
         if mode not in CREATIVE_MODES:
             return {
                 "error": f"Unknown creative mode '{mode}'. Valid modes: {list(CREATIVE_MODES)}",
@@ -781,6 +949,26 @@ def register(mcp):
         summary = model_summary(cfg, "general")
         passes = max(2, min(passes, 6))
 
+        request_hash = None
+        if idempotency_key:
+            request_hash = store.build_idempotency_request_hash(
+                {
+                    "endpoint": "deep_think_creative",
+                    "question": question,
+                    "mode": mode,
+                    "passes": passes,
+                    "data_policy": data_policy,
+                    "verify_with_nova": verify_with_nova,
+                    "provider_config": pc,
+                }
+            )
+            existing = store.lookup_idempotent_job(idempotency_key, request_hash, "deep_think_creative")
+            if existing:
+                response = _idempotent_response(existing, "deep_think_creative")
+                response["mode"] = mode
+                response["passes"] = passes
+                return response
+
         job_id = store.create_job(
             question=question,
             passes=passes,
@@ -795,6 +983,21 @@ def register(mcp):
                 "verify_with_nova": verify_with_nova,
             }),
         )
+        if idempotency_key and request_hash:
+            bound_job_id = store.bind_idempotency_key(
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                endpoint="deep_think_creative",
+                job_id=job_id,
+            )
+            if bound_job_id != job_id:
+                store.fail_job(job_id, "cancelled: duplicate idempotency key")
+                existing = store.get_job(bound_job_id)
+                if existing:
+                    response = _idempotent_response(existing, "deep_think_creative")
+                    response["mode"] = mode
+                    response["passes"] = passes
+                    return response
         _worker.notify_job_available()
 
         return {
@@ -812,6 +1015,16 @@ def register(mcp):
             },
             "message": f"Call get_thinking_result('{job_id}') to poll for results.",
         }
+
+    @mcp.tool()
+    async def cancel_thinking_job(job_id: str, reason: str = "api_cancel") -> dict:
+        """Cancel a queued/running thinking job."""
+        result = store.request_job_cancellation(job_id, reason=reason)
+        if result is None:
+            return {"error": f"No job found with job_id={job_id!r}"}
+        if result.get("status") == "running" and result.get("cancel_requested"):
+            result["worker_cancelled"] = _worker.cancel_running_job(job_id)
+        return result
 
     @mcp.tool()
     async def get_creative_metrics() -> dict:

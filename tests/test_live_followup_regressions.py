@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from deep_think_mcp import worker
 from deep_think_mcp.api import reasoning as reasoning_api
+from deep_think_mcp.engine.validator import MAX_QUESTION_LENGTH
 
 
 class FakeMCP:
@@ -72,6 +74,56 @@ async def test_deep_think_async_blocks_when_runtime_stale(monkeypatch):
     assert result["status"] == "failed"
     assert result["error"] == "RUNTIME_STALE"
     assert result["restart_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_deep_think_async_rejects_empty_question():
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_async = fake_mcp.tools["deep_think_async"]
+
+    result = await deep_think_async(question="   ")
+    assert result["status"] == "validation_error"
+    assert "must not be empty" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_deep_think_async_rejects_overlong_question():
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_async = fake_mcp.tools["deep_think_async"]
+
+    result = await deep_think_async(question="x" * (MAX_QUESTION_LENGTH + 1))
+    assert result["status"] == "validation_error"
+    assert "maximum length" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_deep_think_fan_out_rejects_malformed_adaptive_config():
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_fan_out = fake_mcp.tools["deep_think_fan_out"]
+
+    result = await deep_think_fan_out(
+        question="review service",
+        adaptive_config={"tool_timeout": "bad"},
+    )
+    assert result["status"] == "validation_error"
+    assert "adaptive_config.tool_timeout" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_deep_think_async_rejects_malformed_web_whitelist():
+    fake_mcp = FakeMCP()
+    reasoning_api.register(fake_mcp)
+    deep_think_async = fake_mcp.tools["deep_think_async"]
+
+    result = await deep_think_async(
+        question="review service",
+        web_domain_whitelist=["https://python.org/path"],
+    )
+    assert result["status"] == "validation_error"
+    assert "bare domain" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -505,3 +557,129 @@ async def test_worker_passes_web_whitelist_into_fanout(monkeypatch):
 
     await worker._run_job(job)
     assert captured["web_domain_whitelist"] == ["python.org", "docs.python.org"]
+
+
+@pytest.mark.asyncio
+async def test_worker_normalizes_non_dict_result_before_persisting(monkeypatch):
+    completion_payloads: list[dict] = []
+    fail_calls: list[str] = []
+
+    async def fake_deep_think_passes(**_kwargs):
+        return "plain text output"
+
+    async def fake_pipeline_run(result, job_id=""):
+        return result
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def fake_complete_job(_job_id, result_json, **_kwargs):
+        completion_payloads.append(json.loads(result_json))
+
+    def fake_fail_job(_job_id, error):
+        fail_calls.append(error)
+
+    monkeypatch.setattr(worker.engine, "deep_think_passes", fake_deep_think_passes)
+    monkeypatch.setattr(worker.engine, "build_provider_config", lambda cfg: SimpleNamespace(provider=cfg.get("provider", "")))
+    monkeypatch.setattr(worker, "_verification_pipeline", SimpleNamespace(run=fake_pipeline_run))
+    monkeypatch.setattr(worker.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(worker.store, "complete_job", fake_complete_job)
+    monkeypatch.setattr(worker.store, "fail_job", fake_fail_job)
+
+    job = {
+        "job_id": "job-normalize-nondict",
+        "question": "normalize output",
+        "passes": 1,
+        "provider_config_json": json.dumps({"provider": "anthropic", "task_class": "general", "fan_out": False}),
+    }
+
+    await worker._run_job(job)
+
+    assert len(completion_payloads) == 1
+    assert completion_payloads[0]["status"] == "complete"
+    assert completion_payloads[0]["output"] == "plain text output"
+    assert fail_calls == []
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_transient_complete_job_write_failure(monkeypatch):
+    complete_attempts = {"count": 0}
+    fail_calls: list[str] = []
+    sleep_calls: list[float] = []
+
+    async def fake_deep_think_passes(**_kwargs):
+        return {"status": "complete", "final_answer": "ok", "pass_results": []}
+
+    async def fake_pipeline_run(result, job_id=""):
+        return result
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    def fake_complete_job(*_args, **_kwargs):
+        complete_attempts["count"] += 1
+        if complete_attempts["count"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(worker.engine, "deep_think_passes", fake_deep_think_passes)
+    monkeypatch.setattr(worker.engine, "build_provider_config", lambda cfg: SimpleNamespace(provider=cfg.get("provider", "")))
+    monkeypatch.setattr(worker, "_verification_pipeline", SimpleNamespace(run=fake_pipeline_run))
+    monkeypatch.setattr(worker.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(worker.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(worker.store, "complete_job", fake_complete_job)
+    monkeypatch.setattr(worker.store, "fail_job", lambda _job_id, error: fail_calls.append(error))
+
+    job = {
+        "job_id": "job-retry-complete",
+        "question": "retry complete",
+        "passes": 1,
+        "provider_config_json": json.dumps({"provider": "anthropic", "task_class": "general", "fan_out": False}),
+    }
+
+    await worker._run_job(job)
+
+    assert complete_attempts["count"] == 3
+    assert sleep_calls == [0.05, 0.1]
+    assert fail_calls == []
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_transient_fail_job_write_failure(monkeypatch):
+    fail_attempts = {"count": 0}
+    sleep_calls: list[float] = []
+
+    async def fake_deep_think_passes(**_kwargs):
+        raise RuntimeError("engine boom")
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    async def fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    def fake_fail_job(_job_id, _error):
+        fail_attempts["count"] += 1
+        if fail_attempts["count"] == 1:
+            raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(worker.engine, "deep_think_passes", fake_deep_think_passes)
+    monkeypatch.setattr(worker.engine, "build_provider_config", lambda cfg: SimpleNamespace(provider=cfg.get("provider", "")))
+    monkeypatch.setattr(worker.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(worker.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(worker.store, "complete_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.store, "fail_job", fake_fail_job)
+
+    job = {
+        "job_id": "job-retry-fail",
+        "question": "retry fail",
+        "passes": 1,
+        "provider_config_json": json.dumps({"provider": "anthropic", "task_class": "general", "fan_out": False}),
+    }
+
+    await worker._run_job(job)
+
+    assert fail_attempts["count"] == 2
+    assert sleep_calls == [0.05]

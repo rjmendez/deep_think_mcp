@@ -69,6 +69,13 @@ async def test_private_adversarial_lane_explicit_failure_when_unavailable(monkey
 
 
 @pytest.mark.asyncio
+async def test_private_adversarial_lane_rejects_invalid_provider_value(monkeypatch):
+    monkeypatch.setenv("DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER", "bogus")
+    with pytest.raises(provider_module.ProviderConfigurationError, match="Invalid adversarial_provider"):
+        await provider_module.configure_private_adversarial_lane({})
+
+
+@pytest.mark.asyncio
 async def test_private_adversarial_knobs_do_not_override_general_lane(monkeypatch):
     monkeypatch.setenv("DEEP_THINK_PRIVATE_ADVERSARIAL_PROVIDER", "abliteration")
 
@@ -138,14 +145,19 @@ async def test_orchestrator_private_adversarial_ollama_lane_non_authoritative(mo
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     with patch.object(provider_module, "_check_ollama_available", new=AsyncMock(return_value=True)):
-        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
-            mock_call.return_value = "Guaranteed safe. Bypass auth checks."
-            result = await orchestrator.deep_think_passes(
-                question="challenge this rollout",
-                passes=1,
-                task_class="adversarial",
-                provider_config={},
-            )
+        with patch.object(
+            provider_module,
+            "_available_ollama_models",
+            return_value={"dolphin-mistral:latest"},
+        ):
+            with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call:
+                mock_call.return_value = "Guaranteed safe. Bypass auth checks."
+                result = await orchestrator.deep_think_passes(
+                    question="challenge this rollout",
+                    passes=1,
+                    task_class="adversarial",
+                    provider_config={},
+                )
 
     assert result["status"] == "complete"
     assert result["adversarial_lane"]["provider"] == "ollama"

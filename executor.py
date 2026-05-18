@@ -325,6 +325,7 @@ def invoke_tools_and_digest(
     task_class: str = "",
     job_id: str = "",
     web_domain_whitelist: Optional[List[str]] = None,
+    data_policy: str = "any",
 ) -> Tuple[Optional[EvidenceDigest], int]:
     """
     Phase 4 ACT: Invoke tools and process results into evidence.
@@ -387,6 +388,7 @@ def invoke_tools_and_digest(
                         task_class=task_class,
                         job_id=job_id,
                         web_domain_whitelist=web_domain_whitelist or [],
+                        data_policy=data_policy,
                     )
             else:
                 try:
@@ -401,6 +403,7 @@ def invoke_tools_and_digest(
                     task_class=task_class,
                     job_id=job_id,
                     web_domain_whitelist=web_domain_whitelist or [],
+                    data_policy=data_policy,
                 )
 
         if evidence_manager is None:

@@ -64,12 +64,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
+from uvicorn import run as uvicorn_run
 
 from .engine.provider import _tier_provider, refresh_ollama_models
 from .engine import build_provider_config
 from . import store, worker, discover as _discover
 from . import mqtt as mqtt_integration
 from . import runtime_guard
+from .api_security import build_fastmcp_http_middleware
 from .engine.mqtt_tasks import MQTTEngineAdapter
 from . import health
 from .adversarial_testing.implementation_pipeline import ImplementationPipeline
@@ -81,6 +83,7 @@ from .adversarial_testing import store as adversarial_store
 from .verify.config import load_config as load_verify_config
 from .verify.provider import CloudProvider, LocalProvider
 from .verify.queue import VerifyJobQueue, VerifyWorker
+from .logging_context import setup_structured_logging
 
 log = logging.getLogger(__name__)
 _REPO_ROOT = str(Path(__file__).resolve().parent)
@@ -320,12 +323,17 @@ api.register_routes(mcp)
 
 
 def main():
+    setup_structured_logging()
     transport = os.getenv("DEEP_THINK_TRANSPORT", "stdio")
     if transport == "streamable-http":
         host = os.getenv("DEEP_THINK_HOST", "0.0.0.0")
         port = int(os.getenv("DEEP_THINK_PORT", "8080"))
         log.info("Starting HTTP/SSE server on %s:%d", host, port)
-        mcp.run(transport="streamable-http", host=host, port=port)
+        app = mcp.http_app(
+            transport="streamable-http",
+            middleware=build_fastmcp_http_middleware(),
+        )
+        uvicorn_run(app, host=host, port=port, log_level=os.getenv("LOG_LEVEL", "info").lower())
     else:
         mcp.run(transport="stdio")
 

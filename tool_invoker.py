@@ -34,6 +34,25 @@ except ImportError:  # pragma: no cover - support direct module imports in tests
 
 log = logging.getLogger(__name__)
 
+try:
+    from . import metrics as runtime_metrics
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    import metrics as runtime_metrics
+
+
+def _record_tool_outcome(tool_name: str, status: str, timing_ms: int) -> None:
+    try:
+        runtime_metrics.get_metrics().record_tool_outcome(tool_name, status, timing_ms)
+    except Exception:
+        pass
+
+
+def _normalize_data_policy(value: Any) -> str:
+    normalized = str(value or "any").strip().lower()
+    if normalized in {"any", "local", "cloud"}:
+        return normalized
+    return "any"
+
 
 class ToolInvoker:
     """Executes ToolDirective batches with safety constraints."""
@@ -44,6 +63,7 @@ class ToolInvoker:
         task_class: str = "",
         job_id: str = "",
         web_domain_whitelist: Optional[list[str]] = None,
+        data_policy: str = "any",
     ):
         """Initialize tool invoker with configuration.
         
@@ -54,6 +74,7 @@ class ToolInvoker:
         self.task_class = task_class
         self.job_id = job_id
         self.web_domain_whitelist = web_domain_whitelist or []
+        self.data_policy = _normalize_data_policy(data_policy)
         self.executor = ThreadPoolExecutor(max_workers=5)
         self._tool_registry = None
         try:
@@ -231,6 +252,7 @@ class ToolInvoker:
             except FutureTimeoutError:
                 future.cancel()
                 log.warning(f"Tool {directive.tool_name} timed out in parallel batch")
+                _record_tool_outcome(directive.tool_name, "timeout", timeout * 1000)
                 results.append(ToolResult(
                     tool_name=directive.tool_name,
                     query=directive.query,
@@ -242,6 +264,7 @@ class ToolInvoker:
                 ))
             except Exception as e:
                 log.error(f"Tool {directive.tool_name} failed: {e}")
+                _record_tool_outcome(directive.tool_name, "error", 0)
                 results.append(ToolResult(
                     tool_name=directive.tool_name,
                     query=directive.query,
@@ -269,12 +292,33 @@ class ToolInvoker:
             ToolResult with status, results, and timing
         """
         start_time = time.time()
+
+        def _make_result(
+            *,
+            tool_name: str,
+            query: str,
+            results: str,
+            tool_status: str,
+            timing_ms: int,
+            confidence_impact: float,
+            error_message: str = "",
+        ) -> ToolResult:
+            _record_tool_outcome(tool_name, tool_status, timing_ms)
+            return ToolResult(
+                tool_name=tool_name,
+                query=query,
+                results=results,
+                tool_status=tool_status,
+                timing_ms=timing_ms,
+                confidence_impact=confidence_impact,
+                error_message=error_message,
+            )
         
         try:
             # Guardrail: enforce tool registry + auth requirements before invocation.
             guard_error = self._validate_tool_guardrails(directive)
             if guard_error:
-                return ToolResult(
+                return _make_result(
                     tool_name=directive.tool_name,
                     query=directive.query,
                     results="",
@@ -321,7 +365,7 @@ class ToolInvoker:
                     handler = self._tool_registry.get_tool_handler(directive.tool_name)
 
                 if handler is None:
-                    return ToolResult(
+                    return _make_result(
                         tool_name=directive.tool_name,
                         query=directive.query,
                         results="",
@@ -353,7 +397,7 @@ class ToolInvoker:
             # unsafe serialization or side effects.
             normalized_results, norm_error = self._normalize_tool_output(results)
             if norm_error:
-                return ToolResult(
+                return _make_result(
                     tool_name=directive.tool_name,
                     query=directive.query,
                     results="",
@@ -384,7 +428,7 @@ class ToolInvoker:
                 status = "success"
                 # Impact already calculated by tool wrapper
             
-            return ToolResult(
+            return _make_result(
                 tool_name=directive.tool_name,
                 query=directive.query,
                 results=results,
@@ -397,7 +441,7 @@ class ToolInvoker:
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             log.error(f"Exception in tool {directive.tool_name}: {e}")
-            return ToolResult(
+            return _make_result(
                 tool_name=directive.tool_name,
                 query=directive.query,
                 results="",
@@ -409,6 +453,16 @@ class ToolInvoker:
 
     def _validate_tool_guardrails(self, directive: ToolDirective) -> str:
         """Validate tool directives against registry/auth guardrails."""
+        if self.data_policy == "local" and directive.tool_name in {
+            "web_search",
+            "document_fetch",
+            "nova_verify",
+        }:
+            return (
+                f"Tool '{directive.tool_name}' blocked by data_policy=local "
+                "(external tool calls are disabled)"
+            )
+
         if self._tool_registry is None:
             return ""
 

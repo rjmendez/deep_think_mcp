@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
@@ -626,6 +627,23 @@ def test_filter_adversarial_output():
     assert "Secret internal data" not in filtered
     # Actual reasoning content should be preserved
     assert "adversarial reasoning" in filtered
+
+
+def test_filter_adversarial_output_emits_audit_log_when_changes(caplog):
+    with caplog.at_level(logging.WARNING, logger="deep_think.audit"):
+        filtered = filter_adversarial_output(
+            "[WEB SEARCH RESULTS — internal]\nSensitive\n\nPublic output.",
+            job_id="audit-1",
+        )
+    assert "[WEB SEARCH RESULTS" not in filtered
+    assert any("ADVERSARIAL_OUTPUT_FILTERED job_id=audit-1" in r.message for r in caplog.records)
+
+
+def test_filter_adversarial_output_does_not_emit_audit_log_without_changes(caplog):
+    with caplog.at_level(logging.WARNING, logger="deep_think.audit"):
+        filtered = filter_adversarial_output("No context block here.", job_id="audit-2")
+    assert filtered == "No context block here."
+    assert not any("ADVERSARIAL_OUTPUT_FILTERED job_id=audit-2" in r.message for r in caplog.records)
 
 
 # ===========================================================================

@@ -81,6 +81,11 @@ class Metrics:
     # Orphaned job metrics
     orphaned_jobs_detected: int = 0
     orphaned_jobs_requeued: int = 0
+
+    # Tool metrics
+    tool_outcomes: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    tool_latency_ms: Dict[str, HistogramBucket] = field(default_factory=dict)
+    off_topic_outcomes: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     
     # Timestamps
     start_time_utc: datetime = field(default_factory=lambda: datetime.utcnow())
@@ -170,6 +175,24 @@ class Metrics:
         with self._lock:
             self.orphaned_jobs_requeued += 1
 
+    def record_tool_outcome(self, tool_name: str, status: str, timing_ms: float) -> None:
+        """Record tool invocation outcome by tool name + status + timing."""
+        with self._lock:
+            tool_name = str(tool_name or "unknown")
+            status = str(status or "unknown")
+            key = f"{tool_name}:{status}"
+            self.tool_outcomes[key] += 1
+            if key not in self.tool_latency_ms:
+                self.tool_latency_ms[key] = HistogramBucket()
+            if timing_ms >= 0:
+                self.tool_latency_ms[key].observe(timing_ms)
+
+    def record_off_topic_event(self, outcome: str) -> None:
+        """Record off-topic detector outcome."""
+        with self._lock:
+            key = str(outcome or "unknown")
+            self.off_topic_outcomes[key] += 1
+
     def _update_cache_hit_rate(self) -> None:
         """Update cache hit rate (call with lock held)."""
         total = self.cache_hits + self.cache_misses
@@ -202,6 +225,9 @@ class Metrics:
             self.contradiction_types = defaultdict(int)
             self.timeout_count = 0
             self.timeout_by_component = defaultdict(int)
+            self.tool_outcomes = defaultdict(int)
+            self.tool_latency_ms = {}
+            self.off_topic_outcomes = defaultdict(int)
             self.last_reset_utc = datetime.utcnow()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -236,6 +262,16 @@ class Metrics:
                 "timeouts": {
                     "total": self.timeout_count,
                     "by_component": dict(self.timeout_by_component),
+                },
+                "tools": {
+                    "outcomes": dict(self.tool_outcomes),
+                    "latency_ms": {
+                        key: histogram.to_dict()
+                        for key, histogram in self.tool_latency_ms.items()
+                    },
+                },
+                "off_topic": {
+                    "outcomes": dict(self.off_topic_outcomes),
                 },
                 "uptime_seconds": self.get_uptime_seconds(),
                 "start_time_utc": self.start_time_utc.isoformat(),
@@ -288,6 +324,26 @@ class Metrics:
             lines.append(f"# TYPE ground_truth_uptime_seconds gauge")
             lines.append(f"ground_truth_uptime_seconds {self.get_uptime_seconds()}")
 
+            lines.append("# HELP deep_think_tool_calls_total Tool calls by tool and status")
+            lines.append("# TYPE deep_think_tool_calls_total counter")
+            lines.append("# HELP deep_think_tool_latency_seconds Tool call latency by tool and status")
+            lines.append("# TYPE deep_think_tool_latency_seconds summary")
+            for key, count in sorted(self.tool_outcomes.items()):
+                tool_name, status = key.split(":", 1) if ":" in key else (key, "unknown")
+                labels = f'tool_name="{_prom_label_value(tool_name)}",status="{_prom_label_value(status)}"'
+                lines.append(f"deep_think_tool_calls_total{{{labels}}} {count}")
+                hist = self.tool_latency_ms.get(key)
+                sum_seconds = (hist.sum_ms / 1000.0) if hist else 0.0
+                hist_count = hist.count if hist else 0
+                lines.append(f"deep_think_tool_latency_seconds_sum{{{labels}}} {sum_seconds}")
+                lines.append(f"deep_think_tool_latency_seconds_count{{{labels}}} {hist_count}")
+
+            lines.append("# HELP deep_think_off_topic_events_total Off-topic detector outcomes")
+            lines.append("# TYPE deep_think_off_topic_events_total counter")
+            for outcome, count in sorted(self.off_topic_outcomes.items()):
+                labels = f'outcome="{_prom_label_value(outcome)}"'
+                lines.append(f"deep_think_off_topic_events_total{{{labels}}} {count}")
+
         return "\n".join(lines)
 
 
@@ -303,3 +359,8 @@ def get_metrics() -> Metrics:
 def reset_metrics() -> None:
     """Reset all metrics (useful for testing or periodic resets)."""
     _metrics.reset()
+
+
+def _prom_label_value(value: str) -> str:
+    """Escape Prometheus label values."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")

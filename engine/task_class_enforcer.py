@@ -193,11 +193,12 @@ def filter_adversarial_output(text: str, job_id: str = "") -> str:
     grounded data in the first place (primary defence via tool blocking).
     """
     import re
+    original_text = text
     # Remove any Nova context blocks that may have leaked
     text = re.sub(r'\[NOVA LIBRARY CONTEXT[^\]]*\].*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
     text = re.sub(r'\[DAMA TELEMETRY[^\]]*\].*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
     text = re.sub(r'\[WEB SEARCH RESULTS[^\]]*\].*?(?=\n\n|\Z)', '', text, flags=re.DOTALL)
-    if text != text:  # changes were made
+    if text != original_text:
         _AUDIT_LOG.warning(
             "ADVERSARIAL_OUTPUT_FILTERED job_id=%s — research context blocks stripped from output",
             job_id,

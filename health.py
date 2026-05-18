@@ -195,6 +195,7 @@ def _build_health_response(metrics: dict, max_pending_threshold: int) -> dict:
     """Build health response from metrics."""
     pending_count = metrics["pending_count"]
     runtime = runtime_metrics.get_metrics()
+    worker_runtime = _get_worker_runtime()
     fingerprint = runtime_guard.get_runtime_fingerprint().as_dict()
     runtime_stale = bool(fingerprint.get("runtime_stale"))
     
@@ -214,7 +215,7 @@ def _build_health_response(metrics: dict, max_pending_threshold: int) -> dict:
         "last_success_timestamp": metrics["last_success_timestamp"],
         "oldest_queued_age_secs": metrics.get("oldest_queued_age_secs"),
         "oldest_running_age_secs": metrics.get("oldest_running_age_secs"),
-        "worker_count": 1,  # Simplified: assume 1 active worker (can be enhanced)
+        "worker_count": worker_runtime.get("active_workers", 0),
         "db_status": metrics["db_status"],
         "completed_count": metrics.get("completed_count", 0),
         "timeout_count": runtime.timeout_count,
@@ -231,6 +232,14 @@ def _build_health_response(metrics: dict, max_pending_threshold: int) -> dict:
         response["reason"] = f"Too many pending jobs ({pending_count} >= {max_pending_threshold})"
     
     return response
+
+
+def _get_worker_runtime() -> dict:
+    try:
+        from . import worker as runtime_worker
+        return runtime_worker.get_worker_runtime()
+    except Exception:
+        return {"active_workers": 0, "max_workers": 0, "running": False}
 
 
 def reset_cache() -> None:

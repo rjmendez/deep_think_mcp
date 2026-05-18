@@ -5,7 +5,7 @@ task_class: research_synthesis
 description: Grounded research synthesis with evidence chains, citations, and confidence scoring.
 routing:
   directive_set: research_synthesis
-  mandate_set: synthesis
+  mandate_set: research_synthesis
 controls:
   enable_research_tools: true
   block_abliteration: true

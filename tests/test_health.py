@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch, MagicMock
 import pytest
 
 from deep_think_mcp import health, store
+from deep_think_mcp.api import health as health_api
 
 
 class TestHealthMetrics:
@@ -214,6 +215,39 @@ class TestHealthMetrics:
         assert metrics1["avg_latency"] == metrics2["avg_latency"]
         assert metrics1["worker_count"] == metrics2["worker_count"]
         assert second_call_count == first_call_count  # DB not called again
+
+    def test_health_worker_count_uses_runtime_worker_data(self):
+        """Worker count should come from runtime state, not a hardcoded value."""
+        health.reset_cache()
+
+        def mock_connect():
+            conn = Mock(spec=sqlite3.Connection)
+            count_row = Mock()
+            count_row.__getitem__ = Mock(return_value=0)
+            avg_row = Mock()
+            avg_row.__getitem__ = Mock(side_effect=lambda x: {
+                "avg_secs": 1.0,
+                "last_success": "2024-01-01T00:00:00",
+                "total_completed": 1
+            }.get(x))
+            cursor1 = Mock()
+            cursor1.fetchone = Mock(return_value=count_row)
+            cursor2 = Mock()
+            cursor2.fetchone = Mock(return_value=avg_row)
+            call_count = [0]
+
+            def side_effect(*args, **kwargs):
+                call_count[0] += 1
+                return cursor1 if call_count[0] == 1 else cursor2
+
+            conn.execute = Mock(side_effect=side_effect)
+            conn.row_factory = None
+            conn.close = Mock()
+            return conn
+
+        with patch("deep_think_mcp.health._get_worker_runtime", return_value={"active_workers": 3}):
+            metrics = health.get_health_metrics(mock_connect, max_pending_threshold=100)
+        assert metrics["worker_count"] == 3
 
     def test_health_cache_expiration(self):
         """Test that cache expires after TTL."""
@@ -642,3 +676,22 @@ class TestHealthEdgeCases:
         assert metrics["http_status"] == 503
         assert "reason" in metrics
         assert "pending" in metrics["reason"].lower()
+
+
+class TestMetricsEndpoint:
+    def test_metrics_route_returns_prometheus_payload(self):
+        routes = {}
+
+        class FakeMCP:
+            def custom_route(self, path, methods=None):
+                def decorator(func):
+                    routes[path] = func
+                    return func
+                return decorator
+
+        health_api.register(FakeMCP())
+        assert "/metrics" in routes
+
+        response = asyncio.run(routes["/metrics"](Mock()))
+        assert response.status_code == 200
+        assert "ground_truth_validations_total" in response.body.decode()

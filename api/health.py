@@ -4,9 +4,9 @@ import logging
 import os
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 
-from .. import health, store, mcp_help, runtime_guard
+from .. import health, metrics as runtime_metrics, store, mcp_help, runtime_guard
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +36,15 @@ def register(mcp):
         
         http_status = metrics.pop("http_status", 200)
         return JSONResponse(metrics, status_code=http_status)
+
+    @mcp.custom_route("/metrics", methods=["GET"])
+    async def metrics_endpoint(request: Request) -> PlainTextResponse:
+        """Prometheus metrics endpoint."""
+        payload = runtime_metrics.get_metrics().to_prometheus_format()
+        return PlainTextResponse(
+            payload,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
     
     @mcp.custom_route("/health/hints", methods=["GET"])
     async def health_with_hints(request: Request) -> JSONResponse:
@@ -104,10 +113,10 @@ def register(mcp):
                 status_code=http_status,
             )
         
-        except Exception as e:
+        except Exception:
             log.exception("Health hints endpoint error")
             return JSONResponse(
-                {"error": f"Failed to get health status: {str(e)}", "hints": []},
+                {"error": "Internal server error", "hints": []},
                 status_code=500,
             )
 
@@ -127,9 +136,9 @@ def register(mcp):
                 },
                 status_code=503 if degraded else 200,
             )
-        except Exception as e:
+        except Exception:
             log.exception("Health invariants endpoint error")
             return JSONResponse(
-                {"status": "degraded", "error": f"Failed to check invariants: {str(e)}"},
+                {"status": "degraded", "error": "Internal server error"},
                 status_code=500,
             )

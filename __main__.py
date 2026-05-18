@@ -30,6 +30,7 @@ else:
 import inspect
 import json
 from typing import get_origin, get_args
+from uvicorn import run as uvicorn_run
 
 def _patch_fastmcp_schema_builder():
     """Prevent FastMCP from converting numeric defaults to slice objects."""
@@ -61,6 +62,10 @@ def _patch_fastmcp_schema_builder():
 _patch_fastmcp_schema_builder()
 
 from deep_think_mcp.server import mcp  # noqa: E402
+from deep_think_mcp.api_security import build_fastmcp_http_middleware  # noqa: E402
+from deep_think_mcp.logging_context import setup_structured_logging  # noqa: E402
+
+setup_structured_logging()
 
 transport = os.getenv("DEEP_THINK_TRANSPORT", "streamable-http")
 host = os.getenv("DEEP_THINK_HOST", "0.0.0.0")
@@ -69,4 +74,8 @@ port = int(os.getenv("DEEP_THINK_PORT", "8002"))
 if transport == "stdio":
     mcp.run(transport="stdio")
 else:
-    mcp.run(transport="streamable-http", host=host, port=port)
+    app = mcp.http_app(
+        transport="streamable-http",
+        middleware=build_fastmcp_http_middleware(),
+    )
+    uvicorn_run(app, host=host, port=port, log_level=os.getenv("LOG_LEVEL", "info").lower())

@@ -121,7 +121,7 @@ class TestFix3ModelForTier:
             medium_provider="",
             heavy_provider="",
             data_policy="any",
-            light="claude-haiku-4.5",
+            light="claude-haiku-4-5",
             medium="",
             heavy="",
             model="",
@@ -130,7 +130,7 @@ class TestFix3ModelForTier:
         
         # Light tier should return configured model
         model = provider_module._model_for_tier(cfg, "light", "general")
-        assert model == "claude-haiku-4.5"
+        assert model == "claude-haiku-4-5"
     
     def test_model_for_tier_heavy(self):
         """Test that heavy tier respects its own model configuration."""
@@ -142,14 +142,14 @@ class TestFix3ModelForTier:
             data_policy="any",
             light="",
             medium="",
-            heavy="claude-opus-4.7",
+            heavy="claude-opus-4-7",
             model="",
             base_url="",
         )
         
         # Heavy tier should return configured model
         model = provider_module._model_for_tier(cfg, "heavy", "general")
-        assert model == "claude-opus-4.7"
+        assert model == "claude-opus-4-7"
 
 
 class TestFix4PassOverrides:
@@ -390,6 +390,32 @@ class TestTemperatureKnobPropagation:
                 provider_config={"data_policy": "local", "anthropic_api_key": "sk-ant-test"},
             )
 
+    @pytest.mark.asyncio
+    async def test_classify_task_passes_data_policy_to_provider_call(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call_provider:
+            mock_call_provider.return_value = "general"
+            result = await provider_module.classify_task(
+                question="classify with local policy",
+                provider="ollama",
+                data_policy="local",
+            )
+
+        assert result == "general"
+        assert mock_call_provider.await_count == 1
+        assert mock_call_provider.await_args.kwargs["provider_config"]["data_policy"] == "local"
+
+    @pytest.mark.asyncio
+    async def test_classify_task_rewrites_conflicting_provider_for_local_policy(self):
+        with patch.object(provider_module, "_call_provider", new_callable=AsyncMock) as mock_call_provider:
+            mock_call_provider.return_value = "general"
+            await provider_module.classify_task(
+                question="classify with conflicting provider",
+                provider="anthropic",
+                data_policy="local",
+            )
+
+        assert mock_call_provider.await_args.kwargs["provider"] == "ollama"
+
 
 class TestAnthropicOfficialDefaults:
     """Guard against reintroducing date-coded Anthropic defaults."""
@@ -439,14 +465,14 @@ class TestFix6SynthesisTierProvider:
             data_policy="any",
             light="",
             medium="",
-            heavy="claude-opus-4.7",
+            heavy="claude-opus-4-7",
             model="",
             base_url="",
         )
         
         # Synthesis should use heavy model config
         synthesis_model = provider_module._model_for_tier(cfg, "heavy", "general")
-        assert synthesis_model == "claude-opus-4.7"
+        assert synthesis_model == "claude-opus-4-7"
 
 
 class TestIntegrationProviderConfig:
@@ -456,18 +482,18 @@ class TestIntegrationProviderConfig:
         """Test complete provider config with all overrides."""
         cfg = provider_module.build_provider_config({
             "provider": "anthropic",
-            "light_model": "claude-haiku-4.5",
+            "light_model": "claude-haiku-4-5",
             "light_provider": "ollama",
-            "medium_model": "claude-sonnet-4.5",
-            "heavy_model": "claude-opus-4.7",
+            "medium_model": "claude-sonnet-4-6",
+            "heavy_model": "claude-opus-4-7",
             "heavy_provider": "copilot",
             "data_policy": "any",
         })
         
         # Verify all configurations are preserved
-        assert cfg.light == "claude-haiku-4.5"
-        assert cfg.medium == "claude-sonnet-4.5"
-        assert cfg.heavy == "claude-opus-4.7"
+        assert cfg.light == "claude-haiku-4-5"
+        assert cfg.medium == "claude-sonnet-4-6"
+        assert cfg.heavy == "claude-opus-4-7"
         assert cfg.provider == "anthropic"
         assert cfg.light_provider == "ollama"
         assert cfg.heavy_provider == "copilot"
@@ -478,9 +504,9 @@ class TestIntegrationProviderConfig:
         assert provider_module._tier_provider(cfg, "heavy") == "copilot"
         
         # Verify tier model selection works
-        assert provider_module._model_for_tier(cfg, "light", "general") == "claude-haiku-4.5"
-        assert provider_module._model_for_tier(cfg, "medium", "general") == "claude-sonnet-4.5"
-        assert provider_module._model_for_tier(cfg, "heavy", "general") == "claude-opus-4.7"
+        assert provider_module._model_for_tier(cfg, "light", "general") == "claude-haiku-4-5"
+        assert provider_module._model_for_tier(cfg, "medium", "general") == "claude-sonnet-4-6"
+        assert provider_module._model_for_tier(cfg, "heavy", "general") == "claude-opus-4-7"
     
     def test_backward_compatibility_old_keys(self):
         """Test that old 'light', 'medium', 'heavy' keys still work."""
@@ -493,6 +519,43 @@ class TestIntegrationProviderConfig:
         assert cfg.light == "claude-haiku"
         assert cfg.medium == "claude-sonnet"
         assert cfg.heavy == "claude-opus"
+
+
+class TestProviderConfigValidation:
+    def test_build_provider_config_rejects_empty_base_url_override(self):
+        with pytest.raises(provider_module.ProviderConfigurationError, match="base_url"):
+            provider_module.build_provider_config({"provider": "ollama", "base_url": "   "})
+
+    def test_build_provider_config_rejects_invalid_tier_provider_override(self):
+        with pytest.raises(provider_module.ProviderConfigurationError, match="light_provider"):
+            provider_module.build_provider_config({"provider": "anthropic", "light_provider": "not-a-provider"})
+
+    def test_tier_provider_rejects_cloud_policy_conflict(self):
+        cfg = provider_module.ProviderConfig(
+            provider="ollama",
+            data_policy="cloud",
+            light_provider="",
+            medium_provider="",
+            heavy_provider="",
+            light="",
+            medium="",
+            heavy="",
+            model="",
+            base_url="http://localhost:11434",
+        )
+        with pytest.raises(provider_module.ProviderRoutingError, match="data_policy=cloud"):
+            provider_module._tier_provider(cfg, "medium")
+
+    @pytest.mark.asyncio
+    async def test_call_provider_rejects_explicit_empty_ollama_base_url(self):
+        with pytest.raises(provider_module.ProviderConfigurationError, match="base_url"):
+            await provider_module._call_provider(
+                provider="ollama",
+                model="phi4-mini:latest",
+                system="system",
+                user_prompt="prompt",
+                provider_config={"base_url": "   "},
+            )
 
 
 if __name__ == "__main__":

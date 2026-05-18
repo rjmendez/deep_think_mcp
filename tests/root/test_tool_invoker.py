@@ -27,6 +27,7 @@ from tool_invoker import (
     parse_tool_directives,
     format_evidence_for_reasoning,
 )
+from metrics import get_metrics, reset_metrics
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -445,14 +446,14 @@ class TestErrorHandling:
     """Tests for error handling and recovery."""
     
     def test_invalid_tool_returns_error(self, invoker):
-        """Invalid tool name returns not_callable status."""
+        """Invalid tool name is rejected by guardrails."""
         # Create a directive with a mocked invalid tool name
         directive = ToolDirective("web_search", "test", priority=0)
         directive.tool_name = "invalid_tool"  # Override after creation
         
         result = invoker._invoke_single_tool(directive, 10)
-        assert result.tool_status == "not_callable"
-        assert "Unknown tool" in result.error_message
+        assert result.tool_status == "error"
+        assert "not registered" in result.error_message
     
     def test_network_error_returns_error(self, invoker):
         """Network error returns error status."""
@@ -509,6 +510,32 @@ class TestErrorHandling:
 
         assert result.tool_status == "error"
         assert "auth_failed" in result.error_message
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TEST: DATA POLICY ENFORCEMENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestDataPolicyEnforcement:
+    """Tests for local/cloud data policy guardrails."""
+
+    def test_local_policy_blocks_external_tool_calls(self, config):
+        invoker = ToolInvoker(config=config, data_policy="local")
+
+        for tool_name in ("web_search", "document_fetch", "nova_verify"):
+            directive = ToolDirective(tool_name=tool_name, query="test", priority=1)
+            result = invoker._invoke_single_tool(directive, 10)
+            assert result.tool_status == "error"
+            assert "data_policy=local" in result.error_message
+
+    def test_local_policy_allows_code_search(self, config):
+        invoker = ToolInvoker(config=config, data_policy="local")
+        directive = ToolDirective(tool_name="code_search", query="test", priority=1)
+
+        with patch("tools.code_search.invoke_code_search", return_value=("No code matches found", -0.05, "code_search returned no local matches")):
+            result = invoker._invoke_single_tool(directive, 10)
+
+        assert result.tool_status == "success"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -966,6 +993,17 @@ class TestToolOutputNormalization:
 
         assert result.tool_status == "success"
         assert json.loads(result.results) == dict_output
+
+
+class TestToolOutcomeMetrics:
+    def test_tool_outcome_metrics_recorded(self, invoker):
+        reset_metrics()
+        directive = ToolDirective("web_search", "test", priority=0)
+        with patch("tools.web_search.invoke_web_search", return_value=("ok", 0.1, "")):
+            result = invoker._invoke_single_tool(directive, 10)
+        assert result.tool_status == "success"
+        metrics = get_metrics().to_dict()
+        assert metrics["tools"]["outcomes"].get("web_search:success", 0) >= 1
 
 
 if __name__ == "__main__":

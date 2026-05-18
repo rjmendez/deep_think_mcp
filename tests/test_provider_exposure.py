@@ -102,6 +102,58 @@ def test_off_topic_detector_allows_same_question_context():
     assert reason == ""
 
 
+def test_off_topic_detector_flags_long_low_overlap_answer_without_question_header():
+    off_topic, reason = orchestrator._is_off_topic_response(
+        "Audit retry behavior in orchestrator run_fan_out and cache gating",
+        "Neural image style transfer uses convolutional layers and gradient descent to produce art-like results from photos.",
+    )
+    assert off_topic is True
+    assert "overlap" in reason
+
+
+def test_off_topic_detector_does_not_overblock_short_valid_answer():
+    off_topic, reason = orchestrator._is_off_topic_response(
+        "Add retries and logging for off-topic response handling",
+        "Added bounded retries, logs, and metrics.",
+    )
+    assert off_topic is False
+    assert reason == ""
+
+
+def test_cached_answer_quality_gate_rejects_low_overlap():
+    ok, reason = orchestrator._passes_cached_answer_quality_gate(
+        "Review grounding checks in engine/orchestrator.py",
+        "This response discusses neural style transfer and image classifiers.",
+    )
+    assert ok is False
+    assert "low_question_overlap" in reason
+
+
+def test_cached_answer_quality_gate_accepts_relevant_cached_answer():
+    ok, reason = orchestrator._passes_cached_answer_quality_gate(
+        "Review grounding checks in engine/orchestrator.py",
+        "Question: Review grounding checks in engine/orchestrator.py\nAnswer: The grounding gate needs evidence coverage.",
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_confidence_score_normalization_accepts_percent_string():
+    normalized, warnings = orchestrator._normalize_synthesis_structured(
+        {"confidence_score": "85.7%", "final_answer": "ok"}
+    )
+    assert normalized["confidence_score"] == 85
+    assert warnings == []
+
+
+def test_confidence_score_normalization_handles_invalid_values():
+    normalized, warnings = orchestrator._normalize_synthesis_structured(
+        {"confidence_score": "NaN", "final_answer": "ok"}
+    )
+    assert normalized["confidence_score"] == 0
+    assert any("missing or invalid" in w for w in warnings)
+
+
 def test_tool_guardrails_apply_auth_checks_to_registry_tools(monkeypatch):
     monkeypatch.delenv("NOVA_TOKEN", raising=False)
 

@@ -128,10 +128,10 @@ def register(mcp):
                 status_code=200,
             )
         
-        except Exception as e:
+        except Exception:
             log.exception("Capabilities endpoint error")
             return JSONResponse(
-                {"error": f"Failed to get capabilities: {str(e)}"},
+                {"error": "Internal server error"},
                 status_code=500,
             )
 
@@ -141,10 +141,10 @@ def register(mcp):
         try:
             skills = _list_skill_profiles()
             return JSONResponse({"count": len(skills), "skills": skills}, status_code=200)
-        except Exception as e:
+        except Exception:
             log.exception("Skills endpoint error")
             return JSONResponse(
-                {"error": f"Failed to get skills: {str(e)}"},
+                {"error": "Internal server error"},
                 status_code=500,
             )
 
@@ -273,10 +273,10 @@ def register(mcp):
                 {"error": "Invalid JSON request"},
                 status_code=400,
             )
-        except Exception as e:
+        except Exception:
             log.exception("Suggest endpoint error")
             return JSONResponse(
-                {"error": f"Failed to generate suggestion: {str(e)}"},
+                {"error": "Internal server error"},
                 status_code=500,
             )
 
@@ -318,9 +318,9 @@ def register(mcp):
                     status_code=404,
                 )
         
-        except Exception as e:
+        except Exception:
             log.exception("Help endpoint error")
             return JSONResponse(
-                {"error": f"Failed to get help: {str(e)}"},
+                {"error": "Internal server error"},
                 status_code=500,
             )

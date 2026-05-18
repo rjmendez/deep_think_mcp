@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -35,13 +36,47 @@ from .validator import validate_passes, validate_width, validate_height, Validat
 from deep_think_mcp import store
 from deep_think_mcp import discover
 from deep_think_mcp.defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
+try:
+    from deep_think_mcp import metrics as runtime_metrics
+except ImportError:  # pragma: no cover - support direct module imports in tests
+    import metrics as runtime_metrics
 
 log = logging.getLogger(__name__)
+
+_MAX_SYNTHESIS_PROMPT_CHARS = 36_000
+_MAX_PERSPECTIVE_PAYLOAD_CHARS = 4_500
+_MAX_EVIDENCE_SUMMARY_CHARS = 1_800
+_MAX_CLAIMS_PER_PERSPECTIVE = 6
+_MAX_CLAIM_TEXT_CHARS = 320
+_MAX_EVIDENCE_BASIS_CHARS = 180
+_MAX_VERDICT_CHARS = 320
+_MAX_UNCERTAINTIES_PER_PERSPECTIVE = 5
+_MAX_UNCERTAINTY_CHARS = 180
+_OFF_TOPIC_RETRY_LIMIT = max(0, min(int(os.getenv("DEEP_THINK_OFF_TOPIC_RETRIES", "1") or "1"), 2))
+_NOISE_TOKENS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "if", "in",
+    "is", "it", "of", "on", "or", "that", "the", "this", "to", "what", "when", "where",
+    "which", "who", "why", "with",
+}
+
+
+def _truncate_text(value: Any, max_chars: int, *, label: str = "text") -> str:
+    """Return text bounded by max_chars, with explicit truncation marker."""
+    text = str(value or "")
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = f"\n...[{label} truncated; omitted {omitted} chars]"
+    keep = max(1, max_chars - len(marker))
+    return text[:keep] + marker
 
 
 def _build_tool_query(question: str, perspective_answer: str, max_chars: int = 1800) -> str:
     """Build a tool query that prioritizes perspective-specific context."""
-    perspective = (perspective_answer or "").strip()
+    # Strip [Perspective: NAME] header blocks — they are mandate boilerplate, not signal
+    perspective = re.sub(r'\[Perspective:[^\]]+\]\n?', '', perspective_answer or '').strip()
     base_question = (question or "").strip()
     parts = [part for part in (perspective, base_question) if part]
     if not parts:
@@ -51,15 +86,23 @@ def _build_tool_query(question: str, perspective_answer: str, max_chars: int = 1
 
 
 def _is_off_topic_response(question: str, answer: str) -> tuple[bool, str]:
-    """Detect obvious perspective drift where model answers a different question."""
+    """Detect obvious perspective drift using deterministic lexical heuristics."""
     q = (question or "").strip()
     a = (answer or "").strip()
     if not q or not a:
         return False, ""
 
     q_tokens = set(re.findall(r"[a-z0-9_]+", q.lower()))
+    q_keywords = {t for t in q_tokens if len(t) >= 3 and t not in _NOISE_TOKENS}
     if not q_tokens:
         return False, ""
+    a_tokens = set(re.findall(r"[a-z0-9_]+", a.lower()))
+    a_keywords = {t for t in a_tokens if len(t) >= 3 and t not in _NOISE_TOKENS}
+
+    def _token_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / max(len(left), 1)
 
     # Common failure mode observed in live runs: model emits its own "Question: ..."
     # block that is unrelated to the requested task.
@@ -67,15 +110,92 @@ def _is_off_topic_response(question: str, answer: str) -> tuple[bool, str]:
     if m:
         candidate = m.group(1).strip()
         c_tokens = set(re.findall(r"[a-z0-9_]+", candidate.lower()))
+        c_keywords = {t for t in c_tokens if len(t) >= 3 and t not in _NOISE_TOKENS}
         if c_tokens:
-            overlap = len(q_tokens & c_tokens) / max(len(q_tokens), 1)
+            overlap = _token_overlap(q_tokens, c_tokens)
+            kw_overlap = _token_overlap(q_keywords, c_keywords)
             if overlap < 0.25:
                 return True, (
                     "model generated a different question context "
                     f"(overlap={overlap:.2f})"
                 )
+            if q_keywords and kw_overlap < 0.20:
+                return True, (
+                    "model generated a weakly related question context "
+                    f"(keyword_overlap={kw_overlap:.2f})"
+                )
+
+    # Secondary guardrail for long responses with near-zero lexical connection.
+    # Keep conservative to avoid overblocking short valid answers.
+    if len(a_keywords) >= 12 and len(q_keywords) >= 4:
+        keyword_overlap = _token_overlap(q_keywords, a_keywords)
+        if keyword_overlap < 0.10:
+            return True, f"very_low_keyword_overlap={keyword_overlap:.2f}"
 
     return False, ""
+
+
+def _passes_cached_answer_quality_gate(question: str, answer: str) -> tuple[bool, str]:
+    """Check whether a cached answer is still relevant enough to reuse."""
+    q = (question or "").strip()
+    a = (answer or "").strip()
+    if not q or not a:
+        return False, "empty question or answer"
+
+    off_topic, off_topic_reason = _is_off_topic_response(q, a)
+    if off_topic:
+        return False, f"off_topic: {off_topic_reason}"
+
+    q_tokens = {t for t in re.findall(r"[a-z0-9_]+", q.lower()) if len(t) >= 3 and t not in _NOISE_TOKENS}
+    a_tokens = {t for t in re.findall(r"[a-z0-9_]+", a.lower()) if len(t) >= 3 and t not in _NOISE_TOKENS}
+    if not q_tokens or not a_tokens:
+        return False, "missing tokenization signal"
+
+    # Avoid overblocking concise responses where lexical overlap may be sparse.
+    if len(a_tokens) < 6:
+        return True, ""
+
+    overlap = len(q_tokens & a_tokens) / max(len(q_tokens), 1)
+    if overlap < 0.15:
+        return False, f"low_question_overlap={overlap:.2f}"
+
+    return True, ""
+
+
+def _record_off_topic_outcome(outcome: str) -> None:
+    try:
+        runtime_metrics.get_metrics().record_off_topic_event(outcome)
+    except Exception:
+        pass
+
+
+def _log_off_topic_event(*, stage: str, outcome: str, reason: str = "", perspective: str = "", attempt: int = 0, max_retries: int = 0) -> None:
+    payload = {
+        "event": "off_topic",
+        "stage": stage,
+        "outcome": outcome,
+        "reason": reason,
+        "perspective": perspective,
+        "attempt": attempt,
+        "max_retries": max_retries,
+    }
+    log.info("off_topic_event %s", json.dumps(payload, sort_keys=True, default=str))
+    _record_off_topic_outcome(outcome)
+
+
+def _normalize_unit_confidence(value: Any, default: float = 0.5) -> float:
+    try:
+        if isinstance(value, bool):
+            raise ValueError("bool is not confidence")
+        raw = str(value).strip().rstrip("%") if isinstance(value, str) else value
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite confidence")
+    except Exception:
+        return default
+    if parsed > 1.0:
+        parsed = parsed / 100.0
+    return max(0.0, min(1.0, parsed))
 
 
 def _log_pass_exception(
@@ -773,6 +893,8 @@ async def deep_think_passes(
         cfg.data_policy = data_policy
     elif force_local_models:
         cfg.data_policy = "local"  # Ensure local is set
+    provider_call_config = dict(provider_config)
+    provider_call_config["data_policy"] = cfg.data_policy
 
     if base_task_class == "adversarial" and adversarial_lane_meta:
         lane_provider = (adversarial_lane_meta or {}).get("provider", "")
@@ -818,7 +940,11 @@ async def deep_think_passes(
     
     # Run safety precheck if required
     if task_profile.get("safety_precheck"):
-        safe, reason = await provider_module._run_safety_precheck(question, provider=cfg.provider)
+        safe, reason = await provider_module._run_safety_precheck(
+            question,
+            provider=cfg.provider,
+            data_policy=cfg.data_policy or "any",
+        )
         if not safe:
             log.warning(f"Safety precheck failed: {reason}")
             return {
@@ -835,19 +961,67 @@ async def deep_think_passes(
     validation_results = []
 
     # Compute a run signature that locks in all execution inputs for pass cache keying.
+    # Include provider/model routing details so resume only occurs for equivalent runs.
+    _run_sig_payload = {
+        "question": question,
+        "passes": passes,
+        "task_class": task_class,
+        "base_task_class": base_task_class,
+        "directives": directives,
+        "mandate_prefix": mandate_prefix,
+        "perspective_name": perspective_name or "",
+        "data_policy": cfg.data_policy or "any",
+        "provider": cfg.provider or "",
+        "model_override": model or "",
+        "tier_provider_map": {
+            tier_name: provider_module._tier_provider(cfg, tier_name)
+            for tier_name in ("light", "medium", "heavy")
+        },
+        "tier_model_map": {
+            tier_name: (model or provider_module._model_for_tier(cfg, tier_name, task_class) or "")
+            for tier_name in ("light", "medium", "heavy")
+        },
+        "provider_summary": provider_module.model_summary(cfg, task_class),
+        "pass_overrides": pass_overrides or [],
+    }
     _run_sig = hashlib.sha256(
-        "\n".join([
-            str(question),
-            str(passes),
-            str(task_class),
-            repr(directives),
-            str(mandate_prefix),
-            str(cfg.data_policy),
-        ]).encode()
+        json.dumps(_run_sig_payload, sort_keys=True, default=str).encode()
     ).hexdigest()
 
+    # Resume from contiguous cached pass history when job_id is present.
+    start_pass = 1
+    if job_id:
+        cached_passes = await asyncio.to_thread(
+            store.get_pass_history,
+            job_id,
+            perspective_name,
+            _run_sig,
+        )
+        if cached_passes:
+            for cached in cached_passes:
+                pass_results.append(
+                    _build_pass_result(
+                        pass_num=int(cached["pass_num"]),
+                        framing=str(cached.get("framing") or ""),
+                        tier=str(cached.get("tier") or ""),
+                        provider=str(cached.get("provider") or ""),
+                        model=str(cached.get("model_used") or ""),
+                        output=str(cached.get("output") or ""),
+                    )
+                )
+                validation_results.append(None)
+            start_pass = len(cached_passes) + 1
+            log.info(
+                "Resuming job %s perspective=%s from pass %d/%d (replayed %d cached passes)",
+                job_id,
+                perspective_name or "main",
+                start_pass,
+                passes,
+                len(cached_passes),
+            )
+
     # Execute passes
-    for pass_num in range(1, passes + 1):
+    for pass_num in range(start_pass, passes + 1):
         log.info(f"Pass {pass_num}/{passes}")
         
         # Check if this pass has overrides
@@ -871,15 +1045,16 @@ async def deep_think_passes(
         else:
             mandate_block = f"{mandate_prefix}\n\n" if mandate_prefix else ""
             evidence_block = (
-                f"\n\n## TOOL EVIDENCE (use this to ground your response — do NOT cite locations not listed here)\n{pre_fetched_evidence}"
+                f"## TOOL EVIDENCE (ground your response in this — only cite locations listed here)\n"
+                f"{pre_fetched_evidence}\n\n"
                 if pre_fetched_evidence else ""
             )
-            system_prompt = f"""{mandate_block}You are an expert reasoner. Apply this framing strictly:
+            system_prompt = f"""{mandate_block}{evidence_block}You are an expert reasoner. Apply this framing strictly:
 
 {framing_text}
 
 Use the mandate to structure your response. Be precise and evidence-based.
-Do NOT replace or invent the question. Answer only the provided question/context.{evidence_block}"""
+Do NOT replace or invent the question. Answer only the provided question/context."""
         
         user_prompt = f"Question: {question}"
         
@@ -889,7 +1064,7 @@ Do NOT replace or invent the question. Answer only the provided question/context
         
         override_provider = pass_override.get("provider") if pass_override else None
         provider_name = override_provider or provider_module._tier_provider(cfg, tier)
-        
+
         override_model = pass_override.get("model") if pass_override else None
         model_name = override_model or (model or provider_module._model_for_tier(cfg, tier, task_class))
         log.info(f"deep_think_passes: pass {pass_num} model_name='{model_name}' for tier={tier}, task_class={task_class}, provider={provider_name}")
@@ -907,7 +1082,7 @@ Do NOT replace or invent the question. Answer only the provided question/context
                 system=system_prompt,
                 user_prompt=user_prompt,
                 tier=tier,
-                provider_config=provider_config,
+                provider_config=provider_call_config,
             )
 
             # Extract and validate claims
@@ -1094,25 +1269,26 @@ def _validate_synthesis_grounding(
     return inference_only, warnings
 
 
-def _fan_out_parse_json(text: str) -> dict | None:
+def _fan_out_parse_json_with_error(text: str) -> tuple[dict | None, str | None]:
     """Extract a JSON object from model output, stripping markdown fences."""
-    text = text.strip()
+    text = (text or "").strip()
+    parse_error: Optional[str] = None
     try:
-        return json.loads(text)
-    except Exception:
-        pass
+        return json.loads(text), None
+    except Exception as exc:
+        parse_error = str(exc)
     if "```json" in text:
         inner = text.split("```json", 1)[1].split("```", 1)[0].strip()
         try:
-            return json.loads(inner)
-        except Exception:
-            pass
+            return json.loads(inner), None
+        except Exception as exc:
+            parse_error = str(exc)
     if "```" in text:
         inner = text.split("```", 1)[1].split("```", 1)[0].strip()
         try:
-            return json.loads(inner)
-        except Exception:
-            pass
+            return json.loads(inner), None
+        except Exception as exc:
+            parse_error = str(exc)
     start = text.find("{")
     if start != -1:
         depth = 0
@@ -1123,10 +1299,165 @@ def _fan_out_parse_json(text: str) -> dict | None:
                 depth -= 1
                 if depth == 0:
                     try:
-                        return json.loads(text[start : i + 1])
-                    except Exception:
+                        return json.loads(text[start : i + 1]), None
+                    except Exception as exc:
+                        parse_error = str(exc)
                         break
-    return None
+    return None, parse_error or "no JSON object found"
+
+
+def _fan_out_parse_json(text: str) -> dict | None:
+    parsed, _ = _fan_out_parse_json_with_error(text)
+    return parsed
+
+
+def _normalize_percentage_confidence(value: Any) -> int | None:
+    """Normalize confidence_score to integer [0,100], returning None if invalid."""
+    try:
+        if isinstance(value, bool):
+            return None
+        raw = str(value).strip() if isinstance(value, str) else value
+        if isinstance(raw, str):
+            if not raw:
+                return None
+            raw = raw.rstrip("%").strip()
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            return None
+        return max(0, min(100, int(parsed)))
+    except Exception:
+        return None
+
+
+def _normalize_synthesis_structured(parsed: dict | None) -> tuple[dict, list[str]]:
+    """Validate synthesis JSON fields and apply conservative defaults."""
+    warnings: list[str] = []
+    normalized: dict[str, Any] = {
+        "confidence_score": 0,
+        "converged_claims": [],
+        "contested_areas": [],
+        "gaps": [],
+        "final_answer": "",
+    }
+    if not isinstance(parsed, dict):
+        warnings.append("synthesis output did not parse as JSON")
+        normalized["contested_areas"] = ["Synthesis JSON malformed/unstructured; confidence downgraded."]
+        return normalized, warnings
+
+    raw_conf = parsed.get("confidence_score")
+    normalized_conf = _normalize_percentage_confidence(raw_conf)
+    if normalized_conf is not None:
+        normalized["confidence_score"] = normalized_conf
+    else:
+        warnings.append("synthesis confidence_score missing or invalid; defaulting to 0")
+
+    for key in ("converged_claims", "contested_areas", "gaps"):
+        val = parsed.get(key, [])
+        if isinstance(val, list):
+            normalized[key] = [str(item).strip() for item in val if str(item).strip()]
+        elif val in ("", None):
+            normalized[key] = []
+        else:
+            warnings.append(f"synthesis field '{key}' malformed; coerced to empty list")
+            normalized[key] = []
+
+    final_answer = parsed.get("final_answer", "")
+    if isinstance(final_answer, str):
+        normalized["final_answer"] = final_answer.strip()
+    elif final_answer is None:
+        normalized["final_answer"] = ""
+    else:
+        warnings.append("synthesis final_answer malformed; coerced to string")
+        normalized["final_answer"] = str(final_answer).strip()
+
+    return normalized, warnings
+
+
+def _build_fan_out_perspectives_text(
+    *,
+    successes: list[dict],
+    extract_claims: bool,
+    claim_sets: list[dict],
+    extraction_warnings: list[str],
+    alarm_signals: list[dict],
+) -> str:
+    """Build bounded perspective payload for synthesis prompt."""
+    sections: list[str] = []
+    if extract_claims and claim_sets and len(claim_sets) >= len(successes):
+        for p, cs in zip(successes, claim_sets):
+            evidence = _truncate_text(
+                p.get("evidence_summary", ""),
+                _MAX_EVIDENCE_SUMMARY_CHARS,
+                label=f"{p.get('name', 'perspective')} evidence",
+            )
+            claims = []
+            for claim in (cs.get("claims") or [])[:_MAX_CLAIMS_PER_PERSPECTIVE]:
+                confidence = claim.get("confidence")
+                try:
+                    conf_pct = f"{float(confidence):.0%}"
+                except Exception:
+                    conf_pct = "0%"
+                claim_text = _truncate_text(claim.get("claim", ""), _MAX_CLAIM_TEXT_CHARS, label="claim")
+                evidence_basis = _truncate_text(
+                    claim.get("evidence_basis", "asserted"),
+                    _MAX_EVIDENCE_BASIS_CHARS,
+                    label="evidence basis",
+                ) or "asserted"
+                claims.append(f"  - [{conf_pct}] {claim_text} (basis: {evidence_basis})")
+            uncertainties = [
+                f"  ? {_truncate_text(u, _MAX_UNCERTAINTY_CHARS, label='uncertainty')}"
+                for u in (cs.get("key_uncertainties") or [])[:_MAX_UNCERTAINTIES_PER_PERSPECTIVE]
+            ]
+            extraction_status = cs.get("extractor_error")
+            extraction_line = (
+                f"EXTRACTION_STATUS: FAILED ({extraction_status})"
+                if extraction_status
+                else "EXTRACTION_STATUS: OK"
+            )
+            section = (
+                f"=== {str(p.get('name', 'unknown')).upper()} PERSPECTIVE ===\n"
+                f"{extraction_line}\n"
+                f"VERDICT: {_truncate_text(cs.get('verdict', '(none)'), _MAX_VERDICT_CHARS, label='verdict')}\n"
+                f"CLAIMS:\n{chr(10).join(claims) if claims else '  (no claims extracted)'}\n"
+                f"UNCERTAINTIES:\n{chr(10).join(uncertainties) if uncertainties else '  (none flagged)'}"
+            )
+            if evidence:
+                section += f"\nTOOL EVIDENCE:\n{evidence}"
+            sections.append(_truncate_text(section, _MAX_PERSPECTIVE_PAYLOAD_CHARS, label=f"{p.get('name', 'perspective')} payload"))
+    else:
+        for p in successes:
+            answer = _truncate_text(
+                p.get("final_answer", ""),
+                _MAX_PERSPECTIVE_PAYLOAD_CHARS - _MAX_EVIDENCE_SUMMARY_CHARS,
+                label=f"{p.get('name', 'perspective')} analysis",
+            )
+            evidence = _truncate_text(
+                p.get("evidence_summary", ""),
+                _MAX_EVIDENCE_SUMMARY_CHARS,
+                label=f"{p.get('name', 'perspective')} evidence",
+            )
+            section = f"=== {str(p.get('name', 'unknown')).upper()} PERSPECTIVE ===\n{answer}"
+            if evidence:
+                section += f"\n\nTOOL EVIDENCE:\n{evidence}"
+            sections.append(_truncate_text(section, _MAX_PERSPECTIVE_PAYLOAD_CHARS, label=f"{p.get('name', 'perspective')} payload"))
+
+    perspectives_text = "\n\n".join(sections)
+    if extraction_warnings:
+        warn_block = "\n".join(f"- {w}" for w in extraction_warnings[:8])
+        perspectives_text = f"CLAIM EXTRACTION WARNINGS:\n{warn_block}\n\n{perspectives_text}"
+    if alarm_signals:
+        alarm_preamble = (
+            "⚠️ CONTRADICTION ALERTS — the following factual conflicts were detected "
+            "between perspectives. Address each explicitly in your synthesis:\n"
+        )
+        for i, sig in enumerate(alarm_signals, 1):
+            alarm_preamble += (
+                f"\n{i}. CLAIM: {sig.get('claim', '?')}\n"
+                f"   {sig.get('perspective_a', '?')} says: {sig.get('says_a', '?')}\n"
+                f"   {sig.get('perspective_b', '?')} says: {sig.get('says_b', '?')}\n"
+            )
+        perspectives_text = alarm_preamble + "\n\n" + perspectives_text
+    return _truncate_text(perspectives_text, _MAX_SYNTHESIS_PROMPT_CHARS, label="fan-out synthesis context")
 
 
 async def _fan_out_alarm_scan(question, successes, cfg, task_class, provider_config):
@@ -1159,8 +1490,15 @@ async def _fan_out_alarm_scan(question, successes, cfg, task_class, provider_con
 async def _fan_out_extract_claims(perspective_name, analysis_text, cfg, task_class, provider_config):
     """Distil perspective prose into structured claim set for synthesis compression."""
     if not analysis_text or not analysis_text.strip():
-        return {"claims": [], "verdict": "", "key_uncertainties": []}
-    prompt = _CLAIM_EXTRACTION_PROMPT.format(analysis=analysis_text[:4000])
+        return {
+            "claims": [],
+            "verdict": "",
+            "key_uncertainties": [],
+            "extractor_error": "empty_analysis_text",
+        }
+    prompt = _CLAIM_EXTRACTION_PROMPT.format(
+        analysis=_truncate_text(analysis_text, 4000, label=f"{perspective_name} analysis"),
+    )
     try:
         provider = provider_module._tier_provider(cfg, "light")
         model = provider_module._model_for_tier(cfg, "light", "extraction")
@@ -1170,13 +1508,42 @@ async def _fan_out_extract_claims(perspective_name, analysis_text, cfg, task_cla
             user_prompt=prompt,
             tier="light", provider_config=provider_config,
         )
-        parsed = _fan_out_parse_json(raw)
+        parsed, parse_error = _fan_out_parse_json_with_error(raw)
         if parsed and isinstance(parsed.get("claims"), list):
-            return parsed
-        return {"claims": [], "verdict": raw[:200], "key_uncertainties": []}
+            claims = []
+            for c in parsed.get("claims", [])[:_MAX_CLAIMS_PER_PERSPECTIVE]:
+                claims.append({
+                    "claim": _truncate_text(c.get("claim", ""), _MAX_CLAIM_TEXT_CHARS, label="claim"),
+                    "confidence": c.get("confidence", 0.0),
+                    "evidence_basis": _truncate_text(
+                        c.get("evidence_basis", "asserted: no tool evidence"),
+                        _MAX_EVIDENCE_BASIS_CHARS,
+                        label="evidence basis",
+                    ),
+                })
+            return {
+                "claims": claims,
+                "verdict": _truncate_text(parsed.get("verdict", ""), _MAX_VERDICT_CHARS, label="verdict"),
+                "key_uncertainties": [
+                    _truncate_text(u, _MAX_UNCERTAINTY_CHARS, label="uncertainty")
+                    for u in (parsed.get("key_uncertainties", []) or [])[:_MAX_UNCERTAINTIES_PER_PERSPECTIVE]
+                ],
+                "extractor_error": "",
+            }
+        return {
+            "claims": [],
+            "verdict": _truncate_text(raw, 200, label="extractor raw"),
+            "key_uncertainties": [],
+            "extractor_error": f"claim_extraction_parse_failed: {parse_error or 'unknown'}",
+        }
     except Exception as exc:
         log.warning("Claim extraction failed for %s (non-fatal): %s", perspective_name, exc)
-        return {"claims": [], "verdict": "", "key_uncertainties": []}
+        return {
+            "claims": [],
+            "verdict": "",
+            "key_uncertainties": [],
+            "extractor_error": f"claim_extraction_exception: {exc}",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1321,6 +1688,9 @@ async def run_fan_out(
     tool_mode_enabled = bool(enable_tool_use) and (
         topology == "adaptive" or resolved_class == "code_review"
     )
+    # Explicit strategy: perspective cache is disabled for tool-enabled runs.
+    # Pre-fetched evidence can vary run-to-run and is not part of cache keying.
+    perspective_cache_enabled = not tool_mode_enabled
     adaptive_cfg = adaptive_config or {}
     max_tools_global = int(adaptive_cfg.get("max_tool_calls_global", 20))
     max_tools_per_perspective = int(adaptive_cfg.get("max_tool_calls_per_perspective", 5))
@@ -1403,6 +1773,7 @@ async def run_fan_out(
                 task_class=resolved_class,
                 job_id=job_id,
                 web_domain_whitelist=web_domain_whitelist or [],
+                data_policy=data_policy,
             )
             tools_invoked = [tool["tool_name"] for tool in queued_tools]
             if evidence_digest is None:
@@ -1424,30 +1795,48 @@ async def run_fan_out(
         mandate_text = f"[Perspective: {name.upper()}]\n{mandate['mandate']}"
         cache_key = _perspective_cache_key(mandate_text, perspective_cfg)
 
-        cached = await asyncio.to_thread(store.get_perspective_cache, cache_key)
+        cached = None
+        if perspective_cache_enabled:
+            cached = await asyncio.to_thread(store.get_perspective_cache, cache_key)
         if cached and cached.get("final_answer"):
-            log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
-            tools_invoked: list[str] = []
-            tool_errors: list[str] = []
-            evidence_summary = ""
-            if tool_mode_enabled:
-                tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(
-                    name, cached["final_answer"], 0.5,
+            cache_answer = str(cached.get("final_answer", ""))
+            cache_ok, cache_reject_reason = _passes_cached_answer_quality_gate(question, cache_answer)
+            if not cache_ok:
+                cache_outcome = "cache_quality_rejected"
+                if str(cache_reject_reason).startswith("off_topic:"):
+                    cache_outcome = "cache_off_topic_rejected"
+                log.info(
+                    "Fan-out perspective %s: cache REJECTED (key=%s..., reason=%s)",
+                    name, cache_key[:12], cache_reject_reason,
                 )
-            if job_id:
-                await asyncio.to_thread(
-                    store.set_pass_cache,
-                    job_id, name, 1, cache_key,
-                    "perspective_cache_hit", "cached", "cached", "cached",
-                    cached["final_answer"],
+                _log_off_topic_event(
+                    stage="cache_gate",
+                    outcome=cache_outcome,
+                    reason=cache_reject_reason,
+                    perspective=name,
                 )
-            return {
-                "name": name, "status": "complete",
-                "final_answer": cached["final_answer"],
-                "passes_run": cached["passes_run"],
-                "cache_hit": True,
-                "tools_invoked": tools_invoked, "tool_errors": tool_errors, "evidence_summary": evidence_summary,
-            }
+            else:
+                log.info("Fan-out perspective %s: cache HIT (key=%s...)", name, cache_key[:12])
+                _log_off_topic_event(
+                    stage="cache_gate",
+                    outcome="cache_accepted",
+                    reason="",
+                    perspective=name,
+                )
+                if job_id:
+                    await asyncio.to_thread(
+                        store.set_pass_cache,
+                        job_id, name, 1, cache_key,
+                        "perspective_cache_hit", "cached", "cached", "cached",
+                        cache_answer,
+                    )
+                return {
+                    "name": name, "status": "complete",
+                    "final_answer": cache_answer,
+                    "passes_run": cached["passes_run"],
+                    "cache_hit": True,
+                    "tools_invoked": [], "tool_errors": [], "evidence_summary": "",
+                }
 
         async with sem:
             log.debug("Fan-out perspective starting: %s (slot=%d provider=%s)",
@@ -1460,24 +1849,68 @@ async def run_fan_out(
             pre_tool_errors: list[str] = []
             pre_evidence = ""
             if tool_mode_enabled:
-                pre_query = _build_tool_query(question, mandate_text)
+                pre_query = _build_tool_query(question, "")   # question only, no mandate bloat
                 pre_tools_invoked, pre_tool_errors, pre_evidence = await _run_tool_phase(
                     name, "", 0.5, query_override=pre_query
                 )
 
-            r = await deep_think_passes(
-                question=question,
-                passes=height,
-                provider_config=perspective_pc,
-                task_class=resolved_class,
-                data_policy=data_policy,
-                mandate_prefix=mandate_text,
-                job_id=job_id,
-                perspective_name=name,
-                force_local_models=force_local_models,
-                device_id=device_id,
-                pre_fetched_evidence=pre_evidence,
-            )
+            max_off_topic_retries = _OFF_TOPIC_RETRY_LIMIT
+            retry_attempt = 0
+            while True:
+                run_name = name if retry_attempt == 0 else f"{name}_offtopic_retry_{retry_attempt}"
+                r = await deep_think_passes(
+                    question=question,
+                    passes=height,
+                    provider_config=perspective_pc,
+                    task_class=resolved_class,
+                    data_policy=data_policy,
+                    mandate_prefix=mandate_text,
+                    job_id=job_id,
+                    perspective_name=run_name,
+                    force_local_models=force_local_models,
+                    device_id=device_id,
+                    pre_fetched_evidence=pre_evidence,
+                )
+
+                if not isinstance(r, dict):
+                    break
+                if str(r.get("status") or "failed") != "complete":
+                    break
+                candidate_answer = str(r.get("final_answer") or "").strip()
+                if not candidate_answer:
+                    break
+                off_topic, off_topic_reason = _is_off_topic_response(question, candidate_answer)
+                if not off_topic:
+                    if retry_attempt > 0:
+                        _log_off_topic_event(
+                            stage="perspective",
+                            outcome="retry_recovered",
+                            reason="recovered_with_on_topic_answer",
+                            perspective=name,
+                            attempt=retry_attempt,
+                            max_retries=max_off_topic_retries,
+                        )
+                    break
+
+                _log_off_topic_event(
+                    stage="perspective",
+                    outcome="detected",
+                    reason=off_topic_reason,
+                    perspective=name,
+                    attempt=retry_attempt,
+                    max_retries=max_off_topic_retries,
+                )
+                if retry_attempt >= max_off_topic_retries:
+                    break
+                retry_attempt += 1
+                _log_off_topic_event(
+                    stage="perspective",
+                    outcome="retry_scheduled",
+                    reason=off_topic_reason,
+                    perspective=name,
+                    attempt=retry_attempt,
+                    max_retries=max_off_topic_retries,
+                )
 
         child_status = "complete"
         child_error = None
@@ -1488,7 +1921,7 @@ async def run_fan_out(
             final_answer = r.get("final_answer", "")
             passes_run = len(r.get("pass_results", []))
             raw_conf = r.get("confidence", 0.5)
-            perspective_confidence = max(0.0, min(1.0, float(raw_conf) if raw_conf else 0.5))
+            perspective_confidence = _normalize_unit_confidence(raw_conf, default=0.5)
         else:
             final_answer = str(r)
             passes_run = height
@@ -1496,6 +1929,14 @@ async def run_fan_out(
         if child_status == "complete" and isinstance(final_answer, str) and final_answer.strip():
             off_topic, off_topic_reason = _is_off_topic_response(question, final_answer)
             if off_topic:
+                _log_off_topic_event(
+                    stage="perspective",
+                    outcome="rejected",
+                    reason=off_topic_reason,
+                    perspective=name,
+                    attempt=retry_attempt,
+                    max_retries=_OFF_TOPIC_RETRY_LIMIT,
+                )
                 child_status = "failed"
                 child_error = f"off_topic_response: {off_topic_reason}"
                 tools_invoked, tool_errors, evidence_summary = [], [], ""
@@ -1517,10 +1958,11 @@ async def run_fan_out(
             else:
                 tools_invoked, tool_errors, evidence_summary = await _run_tool_phase(name, final_answer, perspective_confidence)
             perspective_model_sig = provider_module.model_summary(perspective_cfg, resolved_class)
-            await asyncio.to_thread(
-                store.set_perspective_cache,
-                cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
-            )
+            if perspective_cache_enabled:
+                await asyncio.to_thread(
+                    store.set_perspective_cache,
+                    cache_key, name, final_answer, perspective_model_sig, passes_run, job_id,
+                )
         else:
             tools_invoked, tool_errors, evidence_summary = [], [], ""
             if child_error is None and child_status != "complete":
@@ -1552,6 +1994,23 @@ async def run_fan_out(
     )
 
     perspective_outputs: list = []
+
+    def _contain_adversarial_perspective_output(perspective_result: dict) -> dict:
+        name = str(perspective_result.get("name", "")).strip().lower()
+        text = perspective_result.get("final_answer")
+        if not isinstance(text, str) or not text:
+            return perspective_result
+        needs_containment = (base_task_class == "adversarial") or (name == "adversarial")
+        if not needs_containment:
+            return perspective_result
+        filtered = filter_adversarial_output(text, job_id=job_id)
+        if filtered != text:
+            contained = dict(perspective_result)
+            contained["final_answer"] = filtered
+            contained["adversarial_filtered"] = True
+            return contained
+        return perspective_result
+
     for mandate, result in zip(mandates, raw_results):
         if isinstance(result, Exception):
             log.error("Fan-out perspective %s failed: %s", mandate["name"], result)
@@ -1561,7 +2020,7 @@ async def run_fan_out(
                 "tools_invoked": [], "tool_errors": [], "evidence_summary": "",
             })
         else:
-            perspective_outputs.append(result)
+            perspective_outputs.append(_contain_adversarial_perspective_output(result))
 
     def _format_perspective_output(p: dict) -> dict:
         synthesis_text = p.get("final_answer")
@@ -1648,6 +2107,7 @@ async def run_fan_out(
 
     # Optional claim extraction before synthesis
     claim_sets: list = []
+    claim_extraction_warnings: list[str] = []
     if extract_claims and len(successes) >= 1:
         extract_tasks = [
             _fan_out_extract_claims(p["name"], p["final_answer"] or "", cfg, resolved_class, _pc)
@@ -1655,53 +2115,30 @@ async def run_fan_out(
         ]
         claim_sets = list(await asyncio.gather(*extract_tasks, return_exceptions=False))
         claim_sets = [
-            cs if isinstance(cs, dict) else {"claims": [], "verdict": "", "key_uncertainties": []}
+            cs if isinstance(cs, dict) else {"claims": [], "verdict": "", "key_uncertainties": [], "extractor_error": "claim_extraction_non_dict_result"}
             for cs in claim_sets
         ]
+        claim_extraction_warnings = [
+            f"{successes[i].get('name', f'perspective-{i + 1}')}: {cs.get('extractor_error')}"
+            for i, cs in enumerate(claim_sets)
+            if cs.get("extractor_error")
+        ]
+        if claim_extraction_warnings:
+            log.warning(
+                "Claim extraction warnings: %s",
+                "; ".join(claim_extraction_warnings[:8]),
+            )
         log.info("Claim extraction: %d perspectives, total claims=%d",
                  len(claim_sets), sum(len(cs.get("claims", [])) for cs in claim_sets))
 
     # Build synthesis prompt
-    if extract_claims and claim_sets:
-        compact_parts = []
-        for p, cs in zip(successes, claim_sets):
-            evidence_block = f"\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else ""
-            claims_fmt = "\n".join(
-                f"  - [{(c.get('confidence') or 0):.0%}] {c.get('claim', '')} "
-                f"(basis: {c.get('evidence_basis', 'asserted') or 'asserted'})"
-                for c in cs.get("claims", [])
-            )
-            uncertainties_fmt = (
-                "\n".join(f"  ? {u}" for u in cs.get("key_uncertainties", []))
-                or "  (none flagged)"
-            )
-            compact_parts.append(
-                f"=== {p['name'].upper()} PERSPECTIVE ===\n"
-                f"VERDICT: {cs.get('verdict', '(none)')}\n"
-                f"CLAIMS:\n{claims_fmt or '  (no claims extracted)'}\n"
-                f"UNCERTAINTIES:\n{uncertainties_fmt}"
-                f"{evidence_block}"
-            )
-        perspectives_text = "\n\n".join(compact_parts)
-    else:
-        perspectives_text = "\n\n".join(
-            f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
-            + (f"\n\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else "")
-            for p in successes
-        )
-
-    if alarm_signals:
-        alarm_preamble = (
-            "⚠️ CONTRADICTION ALERTS — the following factual conflicts were detected "
-            "between perspectives. Address each explicitly in your synthesis:\n"
-        )
-        for i, sig in enumerate(alarm_signals, 1):
-            alarm_preamble += (
-                f"\n{i}. CLAIM: {sig.get('claim', '?')}\n"
-                f"   {sig.get('perspective_a', '?')} says: {sig.get('says_a', '?')}\n"
-                f"   {sig.get('perspective_b', '?')} says: {sig.get('says_b', '?')}\n"
-            )
-        perspectives_text = alarm_preamble + "\n\n" + perspectives_text
+    perspectives_text = _build_fan_out_perspectives_text(
+        successes=successes,
+        extract_claims=extract_claims,
+        claim_sets=claim_sets,
+        extraction_warnings=claim_extraction_warnings,
+        alarm_signals=alarm_signals,
+    )
 
     synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
         n=len(successes), question=question, perspectives=perspectives_text,
@@ -1769,25 +2206,35 @@ async def run_fan_out(
     )
 
     raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
-    synthesis_structured = _fan_out_parse_json(raw_answer)
-    if synthesis_structured:
-        synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+    synthesis_structured_raw, synthesis_parse_error = _fan_out_parse_json_with_error(raw_answer)
+    synthesis_structured, synthesis_parse_warnings = _normalize_synthesis_structured(synthesis_structured_raw)
+    if synthesis_structured_raw:
+        synthesis_text = synthesis_structured.get("final_answer") or raw_answer
         log.debug("Fan-out synthesis parsed: confidence=%s contested=%d converged=%d",
                   synthesis_structured.get("confidence_score"),
                   len(synthesis_structured.get("contested_areas", [])),
                   len(synthesis_structured.get("converged_claims", [])))
     else:
-        log.warning("Fan-out: synthesis JSON parse failed — falling back to plain text")
+        log.warning(
+            "Fan-out: synthesis JSON parse failed (%s) — applying guarded defaults",
+            synthesis_parse_error,
+        )
         synthesis_text = raw_answer
 
     synthesis_status, synthesis_error, synthesis_healthy = _assess_synthesis_health(
         synthesis_result, synthesis_text
     )
+    if (not synthesis_structured_raw) and not synthesis_error:
+        synthesis_error = f"synthesis JSON parse failed: {synthesis_parse_error or 'unknown'}"
 
-    confidence_score = synthesis_structured.get("confidence_score") if synthesis_structured else None
-    converged_claims = synthesis_structured.get("converged_claims", []) if synthesis_structured else []
-    contested_areas = synthesis_structured.get("contested_areas", []) if synthesis_structured else []
-    gaps = synthesis_structured.get("gaps", []) if synthesis_structured else []
+    confidence_score = synthesis_structured.get("confidence_score")
+    converged_claims = synthesis_structured.get("converged_claims", [])
+    contested_areas = synthesis_structured.get("contested_areas", [])
+    gaps = synthesis_structured.get("gaps", [])
+    if synthesis_parse_warnings:
+        for warning in synthesis_parse_warnings:
+            if warning not in gaps:
+                gaps.append(warning)
 
     # Adaptive expansion
     adaptive_triggered = False
@@ -1834,7 +2281,7 @@ async def run_fan_out(
                 log.error("Adaptive perspective %s failed: %s", mandate["name"], result)
                 extra_outputs.append({"name": mandate["name"], "status": "failed", "error": str(result), "final_answer": None})
             else:
-                extra_outputs.append(result)
+                extra_outputs.append(_contain_adversarial_perspective_output(result))
 
         extra_successes = [p for p in extra_outputs if p["status"] == "complete" and p["final_answer"]]
         all_successes = successes + extra_successes
@@ -1843,20 +2290,13 @@ async def run_fan_out(
 
         if extra_successes:
             alarm_signals = await _fan_out_alarm_scan(question, all_successes, cfg, resolved_class, _pc)
-            perspectives_text = "\n\n".join(
-                f"=== {p['name'].upper()} PERSPECTIVE ===\n{p['final_answer']}"
-                + (f"\n\nTOOL EVIDENCE:\n{p['evidence_summary']}" if p.get("evidence_summary") else "")
-                for p in all_successes
+            perspectives_text = _build_fan_out_perspectives_text(
+                successes=all_successes,
+                extract_claims=extract_claims,
+                claim_sets=claim_sets,
+                extraction_warnings=claim_extraction_warnings,
+                alarm_signals=alarm_signals,
             )
-            if alarm_signals:
-                alarm_preamble = "⚠️ CONTRADICTION ALERTS:\n"
-                for i, sig in enumerate(alarm_signals, 1):
-                    alarm_preamble += (
-                        f"{i}. {sig.get('claim','?')}: "
-                        f"{sig.get('perspective_a','?')} says '{sig.get('says_a','?')}' vs "
-                        f"{sig.get('perspective_b','?')} says '{sig.get('says_b','?')}'\n"
-                    )
-                perspectives_text = alarm_preamble + "\n\n" + perspectives_text
 
             synthesis_question = _FAN_OUT_SYNTHESIS_PROMPT.format(
                 n=len(all_successes), question=question, perspectives=perspectives_text,
@@ -1867,18 +2307,33 @@ async def run_fan_out(
                 perspective_name="synthesis_adaptive",
             )
             raw_answer = synthesis_result.get("final_answer", "") if isinstance(synthesis_result, dict) else str(synthesis_result)
-            synthesis_structured = _fan_out_parse_json(raw_answer)
-            if synthesis_structured:
-                synthesis_text = synthesis_structured.get("final_answer", raw_answer)
+            synthesis_structured_raw, synthesis_parse_error = _fan_out_parse_json_with_error(raw_answer)
+            synthesis_structured, synthesis_parse_warnings = _normalize_synthesis_structured(synthesis_structured_raw)
+            if synthesis_structured_raw:
+                synthesis_text = synthesis_structured.get("final_answer") or raw_answer
                 confidence_score = synthesis_structured.get("confidence_score")
                 converged_claims = synthesis_structured.get("converged_claims", [])
                 contested_areas = synthesis_structured.get("contested_areas", [])
                 gaps = synthesis_structured.get("gaps", [])
+                if synthesis_parse_warnings:
+                    for warning in synthesis_parse_warnings:
+                        if warning not in gaps:
+                            gaps.append(warning)
             else:
                 synthesis_text = raw_answer
+                confidence_score = 0
+                converged_claims = []
+                contested_areas = ["Synthesis JSON malformed/unstructured after adaptive expansion."]
+                if f"synthesis output did not parse as JSON ({synthesis_parse_error or 'unknown'})" not in gaps:
+                    gaps.append(f"synthesis output did not parse as JSON ({synthesis_parse_error or 'unknown'})")
             synthesis_status, synthesis_error, synthesis_healthy = _assess_synthesis_health(
                 synthesis_result, synthesis_text
             )
+            if (not synthesis_structured_raw) and not synthesis_error:
+                synthesis_error = f"synthesis JSON parse failed: {synthesis_parse_error or 'unknown'}"
+
+    if base_task_class == "adversarial" and synthesis_text:
+        synthesis_text = filter_adversarial_output(synthesis_text, job_id=job_id)
 
     cache_hits = sum(1 for p in perspective_outputs if p.get("cache_hit"))
     tools_invoked_total = sum(len(p.get("tools_invoked", [])) for p in perspective_outputs)
@@ -1949,12 +2404,13 @@ async def run_fan_out(
             for p in perspective_outputs
         ],
         "claim_sets": claim_sets if extract_claims else [],
+        "claim_extraction_warnings": claim_extraction_warnings if extract_claims else [],
         "topology": topology,
         "adaptive_config": adaptive_config or {},
         "enable_tool_use": enable_tool_use,
         "tool_evidence_weight": tool_evidence_weight,
         "final_answer": synthesis_text,
-        "confidence": float(confidence_score) / 100.0 if confidence_score is not None else 0.7,
+        "confidence": float(confidence_score) / 100.0 if confidence_score is not None else 0.0,
         "duration_secs": duration,
         "perspective_outputs": {p["name"]: _format_perspective_output(p) for p in perspective_outputs},
     }

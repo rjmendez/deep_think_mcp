@@ -5,8 +5,11 @@ that may be sent by FastMCP or other upstream systems.
 """
 
 import logging
+from typing import Optional
 
 log = logging.getLogger(__name__)
+
+MAX_QUESTION_LENGTH = 10000
 
 
 class ValidationError(ValueError):
@@ -135,3 +138,85 @@ def validate_height(value) -> int:
         log.warning(f"height parameter adjusted from {value} to {height}")
     
     return height
+
+
+def validate_question(value, *, max_length: int = MAX_QUESTION_LENGTH) -> str:
+    """Validate and normalize question-like input fields."""
+    if not isinstance(value, str):
+        raise ValidationError(f"question must be a string, got {type(value).__name__}")
+
+    question = value.strip()
+    if not question:
+        raise ValidationError("question must not be empty")
+    if len(question) > max_length:
+        raise ValidationError(f"question exceeds maximum length ({max_length} characters)")
+    return question
+
+
+def validate_adaptive_config(value) -> Optional[dict]:
+    """Validate adaptive fan-out tool-loop config shape and scalar types."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("adaptive_config must be an object")
+
+    allowed_keys = {
+        "max_tool_calls_global",
+        "max_tool_calls_per_perspective",
+        "tool_timeout",
+    }
+    unknown_keys = sorted(set(value.keys()) - allowed_keys)
+    if unknown_keys:
+        raise ValidationError(
+            f"adaptive_config has unsupported keys: {', '.join(unknown_keys)}"
+        )
+
+    validated = {}
+    for key, raw in value.items():
+        if isinstance(raw, bool):
+            raise ValidationError(f"adaptive_config.{key} must be an integer")
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"adaptive_config.{key} must be an integer: {exc}")
+        if key == "tool_timeout" and parsed < 1:
+            raise ValidationError("adaptive_config.tool_timeout must be >= 1")
+        if key != "tool_timeout" and parsed < 0:
+            raise ValidationError(f"adaptive_config.{key} must be >= 0")
+        validated[key] = parsed
+
+    return validated
+
+
+def validate_web_domain_whitelist(value) -> list[str]:
+    """Validate optional list of domains for web-search/domain filtering."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError("web_domain_whitelist must be an array of domains")
+
+    normalized: list[str] = []
+    for idx, domain in enumerate(value):
+        if not isinstance(domain, str):
+            raise ValidationError(
+                f"web_domain_whitelist[{idx}] must be a string domain"
+            )
+        cleaned = domain.strip().lower()
+        if not cleaned:
+            raise ValidationError(
+                f"web_domain_whitelist[{idx}] must not be empty"
+            )
+        if "://" in cleaned or "/" in cleaned or ":" in cleaned or " " in cleaned:
+            raise ValidationError(
+                f"web_domain_whitelist[{idx}] must be a bare domain (no scheme/path/port)"
+            )
+        normalized.append(cleaned)
+
+    # Preserve order while deduplicating.
+    deduped: list[str] = []
+    seen = set()
+    for domain in normalized:
+        if domain not in seen:
+            deduped.append(domain)
+            seen.add(domain)
+    return deduped

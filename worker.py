@@ -13,8 +13,23 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 
-from .defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
+try:  # Package import path
+    from .defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
+    from . import engine, store
+    from .engine.creative import CreativeReasoningEngine
+    from .nova_factcheck.pipeline import VerificationPipeline
+    from . import metrics
+    from .logging_context import job_context
+except ImportError:  # Script import path
+    from defaults import DEFAULT_TOOL_EVIDENCE_WEIGHT
+    import engine
+    import store
+    from engine.creative import CreativeReasoningEngine
+    from nova_factcheck.pipeline import VerificationPipeline
+    import metrics
+    from logging_context import job_context
 
 # Load credentials from ~/.copilot/credentials at startup if not already in env
 def _load_credentials_at_startup():
@@ -38,19 +53,20 @@ def _load_credentials_at_startup():
 
 _load_credentials_at_startup()
 
-from . import engine, store
-from .engine.creative import CreativeReasoningEngine
-from .nova_factcheck.pipeline import VerificationPipeline
-from . import metrics
-
 _NOVA_VERIFY_ENABLED = os.getenv("DEEP_THINK_NOVA_VERIFY", "true").lower() not in ("0", "false", "no")
 _verification_pipeline = VerificationPipeline(enabled=_NOVA_VERIFY_ENABLED)
 
 log = logging.getLogger(__name__)
 
 _active_tasks: set[asyncio.Task] = set()
+_running_job_tasks: dict[str, asyncio.Task] = {}
+_runtime_worker_active = 0
+_runtime_worker_max = 0
+_runtime_worker_running = False
 
 _job_available = asyncio.Event()
+_TERMINAL_WRITE_MAX_ATTEMPTS = 3
+_TERMINAL_WRITE_BASE_DELAY_SECONDS = 0.05
 
 
 def notify_job_available() -> None:
@@ -62,10 +78,68 @@ def notify_job_available() -> None:
     _job_available.set()
 
 
+def cancel_running_job(job_id: str) -> bool:
+    """Cancel a running job task if it's currently active in this worker process."""
+    task = _running_job_tasks.get(job_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
 def _log_job_event(level: str, event: str, **fields) -> None:
     payload = {"event": event, **fields}
     message = json.dumps(payload, sort_keys=True, default=str)
     getattr(log, level)("job_event %s", message)
+
+
+def _normalize_result_payload(result: object) -> dict:
+    if isinstance(result, dict):
+        return result
+    payload = {"status": "complete", "output": result}
+    if isinstance(result, str):
+        payload["final_answer"] = result
+    try:
+        json.dumps(payload)
+    except TypeError:
+        payload["output"] = str(result)
+    return payload
+
+
+def _is_transient_terminal_write_error(exc: Exception) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return ("database is locked" in message) or ("database is busy" in message)
+
+
+async def _write_terminal_status_with_retry(write_fn, *args, **kwargs) -> None:
+    for attempt in range(1, _TERMINAL_WRITE_MAX_ATTEMPTS + 1):
+        try:
+            await asyncio.to_thread(write_fn, *args, **kwargs)
+            return
+        except Exception as exc:
+            is_retryable = _is_transient_terminal_write_error(exc)
+            if (not is_retryable) or attempt >= _TERMINAL_WRITE_MAX_ATTEMPTS:
+                raise
+            backoff = _TERMINAL_WRITE_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+            log.warning(
+                "Transient terminal write failure for %s (attempt %d/%d): %s",
+                getattr(write_fn, "__name__", "store_write"),
+                attempt,
+                _TERMINAL_WRITE_MAX_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(backoff)
+
+
+def get_worker_runtime() -> dict:
+    """Return runtime worker loop counters for health reporting."""
+    return {
+        "active_workers": _runtime_worker_active,
+        "max_workers": _runtime_worker_max,
+        "running": _runtime_worker_running,
+    }
 
 
 async def _run_job(job: dict) -> None:
@@ -74,7 +148,7 @@ async def _run_job(job: dict) -> None:
     data_policy = job.get("data_policy", "any")
     try:
         provider_config = json.loads(job.get("provider_config_json") or "{}")
-        
+
         # Extract job control params while preserving routing-critical overrides.
         task_class = provider_config.pop("task_class", job.get("task_class", "general"))
         data_policy_raw = provider_config.get("data_policy", job.get("data_policy", "any"))
@@ -90,7 +164,7 @@ async def _run_job(job: dict) -> None:
         dama_node_id = provider_config.pop("dama_node_id", "")
         dama_metric = provider_config.pop("dama_metric", "")
         web_domain_whitelist = provider_config.pop("web_domain_whitelist", [])
-        
+
         # Auto-enable local-only for MQTT operations
         if device_id or force_local_models:
             force_local_models = True
@@ -106,6 +180,11 @@ async def _run_job(job: dict) -> None:
             force_local_models=force_local_models,
             device_id=device_id or None,
         )
+        cancellation_error = await asyncio.to_thread(store.get_cancellation_error, job_id)
+        if cancellation_error:
+            await _write_terminal_status_with_retry(store.fail_job, job_id, cancellation_error)
+            _log_job_event("info", "job_cancelled_before_start", job_id=job_id, reason=cancellation_error)
+            return
 
         raw_timeout_secs = job.get("timeout_secs")
         try:
@@ -126,40 +205,40 @@ async def _run_job(job: dict) -> None:
                 topology = provider_config.pop("topology", "static")
                 adaptive_config = provider_config.pop("adaptive_config", None)
                 enable_tool_use = bool(provider_config.pop("enable_tool_use", False))
-                # enable_research=False overrides enable_tool_use: research tools must be
-                # disabled if the caller explicitly requested no research.
                 if not enable_research:
                     enable_tool_use = False
                 tool_evidence_weight = float(
                     provider_config.pop("tool_evidence_weight", DEFAULT_TOOL_EVIDENCE_WEIGHT)
                 )
                 cfg = engine.build_provider_config(provider_config)
-                r = await engine.run_fan_out(
-                    question=job["question"],
-                    width=width,
-                    height=height,
-                    provider_cfg=cfg,
-                    task_class=task_class,
-                    data_policy=data_policy,
-                    max_parallel=max_parallel,
-                    job_id=job_id,
-                    max_width=max_width,
-                    confidence_threshold=confidence_threshold,
-                    extract_claims=extract_claims,
-                    topology=topology,
-                    adaptive_config=adaptive_config,
-                    enable_tool_use=enable_tool_use,
-                    tool_evidence_weight=tool_evidence_weight,
-                    force_local_models=force_local_models,
-                    device_id=device_id,
-                    web_domain_whitelist=web_domain_whitelist,
-                )
+                with job_context(job_id=job_id, provider=cfg.provider, model=str(provider_config.get("model") or "")):
+                    r = await engine.run_fan_out(
+                        question=job["question"],
+                        width=width,
+                        height=height,
+                        provider_cfg=cfg,
+                        task_class=task_class,
+                        data_policy=data_policy,
+                        max_parallel=max_parallel,
+                        job_id=job_id,
+                        max_width=max_width,
+                        confidence_threshold=confidence_threshold,
+                        extract_claims=extract_claims,
+                        topology=topology,
+                        adaptive_config=adaptive_config,
+                        enable_tool_use=enable_tool_use,
+                        tool_evidence_weight=tool_evidence_weight,
+                        force_local_models=force_local_models,
+                        device_id=device_id,
+                        web_domain_whitelist=web_domain_whitelist,
+                    )
                 log.info(
                     "Fan-out job %s complete (width=%d height=%d task_class=%s provider=%s)",
                     job_id, width, height, task_class, cfg.provider,
                 )
                 return r
-            elif provider_config.pop("creative", False):
+
+            if provider_config.pop("creative", False):
                 creative_mode = provider_config.pop("creative_mode", "lateral-thinking")
                 creative_passes = int(provider_config.pop("creative_passes", job.get("passes", 4)))
                 verify_with_nova = provider_config.pop("verify_with_nova", False)
@@ -179,7 +258,9 @@ async def _run_job(job: dict) -> None:
                     job_id, creative_mode, creative_passes, cfg.provider,
                 )
                 return r
-            else:
+
+            cfg = engine.build_provider_config(provider_config)
+            with job_context(job_id=job_id, provider=cfg.provider, model=str(provider_config.get("model") or "")):
                 r = await engine.deep_think_passes(
                     question=job["question"],
                     passes=int(job["passes"]),
@@ -196,9 +277,8 @@ async def _run_job(job: dict) -> None:
                     dama_metric=dama_metric,
                     web_domain_whitelist=web_domain_whitelist,
                 )
-                cfg = engine.build_provider_config(provider_config)
-                log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
-                return r
+            log.info("Job %s complete (task_class=%s provider=%s)", job_id, task_class, cfg.provider)
+            return r
 
         try:
             result = await asyncio.wait_for(_execute_engine(), timeout=job_timeout_secs)
@@ -206,6 +286,11 @@ async def _run_job(job: dict) -> None:
             raise TimeoutError(
                 f"Job {job_id} exceeded timeout of {job_timeout_secs}s (task_class={task_class})"
             )
+        cancellation_error = await asyncio.to_thread(store.get_cancellation_error, job_id)
+        if cancellation_error:
+            await _write_terminal_status_with_retry(store.fail_job, job_id, cancellation_error)
+            _log_job_event("info", "job_cancelled_after_execute", job_id=job_id, reason=cancellation_error)
+            return
 
         # Nova fact-check: enrich result with verification_results and adjusted confidence
         try:
@@ -229,32 +314,33 @@ async def _run_job(job: dict) -> None:
             )
             log.warning("Nova verification pipeline failed for job %s (non-fatal): %s", job_id, vexc)
 
-        await asyncio.to_thread(
+        result_payload = _normalize_result_payload(result)
+        await _write_terminal_status_with_retry(
             store.complete_job,
             job_id,
-            json.dumps(result),
-            status=result.get("status") if isinstance(result, dict) else None,
+            json.dumps(result_payload),
+            status=result_payload.get("status"),
         )
         _log_job_event(
             "info",
             "job_completed",
             job_id=job_id,
             task_class=task_class,
-            result_status=result.get("status"),
-            verification_status=result.get("verification_status"),
-            final_answer_len=len(result.get("final_answer", "") or ""),
-            pass_result_count=len(result.get("pass_results", []) or []),
+            result_status=result_payload.get("status"),
+            verification_status=result_payload.get("verification_status"),
+            final_answer_len=len(result_payload.get("final_answer", "") or ""),
+            pass_result_count=len(result_payload.get("pass_results", []) or []),
         )
     except Exception as exc:
         error_msg = str(exc) or type(exc).__qualname__
         try:
-            await asyncio.to_thread(store.fail_job, job_id, error_msg)
+            await _write_terminal_status_with_retry(store.fail_job, job_id, error_msg)
         except Exception as fail_exc:
-            # Double-failure: both complete_job and fail_job failed
             fail_error_msg = str(fail_exc) or type(fail_exc).__qualname__
-            log.error("Job %s: DOUBLE FAILURE - complete_job AND fail_job failed. complete: %s, fail: %s", 
-                     job_id, error_msg, fail_error_msg)
-            # Don't re-raise — let orphan watchdog detect and requeue
+            log.error(
+                "Job %s: DOUBLE FAILURE - complete_job AND fail_job failed. complete: %s, fail: %s",
+                job_id, error_msg, fail_error_msg,
+            )
         _log_job_event(
             "error",
             "job_failed",
@@ -294,6 +380,9 @@ async def _orphan_watchdog(check_interval_seconds: int = 0) -> None:
                     evicted = await asyncio.to_thread(store.evict_expired_cache)
                     if evicted:
                         log.info("Cache eviction: removed %d expired entries", evicted)
+                    pruned = await asyncio.to_thread(store.prune_thinking_jobs)
+                    if pruned:
+                        log.info("Job retention prune: removed %d terminal jobs", pruned)
                 except Exception as exc:
                     log.warning("Cache eviction error (non-fatal): %s", exc)
 
@@ -349,6 +438,10 @@ async def worker_loop(max_concurrency: int = 0) -> None:
     _active_tasks.add(watchdog_task)
 
     active = 0
+    global _runtime_worker_active, _runtime_worker_max, _runtime_worker_running
+    _runtime_worker_max = max_concurrency
+    _runtime_worker_active = 0
+    _runtime_worker_running = True
     worker_id = f"worker-{os.getpid()}"
     poll_count = 0
 
@@ -381,6 +474,7 @@ async def worker_loop(max_concurrency: int = 0) -> None:
                 continue
 
             active += 1
+            _runtime_worker_active = active
             _log_job_event(
                 "info",
                 "job_claimed",
@@ -393,6 +487,7 @@ async def worker_loop(max_concurrency: int = 0) -> None:
 
             async def _run_and_release(j: dict) -> None:
                 nonlocal active
+                global _runtime_worker_active
                 try:
                     await _run_job(j)
                 except asyncio.CancelledError:
@@ -402,12 +497,18 @@ async def worker_loop(max_concurrency: int = 0) -> None:
                     jid = j.get("job_id", "")
                     if jid:
                         try:
-                            await asyncio.to_thread(store.fail_job, jid, "worker shutdown")
+                            cancel_error = await asyncio.to_thread(store.get_cancellation_error, jid)
+                            await _write_terminal_status_with_retry(
+                                store.fail_job,
+                                jid,
+                                cancel_error or "worker shutdown",
+                            )
                         except Exception as fe:
                             log.warning("Could not fail job %s on cancel: %s", jid, fe)
                     raise
                 finally:
                     active -= 1
+                    _runtime_worker_active = active
 
             try:
                 task = asyncio.create_task(_run_and_release(job))
@@ -415,15 +516,25 @@ async def worker_loop(max_concurrency: int = 0) -> None:
                 # create_task failed after DB row is already marked 'running' — fail it
                 log.error("create_task failed for job %s: %s", job["job_id"], exc)
                 active -= 1
-                await asyncio.to_thread(store.fail_job, job["job_id"], f"create_task: {exc}")
+                await _write_terminal_status_with_retry(
+                    store.fail_job,
+                    job["job_id"],
+                    f"create_task: {exc}",
+                )
                 continue
 
             _active_tasks.add(task)
-            task.add_done_callback(_active_tasks.discard)
+            _running_job_tasks[job["job_id"]] = task
+            def _cleanup(done_task: asyncio.Task, *, job_id: str = job["job_id"]) -> None:
+                _active_tasks.discard(done_task)
+                _running_job_tasks.pop(job_id, None)
+            task.add_done_callback(_cleanup)
     except asyncio.CancelledError:
         log.info("Worker loop cancelled — shutting down")
         raise
     finally:
+        _runtime_worker_running = False
+        _runtime_worker_active = 0
         remaining = [t for t in list(_active_tasks) if not t.done()]
         if remaining:
             log.info("Cancelling %d remaining task(s) on shutdown...", len(remaining))

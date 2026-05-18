@@ -11,7 +11,7 @@ def test_invoke_tools_and_digest_initializes_invoker_with_low_budget_gate(monkey
     captured_perspective_ids = []
 
     class FakeInvoker:
-        def __init__(self, config=None, task_class=None, job_id=None, web_domain_whitelist=None):
+        def __init__(self, config=None, task_class=None, job_id=None, web_domain_whitelist=None, data_policy=None):
             captured_config["config"] = config
 
         def invoke_tools(self, directives, budget_remaining, perspective_id, timeout):

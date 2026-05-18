@@ -452,6 +452,13 @@ TASK_CLASS_PROFILES: dict = {
         "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
         "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
     },
+    "planning": {
+        "description": "Structured implementation planning for remediation and self-improvement pipelines.",
+        "directives": PLANNING_DIRECTIVES,
+        "ollama":    {"light": "phi4-mini:latest",  "medium": "qwen3.5:27b",       "heavy": "llama3.1:8b"},
+        "copilot":   {"light": "gpt-5.4", "medium": "gpt-5.4", "heavy": "gpt-5.5"},
+        "anthropic": {"light": "claude-haiku-4-5",  "medium": "claude-sonnet-4-6", "heavy": "claude-opus-4-7"},
+    },
 }
 
 TASK_CLASS_NAMES = list(TASK_CLASS_PROFILES.keys())
@@ -686,6 +693,26 @@ PERSPECTIVE_MANDATES: dict = {
                       "Ensure internal consistency and identify contradictions.",
         "context": "Mandate: assess whether extracted data is context-dependent. "
                    "Note if the same field could have different values in different contexts.",
+    },
+
+    # Data governance mandates (6 perspectives)
+    "data_governance": {
+        "stream_integrity": "Mandate: audit telemetry stream integrity. Separate missing, stale, duplicated, and malformed signals with exact scope.",
+        "anomaly_attribution": "Mandate: attribute anomalies to likely causes. Distinguish hardware fault, OS interference, transport loss, and fusion error.",
+        "transport_path": "Mandate: evaluate end-to-end transport reliability. Identify packet loss, ordering issues, buffering artifacts, and timestamp drift.",
+        "platform_interference": "Mandate: inspect host/platform effects. Focus on scheduler pressure, power state transitions, permission changes, and driver constraints.",
+        "remediation_readiness": "Mandate: propose bounded remediations tied to observed evidence. Include rollback preconditions and success predicates.",
+        "validation_guardrails": "Mandate: define verification gates for each remediation. Require telemetry before/after comparisons and explicit stop conditions.",
+    },
+
+    # Research synthesis mandates (6 perspectives)
+    "research_synthesis": {
+        "literature_quality": "Mandate: grade source quality and relevance. Prioritize peer-reviewed or high-authority sources and flag weak evidence.",
+        "claim_grounding": "Mandate: map each claim to direct evidence. Mark claims as grounded, derived, or unsupported with confidence rationale.",
+        "contradiction_analysis": "Mandate: identify conflicting findings across sources. Explain whether conflicts are methodological, temporal, or contextual.",
+        "methodology_risk": "Mandate: stress-test methodological robustness. Flag sample bias, confounders, weak controls, and reproducibility concerns.",
+        "citation_integrity": "Mandate: verify citation fidelity. Ensure cited sources actually support the claimed statement and confidence level.",
+        "synthesis_decision": "Mandate: integrate evidence into an actionable synthesis. Lead with highest-confidence conclusions and clearly isolate uncertainty.",
     },
 }
 
@@ -1013,6 +1040,8 @@ def resolve_skill_selection(
     requested = (skill or task_class or "").strip()
     if requested and requested in TASK_CLASS_PROFILES:
         return requested, TASK_CLASS_PROFILES[requested]
+    if requested:
+        log.warning("Unknown task_class/skill %r; falling back to 'general'", requested)
     return "general", TASK_CLASS_PROFILES["general"]
 
 

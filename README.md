@@ -505,7 +505,7 @@ deep_think_async()  ──→  SQLite (queued)
 - Worker loop runs inside the same process as the MCP server (asyncio task)
 - SQLite + WAL mode handles concurrent reads/writes safely
 - Stale `running` jobs are automatically requeued on startup (crash recovery)
-- Job history persists indefinitely; query with `list_thinking_jobs`
+- Job history is retained with safe terminal-state pruning (configurable via `DEEP_THINK_JOB_RETENTION_MAX_ROWS` / `DEEP_THINK_JOB_RETENTION_DAYS`); query with `list_thinking_jobs`
 
 ---
 
